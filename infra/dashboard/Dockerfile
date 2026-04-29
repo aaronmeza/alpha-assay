@@ -17,8 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the framework package + dashboard optional deps first so
-# Docker layer caching works across app-code changes.
-COPY pyproject.toml ./
+# Docker layer caching works across app-code changes. README/LICENSE/
+# NOTICE are required by pyproject.toml for hatchling to build the
+# package metadata.
+COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir ".[dashboard]"
 
