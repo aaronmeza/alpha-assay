@@ -12,8 +12,10 @@ import pandas as pd
 import pytest
 
 from dashboard.loaders import (
+    describe_run,
     discover_runs,
     filter_by_time_range,
+    load_all_runs,
     load_per_trade_metrics,
     load_session_metrics,
 )
@@ -238,3 +240,108 @@ def test_filter_empty_df_returns_empty():
 def test_filter_none_df_returns_none():
     result = filter_by_time_range(None, None, None)
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# describe_run
+# ---------------------------------------------------------------------------
+
+
+def test_describe_run_returns_name_when_no_csv(tmp_path):
+    run = tmp_path / "my-run"
+    run.mkdir()
+    result = describe_run(run)
+    assert result == "my-run"
+
+
+def test_describe_run_includes_trade_count_and_dates(tmp_path):
+    run = tmp_path / "my-run"
+    rows = [
+        {**_SAMPLE_ROW, "entry_ts": "2026-03-26 14:00:00+00:00"},
+        {**_SAMPLE_ROW, "entry_ts": "2026-04-24 14:00:00+00:00"},
+    ]
+    _write_per_trade_csv(run, rows)
+    result = describe_run(run)
+    assert "my-run" in result
+    assert "2 trades" in result
+    assert "2026-03-26" in result
+    assert "2026-04-24" in result
+
+
+def test_describe_run_single_trade_shows_same_start_end(tmp_path):
+    run = tmp_path / "solo"
+    _write_per_trade_csv(run, [_SAMPLE_ROW])
+    result = describe_run(run)
+    assert "1 trades" in result
+    # Both start and end should be the same date.
+    assert result.count("2026-04-02") == 2
+
+
+# ---------------------------------------------------------------------------
+# load_all_runs
+# ---------------------------------------------------------------------------
+
+
+def test_load_all_runs_returns_none_for_missing_dir(tmp_path):
+    result = load_all_runs(tmp_path / "nonexistent")
+    assert result is None
+
+
+def test_load_all_runs_returns_none_when_no_runs(tmp_path):
+    # Directory exists but has no qualifying run subdirectories.
+    result = load_all_runs(tmp_path)
+    assert result is None
+
+
+def test_load_all_runs_single_run_matches_direct_load(tmp_path):
+    run = tmp_path / "run-a"
+    _write_per_trade_csv(run, [_SAMPLE_ROW])
+    combined = load_all_runs(tmp_path)
+    direct = load_per_trade_metrics(run)
+    assert combined is not None
+    assert len(combined) == len(direct)
+
+
+def test_load_all_runs_concatenates_multiple_runs(tmp_path):
+    run_a = tmp_path / "run-a"
+    run_b = tmp_path / "run-b"
+    _write_per_trade_csv(run_a, [_SAMPLE_ROW])
+    _write_per_trade_csv(run_b, [_SAMPLE_ROW, {**_SAMPLE_ROW, "pnl_usd": -25.0}])
+    combined = load_all_runs(tmp_path)
+    assert combined is not None
+    assert len(combined) == 3
+
+
+def test_load_all_runs_adds_run_name_column(tmp_path):
+    run = tmp_path / "run-x"
+    _write_per_trade_csv(run, [_SAMPLE_ROW])
+    combined = load_all_runs(tmp_path)
+    assert combined is not None
+    assert "run_name" in combined.columns
+    assert combined["run_name"].iloc[0] == "run-x"
+
+
+def test_load_all_runs_sorted_by_entry_ts(tmp_path):
+    run = tmp_path / "run-mixed"
+    rows = [
+        {**_SAMPLE_ROW, "entry_ts": "2026-04-03 14:00:00+00:00"},
+        {**_SAMPLE_ROW, "entry_ts": "2026-04-01 14:00:00+00:00"},
+    ]
+    _write_per_trade_csv(run, rows)
+    combined = load_all_runs(tmp_path)
+    assert combined is not None
+    ts_values = combined["entry_ts"].tolist()
+    assert ts_values == sorted(ts_values)
+
+
+def test_load_all_runs_skips_runs_without_trade_csv(tmp_path):
+    # A run with only session_metrics.json but no per_trade_metrics.csv.
+    run_meta_only = tmp_path / "meta-only"
+    _write_session_json(run_meta_only, {"starting_balance_usd": 100_000.0})
+    # A run with actual trades.
+    run_trades = tmp_path / "with-trades"
+    _write_per_trade_csv(run_trades, [_SAMPLE_ROW])
+    combined = load_all_runs(tmp_path)
+    assert combined is not None
+    assert len(combined) == 1
+    assert combined["run_name"].iloc[0] == "with-trades"

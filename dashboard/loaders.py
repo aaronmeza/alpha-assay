@@ -50,6 +50,52 @@ def discover_runs(runs_dir: str | Path) -> list[str]:
     return [name for _, name in runs]
 
 
+def describe_run(run_dir: Path) -> str:
+    """Return a human-readable label for a run directory.
+
+    Format: ``<name> (<n> trades, <start> -> <end>)`` when trade data is
+    available, otherwise just the directory name.
+    """
+    name = run_dir.name
+    df = load_per_trade_metrics(run_dir)
+    if df is None or df.empty or "entry_ts" not in df.columns:
+        return name
+
+    n = len(df)
+    try:
+        start = df["entry_ts"].min().tz_convert("UTC").strftime("%Y-%m-%d")
+        end = df["entry_ts"].max().tz_convert("UTC").strftime("%Y-%m-%d")
+        return f"{name} ({n} trades, {start} -> {end})"
+    except Exception:
+        return f"{name} ({n} trades)"
+
+
+def load_all_runs(runs_dir: str | Path) -> Optional[pd.DataFrame]:
+    """Load and concatenate per-trade rows across all runs under *runs_dir*.
+
+    Returns a combined DataFrame with an added ``run_name`` column so
+    individual sessions can still be identified.  Returns None when no
+    run directories with trade data are found.
+    """
+    root = Path(runs_dir)
+    run_names = discover_runs(root)
+    frames: list[pd.DataFrame] = []
+    for name in run_names:
+        df = load_per_trade_metrics(root / name)
+        if df is not None and not df.empty:
+            df = df.copy()
+            df["run_name"] = name
+            frames.append(df)
+
+    if not frames:
+        return None
+
+    combined = pd.concat(frames, ignore_index=True)
+    if "entry_ts" in combined.columns:
+        combined = combined.sort_values("entry_ts").reset_index(drop=True)
+    return combined
+
+
 def load_per_trade_metrics(run_dir: Path) -> Optional[pd.DataFrame]:
     """Load per-trade metrics CSV.  Returns None if the file is absent."""
     path = run_dir / "report" / "per_trade_metrics.csv"
