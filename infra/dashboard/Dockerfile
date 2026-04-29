@@ -27,10 +27,13 @@ RUN pip install --no-cache-dir ".[dashboard]"
 # Copy the dashboard app
 COPY dashboard/ ./dashboard/
 
-# Streamlit config: disable the browser auto-open + telemetry
+# Streamlit config: disable the browser auto-open + telemetry.
+# PYTHONPATH=/app makes `dashboard` importable as a top-level package
+# (streamlit puts the script's directory on sys.path, not its parent).
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_SERVER_PORT=8501 \
+    PYTHONPATH=/app \
     RUNS_DIR=/runs
 
 EXPOSE 8501
