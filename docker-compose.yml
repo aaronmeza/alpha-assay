@@ -261,9 +261,11 @@ services:
       RTH_TZ: America/Chicago
       RTH_START_HHMM: "0830"
       RTH_END_HHMM: "1500"
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TZ: America/Chicago
+    # TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID load from .env.alerts. They
+    # are intentionally NOT in environment: above; ${VAR:-} defaults to
+    # empty and silently overrides env_file in docker-compose's merge
+    # order.
     env_file:
       - path: .env.alerts
         required: false
