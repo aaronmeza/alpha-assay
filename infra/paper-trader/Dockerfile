@@ -37,4 +37,4 @@ RUN pip install --upgrade pip \
 
 EXPOSE 8000
 
-ENTRYPOINT ["python", "-u", "scripts/paper_trader_stub.py"]
+CMD ["python", "-u", "/app/scripts/paper_trader_stub.py"]
