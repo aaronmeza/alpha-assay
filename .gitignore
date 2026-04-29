@@ -24,5 +24,7 @@ data/recorder/
 CLAUDE.md
 CLAUDE.local.md
 
-# secrets file loaded by docker-compose env_file directive
+# secrets files loaded by docker-compose env_file directives
 .env.secrets
+.env.alerts
+.env.*
