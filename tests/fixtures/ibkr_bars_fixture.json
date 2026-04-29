@@ -1,0 +1,15 @@
+[
+  {
+    "_fixture_docstring": "Synthetic ib_insync BarData payload, ten 1-min bars for ES futures. Matches the ib_insync==0.9.86 BarData dataclass shape: keys {date, open, high, low, close, volume, average, barCount}. `date` is an ISO 8601 string; tests parse it into pd.Timestamp. Bar 3 intentionally violates the OHLC invariant high >= max(open, close) so tests can assert the adapter's defensive clamp (ADR Appendix A)."
+  },
+  {"date": "2026-04-21T14:30:00+00:00", "open": 5200.00, "high": 5201.25, "low": 5199.75, "close": 5200.50, "volume": 1200, "average": 5200.25, "barCount": 240},
+  {"date": "2026-04-21T14:31:00+00:00", "open": 5200.50, "high": 5202.00, "low": 5200.25, "close": 5201.75, "volume": 1400, "average": 5201.10, "barCount": 275},
+  {"date": "2026-04-21T14:32:00+00:00", "open": 5201.75, "high": 5200.00, "low": 5200.50, "close": 5202.25, "volume": 1100, "average": 5201.40, "barCount": 215},
+  {"date": "2026-04-21T14:33:00+00:00", "open": 5202.25, "high": 5203.00, "low": 5201.50, "close": 5202.75, "volume": 1350, "average": 5202.30, "barCount": 260},
+  {"date": "2026-04-21T14:34:00+00:00", "open": 5202.75, "high": 5203.50, "low": 5202.00, "close": 5202.50, "volume": 1250, "average": 5202.65, "barCount": 245},
+  {"date": "2026-04-21T14:35:00+00:00", "open": 5202.50, "high": 5203.25, "low": 5201.75, "close": 5203.00, "volume": 1300, "average": 5202.55, "barCount": 250},
+  {"date": "2026-04-21T14:36:00+00:00", "open": 5203.00, "high": 5204.00, "low": 5202.50, "close": 5203.75, "volume": 1450, "average": 5203.40, "barCount": 285},
+  {"date": "2026-04-21T14:37:00+00:00", "open": 5203.75, "high": 5204.50, "low": 5203.25, "close": 5204.00, "volume": 1380, "average": 5203.90, "barCount": 270},
+  {"date": "2026-04-21T14:38:00+00:00", "open": 5204.00, "high": 5204.75, "low": 5203.50, "close": 5204.25, "volume": 1420, "average": 5204.10, "barCount": 280},
+  {"date": "2026-04-21T14:39:00+00:00", "open": 5204.25, "high": 5205.00, "low": 5203.75, "close": 5204.50, "volume": 1500, "average": 5204.40, "barCount": 295}
+]

@@ -1,0 +1,1 @@
+P&L net of fees, Max Drawdown, Sharpe, Win rate, Avg MAE/MFE, Exposure %, Capacity assumptions, Commission/slippage config.

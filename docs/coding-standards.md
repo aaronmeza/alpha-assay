@@ -1,0 +1,1 @@
+Ruff for linting and formatting, pytest layout, logging conventions, error handling, commit message style.

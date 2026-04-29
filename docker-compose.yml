@@ -1,0 +1,219 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Aaron Meza
+#
+# observability + paper-trader stack for the deployment host deploy.
+#
+# ADR decision 7 constraints:
+#   - Non-default host ports (prometheus 19090, grafana 13000, paper-trader
+#     metrics 18000, breadth-recorder metrics 18001).
+#   - Tailscale-only access: every host port binds 127.0.0.1 only. On the host,
+#     Tailscale magic-DNS routes traffic from approved peers to these ports;
+#     no service is reachable from the public internet.
+#   - Isolated from the existing factory stack: dedicated network
+#     `alphaassay_observability` and container names prefixed `alphaassay-`.
+#
+# Secrets (IBKR creds, Databento API key) are loaded from `.env.secrets` at the
+# repo root via the `env_file:` directive. That file is in .gitignore; use
+# `.env.secrets.example` as a template. Do NOT commit real credentials.
+#
+# Bringup:
+#   docker compose up -d                        # paper-trader + prometheus + grafana
+#   docker compose --profile recorder up -d     # includes breadth-recorder #
+# See README.md for deployment notes.
+
+services:
+  paper-trader:
+    # always-flat IBKR paper dry-run. Connects to a real IBKR
+    # paper account, subscribes to ES bars + TICK-NYSE breadth,
+    # increments observability counters, and NEVER submits orders.
+    # The heartbeat-only stub (scripts/paper_trader_stub.py) is
+    # kept in the repo as a fallback / reference; flip the `command:`
+    # below to that file if you need to bring the stack up without
+    # IBKR creds (e.g. local laptop smoke test).
+    build:
+      context: .
+      dockerfile: infra/paper-trader/Dockerfile
+    image: alphaassay/paper-trader:phase-w
+    container_name: alphaassay-paper-trader
+    restart: on-failure:3
+    command: ["python", "-u", "/app/scripts/paper_dryrun.py"]
+    environment:
+      METRICS_PORT: "8000"
+      ALPHA_ASSAY_ENV: paper-dryrun
+      TZ: America/Chicago
+      # IBKR connection params. the host runs IB Gateway (paper) headless on
+      # 4002 so that is the documented default. Override IBKR_HOST in
+      # .env.secrets if Gateway runs on a different host.
+      IBKR_HOST: ${IBKR_HOST:-127.0.0.1}
+      IBKR_PORT: ${IBKR_PORT:-4002}
+      IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
+      IBKR_ACCOUNT: ${IBKR_ACCOUNT:-}
+      ES_EXPIRY: ${ES_EXPIRY:-202506}
+    env_file:
+      - path: .env.secrets
+        required: false
+    ports:
+      # host -> container. 127.0.0.1 only, Tailscale-gated.
+      - "127.0.0.1:18000:8000"
+    networks:
+      - alphaassay_observability
+    volumes:
+      - paper_trader_logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  breadth-recorder:
+    # IBKR breadth recorder. Consumes the read-only IBKRAdapter
+    # stream for TICK-NYSE + AD-NYSE, aggregates causally to 1-min bars,
+    # writes rolling daily parquet shards to /data/breadth. Profile-gated
+    # so `docker compose up` without --profile recorder skips it; the
+    # recorder only runs on the host during an active IBKR session.
+    profiles:
+      - recorder
+    image: alphaassay/breadth-recorder:phase-u
+    build:
+      context: .
+      dockerfile: infra/recorders/ibkr_breadth/Dockerfile
+    container_name: alphaassay-breadth-recorder
+    restart: on-failure:3
+    environment:
+      METRICS_PORT: "8001"
+      OUT_DIR: /data/breadth
+      ALPHA_ASSAY_ENV: paper-dryrun
+      TZ: America/Chicago
+    env_file:
+      - path: .env.secrets
+        required: false
+    command: ["python", "-u", "/app/infra/recorders/ibkr_breadth/run.py"]
+    ports:
+      - "127.0.0.1:18001:8001"
+    networks:
+      - alphaassay_observability
+    volumes:
+      - breadth_parquet:/data/breadth
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  es-bars-recorder:
+    # IBKR ES 1-min bar recorder. Sibling to breadth-recorder.
+    # Subscribes to a single ES futures contract via the read-only
+    # IBKRAdapter and writes rolling daily parquet shards to /data/es_bars
+    # in the canonical OHLCV schema accepted by
+    # alpha_assay.data.databento_adapter.load_parquet. Profile-gated under
+    # the same `recorder` profile as breadth-recorder so the laptop dev
+    # loop still skips both by default.
+    profiles:
+      - recorder
+    image: alphaassay/es-bars-recorder:phase-y
+    build:
+      context: .
+      dockerfile: infra/recorders/ibkr_es_bars/Dockerfile
+    container_name: alphaassay-es-bars-recorder
+    restart: on-failure:3
+    environment:
+      METRICS_PORT: "8002"
+      OUT_DIR: /data/es_bars
+      ALPHA_ASSAY_ENV: paper-dryrun
+      TZ: America/Chicago
+      # Distinct client id so paper-trader (1) + breadth-recorder (21)
+      # + this recorder can share an IB Gateway.
+      IBKR_HOST: ${IBKR_HOST:-127.0.0.1}
+      IBKR_PORT: ${IBKR_PORT:-4002}
+      IBKR_CLIENT_ID: ${ES_BARS_IBKR_CLIENT_ID:-22}
+      IBKR_ACCOUNT: ${IBKR_ACCOUNT:-}
+      ES_EXPIRY: ${ES_EXPIRY:-202506}
+    env_file:
+      - path: .env.secrets
+        required: false
+    command: ["python", "-u", "/app/infra/recorders/ibkr_es_bars/run.py"]
+    ports:
+      - "127.0.0.1:18002:8002"
+    networks:
+      - alphaassay_observability
+    volumes:
+      - es_bars_parquet:/data/es_bars
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8002/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: alphaassay-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:19090:9090"
+    networks:
+      - alphaassay_observability
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: alphaassay-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      # Override at deploy-time via .env.secrets (GF_SECURITY_ADMIN_PASSWORD).
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-alphaassay}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      TZ: America/Chicago
+    env_file:
+      - path: .env.secrets
+        required: false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:13000:3000"
+    networks:
+      - alphaassay_observability
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  alphaassay_observability:
+    name: alphaassay_observability
+    driver: bridge
+
+volumes:
+  prometheus_data:
+    name: alphaassay_prometheus_data
+  grafana_data:
+    name: alphaassay_grafana_data
+  paper_trader_logs:
+    name: alphaassay_paper_trader_logs
+  breadth_parquet:
+    name: alphaassay_breadth_parquet
+  es_bars_parquet:
+    name: alphaassay_es_bars_parquet

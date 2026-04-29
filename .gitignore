@@ -1,0 +1,28 @@
+tmp/
+.venv/
+__pycache__/
+*.pyc
+
+# generated test fixtures
+tests/fixtures/sample_*.csv
+tests/fixtures/sample_*.parquet
+
+# data & weights (never commit pulled market data)
+data/databento/
+data/databento_smoke/
+data/recorder/
+*.ipynb
+*.pkl
+*.pt
+*.onnx
+*.joblib
+*.npz
+*.key
+*.crt
+
+# local-only operator notes / agent instructions
+CLAUDE.md
+CLAUDE.local.md
+
+# secrets file loaded by docker-compose env_file directive
+.env.secrets

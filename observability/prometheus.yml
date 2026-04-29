@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Aaron Meza
+#
+# Prometheus config. Two scrape jobs:
+#   - paper-trader: the heartbeat stub (replaces it with the
+#     real IBKR paper-trader). Exposes /metrics on internal port 8000.
+#   - breadth-recorder: profile-gated in docker-compose.yml; wires
+#     this up. Until then, Prometheus will log scrape errors, which is fine.
+#
+# 15s scrape interval matches the spec Section 6 cadence.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: paper-dryrun
+    stack: alphaassay
+
+scrape_configs:
+  - job_name: paper-trader
+    honor_labels: true
+    static_configs:
+      - targets:
+          - paper-trader:8000
+        labels:
+          service: paper-trader
+          component: engine
+
+  - job_name: breadth-recorder
+    honor_labels: true
+    static_configs:
+      - targets:
+          - breadth-recorder:8001
+        labels:
+          service: breadth-recorder
+          component: recorder
+
+  - job_name: es-bars-recorder
+    honor_labels: true
+    static_configs:
+      - targets:
+          - es-bars-recorder:8002
+        labels:
+          service: es-bars-recorder
+          component: recorder

@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alpha_assay"
+version = "0.1.0"
+description = "Open-source backtesting and paper-trading framework for intraday futures and equities strategies."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [{ name = "Aaron Meza" }]
+keywords = ["trading", "backtesting", "futures", "quant", "algorithmic-trading"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "pyyaml>=6",
+    "pytz>=2024.1",
+    "pydantic>=2",
+    "prometheus_client>=0.20",
+    "click>=8.1",
+    "ib_insync>=0.9.86",
+]
+
+[project.scripts]
+alpha_assay = "alpha_assay.cli:main"
+
+[project.optional-dependencies]
+nautilus = ["nautilus_trader>=1.190"]
+databento = ["databento>=0.40"]
+report = ["quantstats>=0.0.62"]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.6",
+    "black>=24",
+    "mypy>=1.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/aaronmeza/alpha-assay"
+Issues = "https://github.com/aaronmeza/alpha-assay/issues"
+Source = "https://github.com/aaronmeza/alpha-assay"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alpha_assay"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

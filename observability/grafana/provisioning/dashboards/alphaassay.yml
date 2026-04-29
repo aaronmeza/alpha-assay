@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Aaron Meza
+#
+# Grafana dashboards provisioning loader. Grafana scans the directory
+# for JSON dashboards and auto-loads them at startup.
+
+apiVersion: 1
+
+providers:
+  - name: alphaassay
+    orgId: 1
+    folder: AlphaAssay
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
