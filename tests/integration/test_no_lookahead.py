@@ -128,10 +128,7 @@ def test_shift_corrected_lookahead_matches_causal(tmp_path):
     # The shifted version cannot see future values (engine slices
     # causally); its submitted_signals count must match the causal
     # version up to the slice length offset.
-    assert (
-        r_causal.session_metrics["submitted_signals"]
-        == r_shifted.session_metrics["submitted_signals"]
-    ), (
+    assert r_causal.session_metrics["submitted_signals"] == r_shifted.session_metrics["submitted_signals"], (
         f"engine is leaking future information: "
         f"causal={r_causal.session_metrics['submitted_signals']} vs "
         f"shifted={r_shifted.session_metrics['submitted_signals']}"

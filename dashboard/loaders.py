@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -70,7 +69,7 @@ def describe_run(run_dir: Path) -> str:
         return f"{name} ({n} trades)"
 
 
-def load_all_runs(runs_dir: str | Path) -> Optional[pd.DataFrame]:
+def load_all_runs(runs_dir: str | Path) -> pd.DataFrame | None:
     """Load and concatenate per-trade rows across all runs under *runs_dir*.
 
     Returns a combined DataFrame with an added ``run_name`` column so
@@ -96,7 +95,7 @@ def load_all_runs(runs_dir: str | Path) -> Optional[pd.DataFrame]:
     return combined
 
 
-def load_per_trade_metrics(run_dir: Path) -> Optional[pd.DataFrame]:
+def load_per_trade_metrics(run_dir: Path) -> pd.DataFrame | None:
     """Load per-trade metrics CSV.  Returns None if the file is absent."""
     path = run_dir / "report" / "per_trade_metrics.csv"
     if not path.exists():
@@ -139,8 +138,8 @@ def load_session_metrics(run_dir: Path) -> dict:
 
 def filter_by_time_range(
     df: pd.DataFrame,
-    start: Optional[pd.Timestamp],
-    end: Optional[pd.Timestamp],
+    start: pd.Timestamp | None,
+    end: pd.Timestamp | None,
     ts_col: str = "entry_ts",
 ) -> pd.DataFrame:
     """Return rows where *ts_col* falls within [start, end] (inclusive).

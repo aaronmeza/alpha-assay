@@ -35,9 +35,7 @@ def test_compose_es_bars_recorder_uses_real_dockerfile() -> None:
 def test_compose_es_bars_recorder_profile_gated() -> None:
     data = _load_compose()
     rec = data["services"]["es-bars-recorder"]
-    assert "recorder" in (
-        rec.get("profiles") or []
-    ), "es-bars-recorder must declare profiles: [recorder]"
+    assert "recorder" in (rec.get("profiles") or []), "es-bars-recorder must declare profiles: [recorder]"
 
 
 def test_compose_es_bars_recorder_has_volume_mount_for_output() -> None:
@@ -52,8 +50,7 @@ def test_compose_es_bars_recorder_has_volume_mount_for_output() -> None:
 
     top_volumes = data.get("volumes", {})
     assert "es_bars_parquet" in top_volumes, (
-        f"es_bars_parquet volume must be declared at top level; got "
-        f"{sorted(top_volumes.keys())}"
+        f"es_bars_parquet volume must be declared at top level; got " f"{sorted(top_volumes.keys())}"
     )
     # The named volume must use the alphaassay_ prefix to keep the
     # the deployment host host's docker volume namespace distinct from sibling stacks.
@@ -95,13 +92,9 @@ def test_compose_es_bars_recorder_has_unique_metrics_port() -> None:
 def test_prometheus_scrape_includes_es_bars_recorder() -> None:
     data = _load_prometheus()
     jobs = {job["job_name"]: job for job in data["scrape_configs"]}
-    assert (
-        "es-bars-recorder" in jobs
-    ), f"prometheus scrape jobs missing es-bars-recorder; got {sorted(jobs)}"
+    assert "es-bars-recorder" in jobs, f"prometheus scrape jobs missing es-bars-recorder; got {sorted(jobs)}"
     job = jobs["es-bars-recorder"]
     targets: list[str] = []
     for sc in job.get("static_configs", []):
         targets.extend(sc.get("targets", []))
-    assert (
-        "es-bars-recorder:8002" in targets
-    ), f"expected scrape target es-bars-recorder:8002; got {targets}"
+    assert "es-bars-recorder:8002" in targets, f"expected scrape target es-bars-recorder:8002; got {targets}"

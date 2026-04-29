@@ -33,12 +33,7 @@ def test_loads_valid_config(tmp_path):
 
 
 def test_rejects_missing_risk_caps(tmp_path):
-    invalid = (
-        "risk_caps:\n"
-        "  max_stop_pts: 5.0\n"
-        "  min_target_pts: 2.5\n"
-        "  min_target_to_stop_ratio: 2.0\n"
-    )
+    invalid = "risk_caps:\n" "  max_stop_pts: 5.0\n" "  min_target_pts: 2.5\n" "  min_target_to_stop_ratio: 2.0\n"
     assert invalid in VALID  # sanity: the block we strip is actually present
     bad = VALID.replace(invalid, "")
     p = tmp_path / "bad.yaml"

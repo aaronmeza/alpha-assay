@@ -193,8 +193,7 @@ def test_dryrun_subscribes_and_emits_metrics():
 
         order_samples = _parse_metric_samples(body, "alpha_assay_orders_submitted_total")
         assert all(v == 0 for _labels, v in order_samples), (
-            "orders_submitted_total must be 0 across all type labels in always-flat dry-run; "
-            f"got {order_samples}"
+            "orders_submitted_total must be 0 across all type labels in always-flat dry-run; " f"got {order_samples}"
         )
 
         freshness_samples = _parse_metric_samples(body, "alpha_assay_ibkr_feed_freshness_seconds")
@@ -204,9 +203,7 @@ def test_dryrun_subscribes_and_emits_metrics():
             feed = labels.get("feed", "")
             if feed.startswith("ES"):
                 seen_es = True
-                assert (
-                    value < 30.0
-                ), f"ES feed freshness {value}s >= 30s; market may be closed or feed stalled"
+                assert value < 30.0, f"ES feed freshness {value}s >= 30s; market may be closed or feed stalled"
             elif feed == "TICK-NYSE":
                 seen_tick = True
                 assert value < 30.0, f"TICK-NYSE freshness {value}s >= 30s; check NYSE breadth feed"
@@ -215,8 +212,7 @@ def test_dryrun_subscribes_and_emits_metrics():
     finally:
         rc = _drain_or_kill(proc)
         assert rc != -9, (
-            "paper_dryrun.py failed to drain within DRAIN_TIMEOUT_SECONDS; "
-            "graceful-shutdown contract is broken"
+            "paper_dryrun.py failed to drain within DRAIN_TIMEOUT_SECONDS; " "graceful-shutdown contract is broken"
         )
 
 

@@ -70,8 +70,7 @@ def main() -> None:
     contract_spec = _build_contract_spec()
 
     log.info(
-        "es-bars-recorder starting (out_dir=%s metrics_port=%d ibkr=%s:%d "
-        "client_id=%d contract=%s)",
+        "es-bars-recorder starting (out_dir=%s metrics_port=%d ibkr=%s:%d " "client_id=%d contract=%s)",
         out_dir,
         metrics_port,
         ibkr_host,

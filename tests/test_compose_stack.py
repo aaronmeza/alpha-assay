@@ -50,12 +50,8 @@ def test_compose_yaml_is_valid() -> None:
     seen_host_ports: set[str] = set()
     for svc_name, svc in services.items():
         for port in svc.get("ports", []):
-            assert isinstance(
-                port, str
-            ), f"service {svc_name} port entry must be long-form string, got {port!r}"
-            assert (
-                "0.0.0.0" not in port
-            ), f"service {svc_name} binds to 0.0.0.0 ({port!r}); must bind 127.0.0.1 only"
+            assert isinstance(port, str), f"service {svc_name} port entry must be long-form string, got {port!r}"
+            assert "0.0.0.0" not in port, f"service {svc_name} binds to 0.0.0.0 ({port!r}); must bind 127.0.0.1 only"
             assert port.startswith(
                 "127.0.0.1:"
             ), f"service {svc_name} port {port!r} must bind 127.0.0.1 for Tailscale-gated access"
@@ -111,16 +107,12 @@ def test_prometheus_scrape_targets() -> None:
 
     scrape_configs = data.get("scrape_configs", [])
     job_names = {job.get("job_name") for job in scrape_configs}
-    assert {"paper-trader", "breadth-recorder"}.issubset(
-        job_names
-    ), f"missing scrape jobs; got {job_names}"
+    assert {"paper-trader", "breadth-recorder"}.issubset(job_names), f"missing scrape jobs; got {job_names}"
 
     for job in scrape_configs:
         if job["job_name"] == "paper-trader":
             targets = job["static_configs"][0]["targets"]
-            assert (
-                "paper-trader:8000" in targets
-            ), f"paper-trader job must target internal port 8000; got {targets}"
+            assert "paper-trader:8000" in targets, f"paper-trader job must target internal port 8000; got {targets}"
         elif job["job_name"] == "breadth-recorder":
             targets = job["static_configs"][0]["targets"]
             assert (
@@ -182,6 +174,4 @@ def test_paper_trader_stub_heartbeat_increments() -> None:
     before = M.bars_processed_total.labels(feed="stub")._value.get()
     module.heartbeat_once()
     after = M.bars_processed_total.labels(feed="stub")._value.get()
-    assert (
-        after == before + 1
-    ), f"heartbeat should increment counter by 1 (before={before}, after={after})"
+    assert after == before + 1, f"heartbeat should increment counter by 1 (before={before}, after={after})"

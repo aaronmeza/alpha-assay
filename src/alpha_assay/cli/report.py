@@ -420,9 +420,7 @@ def _quant_metrics(
 
     # Annualized return: derive from total + actual elapsed days.
     days_elapsed = _elapsed_days_from_per_trade(per_trade)
-    out["annualized_return_pct"] = _annualized_from_total_and_days(
-        out["total_return_pct"], days_elapsed
-    )
+    out["annualized_return_pct"] = _annualized_from_total_and_days(out["total_return_pct"], days_elapsed)
 
     if returns.empty or len(returns) < 2:
         # Daily-return-based metrics are degenerate under fewer than
@@ -525,16 +523,8 @@ def _trade_metrics(per_trade: pd.DataFrame) -> dict[str, float | int | None]:
 
     mae_series = per_trade.get("mae_points")
     mfe_series = per_trade.get("mfe_points")
-    avg_mae = (
-        float(mae_series.dropna().mean())
-        if mae_series is not None and not mae_series.dropna().empty
-        else None
-    )
-    avg_mfe = (
-        float(mfe_series.dropna().mean())
-        if mfe_series is not None and not mfe_series.dropna().empty
-        else None
-    )
+    avg_mae = float(mae_series.dropna().mean()) if mae_series is not None and not mae_series.dropna().empty else None
+    avg_mfe = float(mfe_series.dropna().mean()) if mfe_series is not None and not mfe_series.dropna().empty else None
 
     return {
         "n_trades_total": int(len(per_trade)),
@@ -769,9 +759,7 @@ def _quantstats_html(equity: pd.Series, out_path: Path) -> bool:
         return False
 
     try:
-        qs_reports.html(
-            returns, output=str(out_path), download_filename=None, title="alpha_assay backtest"
-        )
+        qs_reports.html(returns, output=str(out_path), download_filename=None, title="alpha_assay backtest")
     except TypeError:
         # Older signatures don't accept ``download_filename``; retry.
         try:

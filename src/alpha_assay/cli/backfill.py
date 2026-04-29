@@ -98,9 +98,7 @@ def _parse_duration_seconds(duration_str: str) -> int:
     """
     parts = duration_str.strip().split()
     if len(parts) != 2:
-        raise click.BadParameter(
-            f"--chunk-duration must be like '1 W' or '2 D', got {duration_str!r}"
-        )
+        raise click.BadParameter(f"--chunk-duration must be like '1 W' or '2 D', got {duration_str!r}")
     try:
         n = int(parts[0])
     except ValueError as exc:
@@ -108,8 +106,7 @@ def _parse_duration_seconds(duration_str: str) -> int:
     unit = parts[1].upper()
     if unit not in _DURATION_UNIT_SECONDS:
         raise click.BadParameter(
-            f"--chunk-duration unit must be one of {sorted(_DURATION_UNIT_SECONDS)}, "
-            f"got {parts[1]!r}"
+            f"--chunk-duration unit must be one of {sorted(_DURATION_UNIT_SECONDS)}, " f"got {parts[1]!r}"
         )
     if n <= 0:
         raise click.BadParameter("--chunk-duration count must be positive")
@@ -303,9 +300,7 @@ def _flush_buffer_to_shards(
     return n_days
 
 
-def _build_contract_spec(
-    *, symbol: str, exchange: str, currency: str, expiry: str
-) -> dict[str, Any]:
+def _build_contract_spec(*, symbol: str, exchange: str, currency: str, expiry: str) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "sec_type": "FUT",
@@ -501,9 +496,7 @@ def backfill(
     port = ibkr_port if ibkr_port is not None else int(os.environ.get("IBKR_PORT", "4002"))
     expiry = es_expiry or os.environ.get("ES_EXPIRY", "20260618")
 
-    contract_spec = _build_contract_spec(
-        symbol=symbol, exchange=exchange, currency=currency, expiry=expiry
-    )
+    contract_spec = _build_contract_spec(symbol=symbol, exchange=exchange, currency=currency, expiry=expiry)
 
     now_utc = datetime.now(tz=UTC).replace(microsecond=0)
     chunks = build_chunk_schedule(now=now_utc, days=days, chunk_duration=chunk_duration)
@@ -545,9 +538,7 @@ def backfill(
         click.echo("backfill: interrupted; partial work flushed to shards", err=True)
         raise SystemExit(130) from None
 
-    click.echo(
-        f"backfill: done. chunks={chunks_done}/{len(chunks)} bars={bars_total} out={out_path}"
-    )
+    click.echo(f"backfill: done. chunks={chunks_done}/{len(chunks)} bars={bars_total} out={out_path}")
 
 
 __all__ = [

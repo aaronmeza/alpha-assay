@@ -32,9 +32,10 @@ this.
 Checklist file format
 ---------------------
 
-only checks existence -- contents are not parsed here. (or a separate ship-out tool) populates the file with a human-signed
-manifest listing approved configs, cap sizes, gateway versions, etc.
-Signing the checklist is a deliberate manual step.
+only checks existence -- contents are not parsed here. A separate
+ship-out tool populates the file with a human-signed manifest listing
+approved configs, cap sizes, gateway versions, etc. Signing the
+checklist is a deliberate manual step.
 
 Observability
 -------------
@@ -53,11 +54,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
 from alpha_assay.observability import metrics as M
+
+if TYPE_CHECKING:
+    from alpha_assay.data.ibkr_adapter import IBKRAdapter
 
 _LOG = logging.getLogger(__name__)
 

@@ -157,9 +157,7 @@ def _make_engine(venue: Venue, trader_id: str = "SPIKE-001") -> BacktestEngine:
 def test_nautilus_engine_runs_against_fixture(sim_venue: Venue, fixture_df: pd.DataFrame) -> None:
     """E3: BacktestEngine instantiates, SIM venue attaches, fixture loads."""
     assert fixture_df.shape[0] >= 300, "fixture must have >= 300 rows"
-    assert (
-        list(fixture_df.columns) == EXPECTED_COLUMNS
-    ), f"unexpected columns: {list(fixture_df.columns)}"
+    assert list(fixture_df.columns) == EXPECTED_COLUMNS, f"unexpected columns: {list(fixture_df.columns)}"
 
     engine = _make_engine(sim_venue, trader_id="SPIKE-E3")
     try:
@@ -190,9 +188,7 @@ def test_always_flat_strategy_sees_every_bar(sim_venue: Venue, fixture_df: pd.Da
 
         engine.run()
 
-        assert strategy.bars_seen == len(
-            bars
-        ), f"strategy saw {strategy.bars_seen} bars, expected {len(bars)}"
+        assert strategy.bars_seen == len(bars), f"strategy saw {strategy.bars_seen} bars, expected {len(bars)}"
 
         cache = engine.cache
         orders = cache.orders()

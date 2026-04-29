@@ -35,14 +35,11 @@ class RiskCaps:
         if stop_pts > self.max_stop_pts:
             raise RiskCapViolation(f"stop_pts {stop_pts} exceeds max_stop_pts {self.max_stop_pts}")
         if target_pts < self.min_target_pts:
-            raise RiskCapViolation(
-                f"target_pts {target_pts} below min_target_pts {self.min_target_pts}"
-            )
+            raise RiskCapViolation(f"target_pts {target_pts} below min_target_pts {self.min_target_pts}")
         ratio = target_pts / stop_pts
         if ratio < self.min_target_to_stop_ratio:
             raise RiskCapViolation(
-                f"target/stop ratio {ratio:.2f} below "
-                f"min_target_to_stop_ratio {self.min_target_to_stop_ratio}"
+                f"target/stop ratio {ratio:.2f} below " f"min_target_to_stop_ratio {self.min_target_to_stop_ratio}"
             )
 
     def validate_exit_params(self, exit_params: ExitParams) -> None:

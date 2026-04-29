@@ -85,8 +85,4 @@ class KillSwitch:
     def should_trip_on_stale_data(self, feed_freshness_seconds: float) -> TripReason | None:
         if self.max_feed_freshness_seconds is None:
             return None
-        return (
-            TripReason.STALE_DATA
-            if feed_freshness_seconds > self.max_feed_freshness_seconds
-            else None
-        )
+        return TripReason.STALE_DATA if feed_freshness_seconds > self.max_feed_freshness_seconds else None

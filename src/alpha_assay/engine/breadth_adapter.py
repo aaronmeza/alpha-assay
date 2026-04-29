@@ -22,9 +22,7 @@ _TICK_DATA_TYPE = DataType(TickIndicator)
 _ADD_DATA_TYPE = DataType(AddIndicator)
 
 
-def df_to_breadth(
-    df: pd.DataFrame, instrument_id: InstrumentId
-) -> tuple[list[CustomData], list[CustomData]]:
+def df_to_breadth(df: pd.DataFrame, instrument_id: InstrumentId) -> tuple[list[CustomData], list[CustomData]]:
     """Return (tick_events, add_events) wrapped in CustomData envelopes.
 
     Requires `timestamp`, `TICK`, and `ADD` columns. `timestamp` must be a

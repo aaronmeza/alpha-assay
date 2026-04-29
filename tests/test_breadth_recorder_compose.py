@@ -29,9 +29,7 @@ def test_compose_breadth_recorder_service_uses_real_dockerfile() -> None:
 def test_compose_breadth_recorder_still_profile_gated() -> None:
     data = _load_compose()
     recorder = data["services"]["breadth-recorder"]
-    assert "recorder" in (
-        recorder.get("profiles") or []
-    ), "breadth-recorder must declare profiles: [recorder]"
+    assert "recorder" in (recorder.get("profiles") or []), "breadth-recorder must declare profiles: [recorder]"
 
 
 def test_compose_breadth_recorder_has_volume_mount_for_output() -> None:
@@ -46,8 +44,7 @@ def test_compose_breadth_recorder_has_volume_mount_for_output() -> None:
 
     top_volumes = data.get("volumes", {})
     assert "breadth_parquet" in top_volumes, (
-        f"breadth_parquet volume must be declared at the top level; got "
-        f"{sorted(top_volumes.keys())}"
+        f"breadth_parquet volume must be declared at the top level; got " f"{sorted(top_volumes.keys())}"
     )
 
 

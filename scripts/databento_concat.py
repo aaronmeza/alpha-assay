@@ -82,10 +82,7 @@ def main(argv: list[str] | None = None) -> None:
     merged_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(merged_path)
 
-    print(
-        f"merged {len(shards)} shards -> {merged_path} "
-        f"({len(merged)} rows, {merged_path.stat().st_size} bytes)"
-    )
+    print(f"merged {len(shards)} shards -> {merged_path} " f"({len(merged)} rows, {merged_path.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":

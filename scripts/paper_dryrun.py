@@ -22,9 +22,10 @@ heartbeat-only placeholder once IBKR creds are wired up. It:
 - Drains gracefully on SIGTERM / SIGINT within
   ``DRAIN_TIMEOUT_SECONDS`` (default 20s).
 
-The script is the always-flat paper dry-run; it replaces the ``paper_trader_stub.py`` heartbeat-only stub when IBKR creds are
-wired up. It NEVER submits orders. All test invariants for that fact
-live in ``tests/test_paper_dryrun_unit.py``; live the deployment host verification
+The script is the always-flat paper dry-run; it replaces
+``paper_trader_stub.py`` heartbeat-only stub when IBKR creds are
+wired up. It NEVER submits orders. Unit invariants live in
+``tests/test_paper_dryrun_unit.py``; deployment-host verification
 lives in ``tests/integration/test_e2e_paper_dryrun.py`` (opt-in via
 ``RUN_LIVE_E2E=1``).
 
@@ -189,8 +190,7 @@ class AlwaysFlatStrategy:
         """
         self.disconnect_count += 1
         _LOG.warning(
-            "ibkr disconnect observed; count=%d (heartbeat continues, reconnect deferred to "
-            "ib_insync)",
+            "ibkr disconnect observed; count=%d (heartbeat continues, reconnect deferred to " "ib_insync)",
             self.disconnect_count,
         )
 
@@ -361,8 +361,7 @@ def run(cfg: DryrunConfig) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     _LOG.info(
-        "paper-dryrun starting: ibkr=%s:%d client_id=%d metrics_port=%d es_expiry=%s "
-        "duration_seconds=%d",
+        "paper-dryrun starting: ibkr=%s:%d client_id=%d metrics_port=%d es_expiry=%s " "duration_seconds=%d",
         cfg.ibkr_host,
         cfg.ibkr_port,
         cfg.ibkr_client_id,

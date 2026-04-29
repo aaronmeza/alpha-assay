@@ -37,9 +37,7 @@ def test_two_in_process_runs_byte_equal(fixture_df):
 
     assert len(r1.trades) == len(r2.trades)
     for t1, t2 in zip(r1.trades, r2.trades, strict=False):
-        assert (
-            t1["timestamp"] == t2["timestamp"]
-        ), f"trade timestamp drift: {t1['timestamp']} vs {t2['timestamp']}"
+        assert t1["timestamp"] == t2["timestamp"], f"trade timestamp drift: {t1['timestamp']} vs {t2['timestamp']}"
         assert t1["price"] == t2["price"], f"fill price drift: {t1['price']} vs {t2['price']}"
         assert t1["quantity"] == t2["quantity"]
         assert t1["side"] == t2["side"]

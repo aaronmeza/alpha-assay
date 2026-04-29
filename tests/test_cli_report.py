@@ -322,9 +322,7 @@ def test_cli_report_handles_empty_trades_gracefully(tmp_path):
     pd.DataFrame(columns=["timestamp", "side", "price", "quantity", "order_type"]).to_csv(
         bt_out / "trades.csv", index=False
     )
-    (bt_out / "session_metrics.json").write_text(
-        json.dumps({"run_status": "completed", "submitted_signals": 0})
-    )
+    (bt_out / "session_metrics.json").write_text(json.dumps({"run_status": "completed", "submitted_signals": 0}))
 
     runner = CliRunner()
     result = runner.invoke(

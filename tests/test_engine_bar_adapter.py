@@ -87,9 +87,7 @@ def test_df_to_bars_clamps_inverted_low(bar_type):
 
 
 def test_df_to_bars_empty_df_returns_empty(bar_type):
-    df = pd.DataFrame(
-        columns=["timestamp", "ES_open", "ES_high", "ES_low", "ES_close", "ES_volume"]
-    )
+    df = pd.DataFrame(columns=["timestamp", "ES_open", "ES_high", "ES_low", "ES_close", "ES_volume"])
     bars = df_to_bars(df, bar_type)
     assert bars == []
 

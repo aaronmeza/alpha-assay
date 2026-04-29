@@ -141,9 +141,7 @@ def test_contract_spec_to_stock():
 
 def test_contract_spec_unknown_sec_type_raises_valueerror():
     try:
-        ibkr_adapter._build_contract(
-            {"symbol": "BTCUSD", "sec_type": "CRYPTO", "exchange": "PAXOS"}
-        )
+        ibkr_adapter._build_contract({"symbol": "BTCUSD", "sec_type": "CRYPTO", "exchange": "PAXOS"})
     except ValueError as exc:
         msg = str(exc)
         assert "CRYPTO" in msg

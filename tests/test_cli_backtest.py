@@ -1,5 +1,4 @@
-"""CliRunner-driven tests against the backtest CLI. Uses the synthetic CSV + SMA crossover to stay deterministic.
-"""
+"""CliRunner-driven tests against the backtest CLI. Uses the synthetic CSV + SMA crossover to stay deterministic."""
 
 import json
 from pathlib import Path

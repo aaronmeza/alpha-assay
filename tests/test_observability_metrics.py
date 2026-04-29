@@ -84,6 +84,4 @@ def test_start_metrics_server_exposes_http_endpoint():
     time.sleep(0.1)
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=2.0) as resp:
         body = resp.read().decode()
-    assert (
-        "alpha_assay_" in body
-    ), f"/metrics response should contain our prefix; got first 200 chars: {body[:200]!r}"
+    assert "alpha_assay_" in body, f"/metrics response should contain our prefix; got first 200 chars: {body[:200]!r}"

@@ -33,10 +33,7 @@ class BreadthAwareTestStrategy(BaseStrategy):
 
     def generate_signals(self, data: pd.DataFrame) -> pd.Series:
         if "TICK" not in data.columns or "ADD" not in data.columns:
-            raise KeyError(
-                "BreadthAwareTestStrategy requires TICK and ADD columns; "
-                f"got {list(data.columns)}"
-            )
+            raise KeyError("BreadthAwareTestStrategy requires TICK and ADD columns; " f"got {list(data.columns)}")
         sig = self.config["signal"]
         window = int(sig["tick_window"])
         thr = float(sig["tick_z_threshold"])

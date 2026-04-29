@@ -133,9 +133,7 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _estimate_schema_cost(
-    client, dataset: str, symbol: str, schema: str, start: str, end: str
-) -> float:
+def _estimate_schema_cost(client, dataset: str, symbol: str, schema: str, start: str, end: str) -> float:
     """Call Databento's metadata.get_cost for one (schema, range).
 
     Signature per databento-python v0.57+:
@@ -252,16 +250,12 @@ def main(argv: list[str] | None = None) -> None:
 
             cumulative_mb = total_bytes / (1024 * 1024)
             print(
-                f"[{day}] [{schema}] rows={rows} "
-                f"duration={call_duration:.2f}s cumulative={cumulative_mb:.2f} MB",
+                f"[{day}] [{schema}] rows={rows} " f"duration={call_duration:.2f}s cumulative={cumulative_mb:.2f} MB",
                 file=sys.stderr,
             )
 
     wall = time.monotonic() - t0
-    print(
-        f"summary: pulled={pulled} skipped={skipped} rows={total_rows} "
-        f"bytes={total_bytes} wall_s={wall:.2f}"
-    )
+    print(f"summary: pulled={pulled} skipped={skipped} rows={total_rows} " f"bytes={total_bytes} wall_s={wall:.2f}")
 
 
 if __name__ == "__main__":

@@ -10,9 +10,8 @@ dicts so the Streamlit UI can render them without further processing.
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+from typing import Any
 
-import numpy as np
 import pandas as pd
 
 
@@ -60,7 +59,7 @@ def compute_aggregate_metrics(
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
 
     # Annualised Sharpe on daily PnL series (250 trading days).
-    sharpe: Optional[float] = None
+    sharpe: float | None = None
     if n >= 2:
         std = float(pnl.std(ddof=1))
         if std > 0:
@@ -74,9 +73,7 @@ def compute_aggregate_metrics(
 
     return {
         "total_pnl_usd": round(total_pnl, 2),
-        "total_pnl_pct": round((total_pnl / starting_balance_usd) * 100, 4)
-        if starting_balance_usd
-        else None,
+        "total_pnl_pct": (round((total_pnl / starting_balance_usd) * 100, 4) if starting_balance_usd else None),
         "n_trades": n,
         "win_rate": round(win_rate, 4) if win_rate is not None else None,
         "profit_factor": round(profit_factor, 3) if profit_factor is not None else None,
@@ -129,26 +126,16 @@ def compute_per_day_summary(
             {
                 "date": str(date),
                 "n_trades": n,
-                "n_long": int((group["side"] == "long").sum())
-                if "side" in group.columns
-                else None,
-                "n_short": int((group["side"] == "short").sum())
-                if "side" in group.columns
-                else None,
+                "n_long": int((group["side"] == "long").sum()) if "side" in group.columns else None,
+                "n_short": (int((group["side"] == "short").sum()) if "side" in group.columns else None),
                 "total_pnl_usd": round(total_pnl, 2),
-                "total_pnl_pct": round((total_pnl / starting_balance_usd) * 100, 4)
-                if starting_balance_usd
-                else None,
+                "total_pnl_pct": (round((total_pnl / starting_balance_usd) * 100, 4) if starting_balance_usd else None),
                 "win_rate": round(len(wins) / n, 4) if n > 0 else None,
-                "largest_win_usd": round(float(wins.max()), 2)
-                if not wins.empty
-                else None,
-                "largest_loss_usd": round(float(losses.min()), 2)
-                if not losses.empty
-                else None,
-                "avg_hold_seconds": round(float(group["hold_seconds"].mean()), 1)
-                if "hold_seconds" in group.columns
-                else None,
+                "largest_win_usd": round(float(wins.max()), 2) if not wins.empty else None,
+                "largest_loss_usd": round(float(losses.min()), 2) if not losses.empty else None,
+                "avg_hold_seconds": (
+                    round(float(group["hold_seconds"].mean()), 1) if "hold_seconds" in group.columns else None
+                ),
             }
         )
 

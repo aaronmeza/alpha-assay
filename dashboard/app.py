@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -70,35 +69,35 @@ _TRADE_DISPLAY_COLS = [
 # ---------------------------------------------------------------------------
 
 
-def _fmt_usd(v: Optional[float]) -> str:
+def _fmt_usd(v: float | None) -> str:
     if v is None:
         return "-"
     sign = "+" if v > 0 else ""
     return f"{sign}${v:,.2f}"
 
 
-def _fmt_pct(v: Optional[float]) -> str:
+def _fmt_pct(v: float | None) -> str:
     if v is None:
         return "-"
     sign = "+" if v > 0 else ""
     return f"{sign}{v:.3f}%"
 
 
-def _fmt_ratio(v: Optional[float]) -> str:
+def _fmt_ratio(v: float | None) -> str:
     if v is None:
         return "-"
     return f"{v:.3f}"
 
 
-def _fmt_winrate(v: Optional[float]) -> str:
+def _fmt_winrate(v: float | None) -> str:
     if v is None:
         return "-"
     return f"{v * 100:.1f}%"
 
 
 def _build_time_range(
-    preset: str, df: Optional[pd.DataFrame], custom_start=None, custom_end=None
-) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    preset: str, df: pd.DataFrame | None, custom_start=None, custom_end=None
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     """Translate a preset label into (start, end) UTC timestamps."""
     now = pd.Timestamp.utcnow()
 
@@ -146,9 +145,7 @@ with st.sidebar:
     if not run_names:
         run_picker_options = [_ALL_RUNS_LABEL.replace("default", "0 found")]
     else:
-        friendly_labels = [
-            describe_run(Path(runs_dir) / name) for name in run_names
-        ]
+        friendly_labels = [describe_run(Path(runs_dir) / name) for name in run_names]
         run_picker_options = [_ALL_RUNS_LABEL] + friendly_labels
 
     selected_label = st.selectbox(
@@ -179,7 +176,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 # Resolve which run (if any) was explicitly picked.
-selected_run: Optional[str] = None
+selected_run: str | None = None
 if run_names and selected_label != _ALL_RUNS_LABEL:
     # Match the friendly label back to a run name.
     for name in run_names:
@@ -207,10 +204,7 @@ if trades_df is None:
 # ---------------------------------------------------------------------------
 
 if not run_names:
-    st.info(
-        "No session outputs found yet. "
-        "Results will appear here once sessions have completed."
-    )
+    st.info("No session outputs found yet. " "Results will appear here once sessions have completed.")
 
 # ---------------------------------------------------------------------------
 # Apply time filter
@@ -320,16 +314,9 @@ else:
     else:
         for summary in day_summaries:
             date_str = summary["date"]
-            pnl_label = (
-                f"{_fmt_usd(summary['total_pnl_usd'])}  ({_fmt_pct(summary['total_pnl_pct'])})"
-            )
-            trades_label = (
-                f"{summary['n_trades']} trades"
-                + (
-                    f"  ({summary['n_long']}L / {summary['n_short']}S)"
-                    if summary["n_long"] is not None
-                    else ""
-                )
+            pnl_label = f"{_fmt_usd(summary['total_pnl_usd'])}  ({_fmt_pct(summary['total_pnl_pct'])})"
+            trades_label = f"{summary['n_trades']} trades" + (
+                f"  ({summary['n_long']}L / {summary['n_short']}S)" if summary["n_long"] is not None else ""
             )
 
             # Card row
@@ -343,14 +330,11 @@ else:
                     f"Best: {_fmt_usd(summary['largest_win_usd'])}  |  Worst: {_fmt_usd(summary['largest_loss_usd'])}"
                 )
                 avg_hold = summary["avg_hold_seconds"]
-                card_cols[5].markdown(
-                    f"Avg hold: {int(avg_hold)}s" if avg_hold is not None else "Avg hold: -"
-                )
+                card_cols[5].markdown(f"Avg hold: {int(avg_hold)}s" if avg_hold is not None else "Avg hold: -")
 
             # Expandable trade table for this day.
             day_df = filtered_df[
-                filtered_df["entry_ts"].dt.tz_convert("America/Chicago").dt.date.astype(str)
-                == date_str
+                filtered_df["entry_ts"].dt.tz_convert("America/Chicago").dt.date.astype(str) == date_str
             ]
 
             display_cols = [c for c in _TRADE_DISPLAY_COLS if c in day_df.columns]
@@ -360,9 +344,7 @@ else:
             for ts_col in ("entry_ts", "exit_ts"):
                 if ts_col in display_df.columns:
                     display_df[ts_col] = (
-                        display_df[ts_col]
-                        .dt.tz_convert("America/Chicago")
-                        .dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+                        display_df[ts_col].dt.tz_convert("America/Chicago").dt.strftime("%Y-%m-%d %H:%M:%S %Z")
                     )
 
             with st.expander(f"Trades for {date_str} ({len(day_df)} rows)", expanded=False):

@@ -50,8 +50,7 @@ def _load_breadth_close(path: str | Path, out_col: str) -> pd.DataFrame:
     missing = [c for c in _BREADTH_REQUIRED if c not in df.columns]
     if missing:
         raise BreadthSchemaError(
-            f"breadth parquet at {path!s} missing required columns: {missing}; "
-            f"saw {list(df.columns)}"
+            f"breadth parquet at {path!s} missing required columns: {missing}; " f"saw {list(df.columns)}"
         )
     if df.empty:
         raise BreadthSchemaError(f"breadth parquet at {path!s} has zero rows")
@@ -66,9 +65,7 @@ def _load_breadth_close(path: str | Path, out_col: str) -> pd.DataFrame:
     # but we keep the contract loud so a corrupt shard fails here, not
     # silently in the inner-join.
     if out.index.duplicated().any():
-        raise BreadthSchemaError(
-            f"breadth parquet at {path!s} has duplicate timestamps after tz convert"
-        )
+        raise BreadthSchemaError(f"breadth parquet at {path!s} has duplicate timestamps after tz convert")
     return out
 
 
@@ -106,7 +103,6 @@ def load_es_with_breadth(
 
     if joined.empty:
         raise BreadthSchemaError(
-            "joined ES + breadth frame is empty; check that the ES window "
-            "overlaps the recorder shard timestamps"
+            "joined ES + breadth frame is empty; check that the ES window " "overlaps the recorder shard timestamps"
         )
     return joined.sort_index()

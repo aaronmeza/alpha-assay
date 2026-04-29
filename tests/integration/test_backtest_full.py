@@ -94,7 +94,4 @@ def test_backtest_full_ignores_breadth_columns_for_sma(fixture_df):
     )
     result_b = runner_b.run()
 
-    assert (
-        result_a.session_metrics["submitted_signals"]
-        == result_b.session_metrics["submitted_signals"]
-    )
+    assert result_a.session_metrics["submitted_signals"] == result_b.session_metrics["submitted_signals"]

@@ -393,12 +393,7 @@ class IBKRAdapter:
                 if last is None or pd.isna(last):
                     bid = getattr(t, "bid", None)
                     ask = getattr(t, "ask", None)
-                    if (
-                        bid is not None
-                        and ask is not None
-                        and not pd.isna(bid)
-                        and not pd.isna(ask)
-                    ):
+                    if bid is not None and ask is not None and not pd.isna(bid) and not pd.isna(ask):
                         last = (float(bid) + float(ask)) / 2.0
                 if last is None or pd.isna(last):
                     last = getattr(t, "close", None)
@@ -464,9 +459,9 @@ def _normalize_bar(raw: Any, feed: str) -> dict[str, Any]:
     }
 
 
-# Module-level sanity: `place_order` is intentionally absent. # will add a sibling module (`ibkr_executor.py`) that composes this
-# adapter's connection but exposes the order-submission surface
-# separately. Keeping order submission out of this module is the
-# explicit /T boundary and is asserted by
-# `test_adapter_has_no_place_order_attribute`.
+# Module-level sanity: `place_order` is intentionally absent. A sibling
+# module (`ibkr_executor.py`) composes this adapter's connection but
+# exposes the order-submission surface separately. Keeping order
+# submission out of this module is the explicit read-vs-write boundary
+# and is asserted by `test_adapter_has_no_place_order_attribute`.
 _LIVE_UNIX_TIME = time.time  # re-exported for tests that need monotonic stubbing

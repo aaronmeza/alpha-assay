@@ -132,9 +132,7 @@ TICK_DATA_TYPE = DataType(TickIndicator)
 ADD_DATA_TYPE = DataType(AddIndicator)
 
 
-def _df_to_breadth(
-    df: pd.DataFrame, instrument_id: InstrumentId
-) -> tuple[list[CustomData], list[CustomData]]:
+def _df_to_breadth(df: pd.DataFrame, instrument_id: InstrumentId) -> tuple[list[CustomData], list[CustomData]]:
     # BacktestEngine's DataEngine.process dispatch only routes custom data
     # when wrapped in a CustomData(data_type, data) envelope. Raw custom
     # Data subclasses fall through to a silent log.error("unrecognized
@@ -270,9 +268,7 @@ def test_custom_breadth_data_flows_to_strategy(sim_venue: Venue, fixture_df: pd.
         for event in strategy.events:
             by_kind[event.kind] += 1
         assert by_kind["bar"] == len(bars), f"expected {len(bars)} bars, got {by_kind['bar']}"
-        assert by_kind["tick"] == len(
-            ticks
-        ), f"expected {len(ticks)} TICK events, got {by_kind['tick']}"
+        assert by_kind["tick"] == len(ticks), f"expected {len(ticks)} TICK events, got {by_kind['tick']}"
         assert by_kind["add"] == len(adds), f"expected {len(adds)} ADD events, got {by_kind['add']}"
 
         # Interleave check: for every bar at ts T, the matching TICK and
@@ -297,8 +293,7 @@ def test_custom_breadth_data_flows_to_strategy(sim_venue: Venue, fixture_df: pd.
         # A batched-all-one-kind artifact would produce a run equal to
         # len(fixture_df); interleaved traffic yields a small run.
         assert max_run < 10, (
-            f"events look batched by kind (max_run={max_run}); "
-            "custom data is not interleaving with bars as expected"
+            f"events look batched by kind (max_run={max_run}); " "custom data is not interleaving with bars as expected"
         )
 
         cache = engine.cache

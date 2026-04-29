@@ -13,7 +13,6 @@ from dashboard.metrics import (
     compute_per_day_summary,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -101,10 +100,7 @@ def test_aggregate_pnl_pct():
 
 
 def test_aggregate_max_drawdown_zero_for_monotone_winners():
-    rows = [
-        {**_LONG_WIN, "pnl_usd": 50.0, "entry_ts": f"2026-04-0{i} 14:00:00+00:00"}
-        for i in range(2, 6)
-    ]
+    rows = [{**_LONG_WIN, "pnl_usd": 50.0, "entry_ts": f"2026-04-0{i} 14:00:00+00:00"} for i in range(2, 6)]
     df = _make_trades(rows)
     m = compute_aggregate_metrics(df)
     assert m["max_drawdown_usd"] == pytest.approx(0.0)

@@ -219,9 +219,7 @@ class NautilusBacktestRunner:
         self.data = data
         self.instrument_symbol = instrument_symbol
         self.starting_balance_usd = starting_balance_usd
-        self.risk_caps = risk_caps or RiskCaps(
-            max_stop_pts=5.0, min_target_pts=2.5, min_target_to_stop_ratio=2.0
-        )
+        self.risk_caps = risk_caps or RiskCaps(max_stop_pts=5.0, min_target_pts=2.5, min_target_to_stop_ratio=2.0)
 
     def _build_engine(self) -> BacktestEngine:
         config = BacktestEngineConfig(
@@ -300,20 +298,14 @@ class NautilusBacktestRunner:
             # back to a two-point start/end curve on zero-trade runs so
             # plotting code never hits an empty series.
             account = engine.portfolio.account(_VENUE)
-            final_balance = (
-                float(account.balance_total(USD).as_double())
-                if account
-                else self.starting_balance_usd
-            )
+            final_balance = float(account.balance_total(USD).as_double()) if account else self.starting_balance_usd
             if trades:
                 eq_idx = pd.DatetimeIndex([t["timestamp"] for t in trades])
                 eq_vals = [self.starting_balance_usd] * len(trades)
                 eq_vals[-1] = final_balance
                 equity = pd.Series(eq_vals, index=eq_idx, name="equity_usd")
             else:
-                eq_idx = pd.DatetimeIndex(
-                    [self.data["timestamp"].iloc[0], self.data["timestamp"].iloc[-1]]
-                )
+                eq_idx = pd.DatetimeIndex([self.data["timestamp"].iloc[0], self.data["timestamp"].iloc[-1]])
                 equity = pd.Series(
                     [self.starting_balance_usd, final_balance],
                     index=eq_idx,

@@ -5,11 +5,9 @@
 from __future__ import annotations
 
 import json
-import textwrap
 from pathlib import Path
 
 import pandas as pd
-import pytest
 
 from dashboard.loaders import (
     describe_run,
@@ -19,7 +17,6 @@ from dashboard.loaders import (
     load_per_trade_metrics,
     load_session_metrics,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures helpers

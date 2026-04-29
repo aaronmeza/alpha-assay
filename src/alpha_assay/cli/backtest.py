@@ -84,8 +84,7 @@ def backtest(
     # z-score path inside the strategy.
     if (tick_data_path is None) ^ (ad_data_path is None):
         raise click.UsageError(
-            "--tick-data and --ad-data must be provided together "
-            "(breadth-aware strategies need both feeds)."
+            "--tick-data and --ad-data must be provided together " "(breadth-aware strategies need both feeds)."
         )
 
     cfg = load_config(config_path)
@@ -99,9 +98,7 @@ def backtest(
     )
 
     if tick_data_path is not None and ad_data_path is not None:
-        df = load_es_with_breadth(
-            data_path, tick_path=tick_data_path, ad_path=ad_data_path
-        ).reset_index()
+        df = load_es_with_breadth(data_path, tick_path=tick_data_path, ad_path=ad_data_path).reset_index()
     else:
         df = load_parquet(data_path).reset_index()
     # Engine expects a `timestamp` column (not index) + ES_-prefixed OHLCV
@@ -119,7 +116,5 @@ def backtest(
     out.mkdir(parents=True, exist_ok=True)
     trades_df = pd.DataFrame(result.trades)
     trades_df.to_csv(out / "trades.csv", index=False)
-    (out / "session_metrics.json").write_text(
-        json.dumps(result.session_metrics, default=str, indent=2)
-    )
+    (out / "session_metrics.json").write_text(json.dumps(result.session_metrics, default=str, indent=2))
     click.echo(f"Wrote {len(result.trades)} trades and session_metrics.json to {out}")

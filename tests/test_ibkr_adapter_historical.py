@@ -18,9 +18,7 @@ def _epoch(s: str) -> int:
     return int(pd.Timestamp(s, tz="UTC").timestamp())
 
 
-def _fake_bar(
-    *, ts_iso: str, o: float, h: float, low: float, c: float, vol: int
-) -> SimpleNamespace:
+def _fake_bar(*, ts_iso: str, o: float, h: float, low: float, c: float, vol: int) -> SimpleNamespace:
     """Build a SimpleNamespace that quacks like ib_insync.BarData with formatDate=2."""
     return SimpleNamespace(
         date=_epoch(ts_iso),
