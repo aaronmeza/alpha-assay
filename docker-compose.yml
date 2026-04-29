@@ -48,7 +48,7 @@ services:
       IBKR_PORT: ${IBKR_PORT:-4002}
       IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
       IBKR_ACCOUNT: ${IBKR_ACCOUNT:-}
-      ES_EXPIRY: ${ES_EXPIRY:-202506}
+      ES_EXPIRY: ${ES_EXPIRY:-20260618}
     env_file:
       - path: .env.secrets
         required: false
@@ -129,7 +129,7 @@ services:
       IBKR_PORT: ${IBKR_PORT:-4002}
       IBKR_CLIENT_ID: ${ES_BARS_IBKR_CLIENT_ID:-22}
       IBKR_ACCOUNT: ${IBKR_ACCOUNT:-}
-      ES_EXPIRY: ${ES_EXPIRY:-202506}
+      ES_EXPIRY: ${ES_EXPIRY:-20260618}
     env_file:
       - path: .env.secrets
         required: false
