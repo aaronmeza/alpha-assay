@@ -147,6 +147,40 @@ services:
       retries: 5
       start_period: 10s
 
+  dashboard:
+    # Streamlit results browser. Profile-gated so `docker compose up`
+    # without --profile dashboard skips it. Bind-mounts RUNS_DIR from
+    # the host so the container can read run outputs without copying data.
+    #
+    # Bringup:
+    #   RUNS_DIR=/path/to/runs docker compose --profile dashboard up -d dashboard
+    profiles:
+      - dashboard
+    build:
+      context: .
+      dockerfile: infra/dashboard/Dockerfile
+    image: alphaassay/dashboard:0.1.0
+    container_name: alphaassay-dashboard
+    restart: unless-stopped
+    environment:
+      RUNS_DIR: /runs
+      TZ: America/Chicago
+    ports:
+      - "127.0.0.1:13001:8501"
+    volumes:
+      - type: bind
+        source: ${RUNS_DIR:-./runs}
+        target: /runs
+        read_only: true
+    networks:
+      - alphaassay_observability
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
   prometheus:
     image: prom/prometheus:v2.55.0
     container_name: alphaassay-prometheus

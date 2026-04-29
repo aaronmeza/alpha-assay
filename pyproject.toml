@@ -39,6 +39,11 @@ alpha_assay = "alpha_assay.cli:main"
 nautilus = ["nautilus_trader>=1.190"]
 databento = ["databento>=0.40"]
 report = ["quantstats>=0.0.62"]
+dashboard = [
+    "streamlit>=1.30",
+    "plotly>=5.0",
+    "pyarrow>=14.0",
+]
 dev = [
     "pytest>=7.4",
     "ruff>=0.6",
