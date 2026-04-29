@@ -3,11 +3,12 @@
 #
 # paper-trader image.
 #
-# Thin Python 3.11-slim base (matches pyproject.toml requires-python and the
-# rest of the repo). The entrypoint runs scripts/paper_trader_stub.py, which is
-# a heartbeat-only placeholder kept alive solely so Prometheus has a live
-# scrape target while replaces
-# the ENTRYPOINT with the real `alpha_assay paper` command.
+# Thin Python 3.11-slim base (matches pyproject.toml requires-python).
+# CMD points at scripts/paper_trader_stub.py - a heartbeat-only
+# placeholder kept alive solely so Prometheus has a live scrape target
+# when bringing the stack up without IBKR creds. Real deployments
+# override CMD via docker-compose `command:` to run the always-flat
+# scripts/paper_dryrun.py or the real paper-trader entrypoint.
 #
 # Build context is the repo root (see docker-compose.yml build.context).
 FROM python:3.11-slim
