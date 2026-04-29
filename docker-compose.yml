@@ -241,6 +241,37 @@ services:
       retries: 5
       start_period: 20s
 
+  alerts:
+    # Lightweight alert poller. Watches Prometheus for IBKR feed-freshness
+    # breaches during RTH and posts to a Telegram chat on state transition.
+    # Stdlib-only Python; no extra runtime deps.
+    profiles:
+      - alerts
+    build:
+      context: .
+      dockerfile: infra/alerts/Dockerfile
+    image: alphaassay/alerts:0.1.0
+    container_name: alphaassay-alerts
+    restart: unless-stopped
+    environment:
+      PROMETHEUS_URL: http://prometheus:9090
+      POLL_INTERVAL_SECONDS: "60"
+      FRESHNESS_THRESHOLD: "60"
+      SUSTAIN_SECONDS: "300"
+      RTH_TZ: America/Chicago
+      RTH_START_HHMM: "0830"
+      RTH_END_HHMM: "1500"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TZ: America/Chicago
+    env_file:
+      - path: .env.alerts
+        required: false
+    depends_on:
+      - prometheus
+    networks:
+      - alphaassay_observability
+
 networks:
   alphaassay_observability:
     name: alphaassay_observability
