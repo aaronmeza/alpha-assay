@@ -33,7 +33,7 @@ services:
     build:
       context: .
       dockerfile: infra/paper-trader/Dockerfile
-    image: alphaassay/paper-trader:phase-w
+    image: alphaassay/paper-trader:0.1.0
     container_name: alphaassay-paper-trader
     restart: on-failure:3
     command: ["python", "-u", "/app/scripts/paper_dryrun.py"]
@@ -74,7 +74,7 @@ services:
     # recorder only runs on the host during an active IBKR session.
     profiles:
       - recorder
-    image: alphaassay/breadth-recorder:phase-u
+    image: alphaassay/breadth-recorder:0.1.0
     build:
       context: .
       dockerfile: infra/recorders/ibkr_breadth/Dockerfile
@@ -112,7 +112,7 @@ services:
     # loop still skips both by default.
     profiles:
       - recorder
-    image: alphaassay/es-bars-recorder:phase-y
+    image: alphaassay/es-bars-recorder:0.1.0
     build:
       context: .
       dockerfile: infra/recorders/ibkr_es_bars/Dockerfile
