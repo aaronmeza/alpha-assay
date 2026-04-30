@@ -331,11 +331,23 @@ class BreadthRecorder:
         or on shutdown.
         """
         assert self._shutdown_event is not None
+
+        async def _watch_connection() -> None:
+            # Poll the adapter every 5s. If the connection drops, ib_insync
+            # stops yielding ticks without raising - the per-symbol
+            # consumers hang forever. Watcher raises so the outer
+            # supervisor reconnects.
+            while True:
+                await asyncio.sleep(5)
+                if not self._adapter.is_connected:
+                    raise ConnectionError("adapter disconnected; reconnect needed")
+
         tasks = [asyncio.create_task(self._stream_symbol(sym)) for sym in self._symbols]
         shutdown_waiter = asyncio.create_task(self._shutdown_event.wait())
+        connection_watcher = asyncio.create_task(_watch_connection())
         try:
             done, _pending = await asyncio.wait(
-                [*tasks, shutdown_waiter],
+                [*tasks, shutdown_waiter, connection_watcher],
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for t in done:
@@ -357,6 +369,10 @@ class BreadthRecorder:
                 shutdown_waiter.cancel()
                 with suppress(asyncio.CancelledError):
                     await shutdown_waiter
+            if not connection_watcher.done():
+                connection_watcher.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await connection_watcher
 
     async def _stream_symbol(self, symbol: str) -> None:
         assert self._shutdown_event is not None

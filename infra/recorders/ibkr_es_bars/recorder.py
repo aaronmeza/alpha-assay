@@ -354,12 +354,23 @@ class ESBarsRecorder:
                     return
                 self.ingest_bar(bar)
 
+        async def _watch_connection() -> None:
+            # Poll the adapter every 5s. If the connection drops (peer
+            # closed, IB Gateway restart, etc.) ib_insync stops yielding
+            # bars without raising - the consume_task hangs forever. The
+            # watcher raises so the outer supervisor reconnects.
+            while True:
+                await asyncio.sleep(5)
+                if not self._adapter.is_connected:
+                    raise ConnectionError("adapter disconnected; reconnect needed")
+
         gen = self._adapter.subscribe_bars(self._contract_spec)
         consume_task = asyncio.create_task(_consume(gen))
         shutdown_waiter = asyncio.create_task(self._shutdown_event.wait())
+        connection_watcher = asyncio.create_task(_watch_connection())
         try:
             done, _pending = await asyncio.wait(
-                [consume_task, shutdown_waiter],
+                [consume_task, shutdown_waiter, connection_watcher],
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for t in done:
@@ -377,6 +388,10 @@ class ESBarsRecorder:
                 shutdown_waiter.cancel()
                 with suppress(asyncio.CancelledError):
                     await shutdown_waiter
+            if not connection_watcher.done():
+                connection_watcher.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await connection_watcher
             with suppress(Exception):
                 await gen.aclose()
 
