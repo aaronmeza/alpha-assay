@@ -8,6 +8,11 @@ apiVersion: 1
 
 datasources:
   - name: Prometheus
+    # Stable uid so dashboard JSON can reference it via the modern
+    # {type, uid} object form. Grafana 8+ deprecated the legacy
+    # by-name string reference; 11.x will not resolve it at all and
+    # panels render "No data".
+    uid: prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090

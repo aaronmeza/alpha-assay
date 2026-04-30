@@ -3,7 +3,10 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": "Prometheus",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
@@ -17,7 +20,11 @@
   "graphTooltip": 1,
   "title": "AlphaAssay trading observability",
   "uid": "alphaassay-v01",
-  "tags": ["alphaassay", "paper-trader", "phase-v"],
+  "tags": [
+    "alphaassay",
+    "paper-trader",
+    "phase-v"
+  ],
   "schemaVersion": 39,
   "version": 1,
   "refresh": "15s",
@@ -32,7 +39,12 @@
       "id": 100,
       "title": "Signal pipeline",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "panels": []
     },
     {
@@ -40,8 +52,16 @@
       "id": 1,
       "title": "Bars processed (rate /1m)",
       "description": "rate(alpha_assay_bars_processed_total[1m]) per feed",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
       "targets": [
         {
           "expr": "sum by (feed) (rate(alpha_assay_bars_processed_total[1m]))",
@@ -54,8 +74,16 @@
       "type": "timeseries",
       "id": 2,
       "title": "Signals generated (rate /1m)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
       "targets": [
         {
           "expr": "sum by (strategy, direction) (rate(alpha_assay_signals_generated_total[1m]))",
@@ -68,8 +96,16 @@
       "type": "timeseries",
       "id": 3,
       "title": "Signals filtered (rate /1m)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
       "targets": [
         {
           "expr": "sum by (filter_name, reason) (rate(alpha_assay_signals_filtered_total[1m]))",
@@ -82,8 +118,16 @@
       "type": "timeseries",
       "id": 4,
       "title": "Signals fired (rate /1m)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
       "targets": [
         {
           "expr": "sum by (strategy, direction) (rate(alpha_assay_signals_fired_total[1m]))",
@@ -97,15 +141,28 @@
       "id": 101,
       "title": "Orders and fills",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
       "panels": []
     },
     {
       "type": "timeseries",
       "id": 5,
       "title": "Orders submitted (rate /1m)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
       "targets": [
         {
           "expr": "sum by (type) (rate(alpha_assay_orders_submitted_total[1m]))",
@@ -118,8 +175,16 @@
       "type": "timeseries",
       "id": 6,
       "title": "Orders filled (rate /1m)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
       "targets": [
         {
           "expr": "sum by (type, status) (rate(alpha_assay_orders_filled_total[1m]))",
@@ -132,8 +197,16 @@
       "type": "heatmap",
       "id": 7,
       "title": "Fill slippage (points) - heatmap",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
       "targets": [
         {
           "expr": "sum by (le) (rate(alpha_assay_fill_slippage_points_bucket[5m]))",
@@ -146,8 +219,16 @@
       "type": "timeseries",
       "id": 8,
       "title": "Fill slippage p50 / p90 / p99",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(alpha_assay_fill_slippage_points_bucket[5m])))",
@@ -171,15 +252,28 @@
       "id": 102,
       "title": "Trade level",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
       "panels": []
     },
     {
       "type": "timeseries",
       "id": 9,
       "title": "Trades completed (rate /5m)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 35 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 35
+      },
       "targets": [
         {
           "expr": "sum by (outcome) (rate(alpha_assay_trades_total[5m]))",
@@ -192,8 +286,16 @@
       "type": "heatmap",
       "id": 10,
       "title": "Trade PnL (points)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 35 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 35
+      },
       "targets": [
         {
           "expr": "sum by (le) (rate(alpha_assay_trade_pnl_points_bucket[15m]))",
@@ -206,8 +308,16 @@
       "type": "timeseries",
       "id": 11,
       "title": "Trade duration p50 / p95 (seconds)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 35 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 35
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(alpha_assay_trade_duration_seconds_bucket[15m])))",
@@ -225,8 +335,16 @@
       "type": "heatmap",
       "id": 12,
       "title": "Trade MAE (points)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 43
+      },
       "targets": [
         {
           "expr": "sum by (le) (rate(alpha_assay_trade_mae_points_bucket[15m]))",
@@ -239,8 +357,16 @@
       "type": "heatmap",
       "id": 13,
       "title": "Trade MFE (points)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 43
+      },
       "targets": [
         {
           "expr": "sum by (le) (rate(alpha_assay_trade_mfe_points_bucket[15m]))",
@@ -254,15 +380,28 @@
       "id": 103,
       "title": "Equity and risk",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      },
       "panels": []
     },
     {
       "type": "timeseries",
       "id": 14,
       "title": "Equity (points)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 52 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 52
+      },
       "targets": [
         {
           "expr": "alpha_assay_equity_points",
@@ -275,8 +414,16 @@
       "type": "timeseries",
       "id": 15,
       "title": "Session PnL (points)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 52 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 52
+      },
       "targets": [
         {
           "expr": "alpha_assay_session_pnl_points",
@@ -289,8 +436,16 @@
       "type": "timeseries",
       "id": 16,
       "title": "Drawdown (points)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 52 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 52
+      },
       "targets": [
         {
           "expr": "alpha_assay_drawdown_points",
@@ -303,8 +458,16 @@
       "type": "timeseries",
       "id": 17,
       "title": "Position (contracts)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 52 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 52
+      },
       "targets": [
         {
           "expr": "alpha_assay_position_contracts",
@@ -318,15 +481,28 @@
       "id": 104,
       "title": "Health and session state",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 60 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
       "panels": []
     },
     {
       "type": "timeseries",
       "id": 18,
       "title": "Feed freshness (seconds since last tick)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 61 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
       "targets": [
         {
           "expr": "alpha_assay_feed_freshness_seconds",
@@ -339,8 +515,16 @@
       "type": "stat",
       "id": 19,
       "title": "IBKR connected",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 61 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 61
+      },
       "targets": [
         {
           "expr": "alpha_assay_ibkr_connected",
@@ -353,8 +537,16 @@
       "type": "timeseries",
       "id": 25,
       "title": "IBKR connection events/min",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 77 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 77
+      },
       "targets": [
         {
           "expr": "sum by (event) (rate(alpha_assay_ibkr_connection_events_total[1m]))",
@@ -367,8 +559,16 @@
       "type": "timeseries",
       "id": 26,
       "title": "IBKR feed freshness (seconds since last tick)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 77 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 77
+      },
       "targets": [
         {
           "expr": "alpha_assay_ibkr_feed_freshness_seconds",
@@ -381,8 +581,16 @@
       "type": "stat",
       "id": 20,
       "title": "Kill-switch armed",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 61 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 61
+      },
       "targets": [
         {
           "expr": "alpha_assay_kill_switch_armed",
@@ -395,8 +603,16 @@
       "type": "stat",
       "id": 21,
       "title": "In session",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 61 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 61
+      },
       "targets": [
         {
           "expr": "alpha_assay_in_session",
@@ -409,8 +625,16 @@
       "type": "timeseries",
       "id": 22,
       "title": "Kill-switch trips (rate /5m)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 65 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 65
+      },
       "targets": [
         {
           "expr": "sum by (reason) (rate(alpha_assay_kill_switch_trips_total[5m]))",
@@ -424,7 +648,12 @@
       "id": 106,
       "title": "Execution mode and live-mode locks",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 83 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 83
+      },
       "panels": []
     },
     {
@@ -432,8 +661,16 @@
       "id": 27,
       "title": "Exec mode (paper vs live)",
       "description": "alpha_assay_exec_mode{mode=\"paper|live\"} -- 1 for active mode, 0 for other.",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 84 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 84
+      },
       "targets": [
         {
           "expr": "alpha_assay_exec_mode",
@@ -447,8 +684,16 @@
       "id": 28,
       "title": "Live-mode lock state (env / cli / checklist)",
       "description": "alpha_assay_live_lock_state{lock=\"env|cli|checklist\"} -- 1 engaged, 0 not. All three must be 1 to flip LIVE.",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 84 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 84
+      },
       "targets": [
         {
           "expr": "alpha_assay_live_lock_state",
@@ -462,15 +707,28 @@
       "id": 105,
       "title": "Runtime latency",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 69 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
       "panels": []
     },
     {
       "type": "timeseries",
       "id": 23,
       "title": "Signal eval latency p50 / p95 / p99 (seconds)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 70 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le, strategy) (rate(alpha_assay_signal_eval_seconds_bucket[5m])))",
@@ -493,8 +751,16 @@
       "type": "timeseries",
       "id": 24,
       "title": "Bar-to-order latency p50 / p95 / p99 (seconds)",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 70 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(alpha_assay_bar_to_order_seconds_bucket[5m])))",
@@ -518,7 +784,12 @@
       "id": 106,
       "title": "Breadth recorder ",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 78 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 78
+      },
       "panels": []
     },
     {
@@ -526,8 +797,16 @@
       "id": 30,
       "title": "Recorder ticks received (rate /1m)",
       "description": "rate(alpha_assay_recorder_ticks_received_total[1m]) per symbol",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 79 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 79
+      },
       "targets": [
         {
           "expr": "sum by (symbol) (rate(alpha_assay_recorder_ticks_received_total[1m]))",
@@ -541,8 +820,16 @@
       "id": 31,
       "title": "Recorder bars written (rate /5m)",
       "description": "rate(alpha_assay_recorder_bars_written_total[5m]) per symbol",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 79 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 79
+      },
       "targets": [
         {
           "expr": "sum by (symbol) (rate(alpha_assay_recorder_bars_written_total[5m]))",
@@ -556,8 +843,16 @@
       "id": 32,
       "title": "Recorder write errors (rate /5m)",
       "description": "rate(alpha_assay_recorder_write_errors_total[5m]) per symbol + error_class",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 87 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 87
+      },
       "targets": [
         {
           "expr": "sum by (symbol, error_class) (rate(alpha_assay_recorder_write_errors_total[5m]))",
@@ -571,8 +866,16 @@
       "id": 33,
       "title": "Recorder RTH session gap (seconds since last tick)",
       "description": "alpha_assay_recorder_session_gap_seconds per symbol. Sustained growth during RTH indicates a feed stall.",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 87 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 87
+      },
       "targets": [
         {
           "expr": "alpha_assay_recorder_session_gap_seconds",
@@ -586,8 +889,16 @@
       "id": 34,
       "title": "Recorder reconnect attempts",
       "description": "alpha_assay_recorder_reconnects_total. Non-zero means the adapter lost the IBKR connection at least once.",
-      "datasource": "Prometheus",
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 95 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 95
+      },
       "targets": [
         {
           "expr": "alpha_assay_recorder_reconnects_total",
