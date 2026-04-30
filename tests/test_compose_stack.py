@@ -112,12 +112,16 @@ def test_prometheus_scrape_targets() -> None:
     for job in scrape_configs:
         if job["job_name"] == "paper-trader":
             targets = job["static_configs"][0]["targets"]
-            assert "paper-trader:8000" in targets, f"paper-trader job must target internal port 8000; got {targets}"
+            assert "host.docker.internal:8000" in targets, (
+                f"paper-trader job must target host.docker.internal:8000 so the scrape "
+                f"works whether the container is on the bridge network or network_mode: host; "
+                f"got {targets}"
+            )
         elif job["job_name"] == "breadth-recorder":
             targets = job["static_configs"][0]["targets"]
-            assert (
-                "breadth-recorder:8001" in targets
-            ), f"breadth-recorder job must target internal port 8001; got {targets}"
+            assert "host.docker.internal:8001" in targets, (
+                f"breadth-recorder job must target host.docker.internal:8001; got {targets}"
+            )
 
 
 def test_grafana_dashboard_json_is_valid() -> None:
