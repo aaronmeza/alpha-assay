@@ -12,7 +12,7 @@ to keep them distinct from the breadth recorder's
 Counters end in ``_total`` (Prometheus convention).
 
 The recorder service exposes these on its own HTTP port: ``:8002``
-container-internal, ``:18002`` host-side Tailscale-gated.
+container-internal, ``:18002`` host-side (loopback-only).
 """
 
 from __future__ import annotations

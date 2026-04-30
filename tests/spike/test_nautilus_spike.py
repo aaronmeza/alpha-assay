@@ -1,12 +1,11 @@
-"""NautilusTrader engine spike (Week 1, PR #6).
+"""NautilusTrader engine spike.
 
 Goal: prove end-to-end wiring of NautilusTrader's BacktestEngine against
 the project's sample_2d.csv fixture before committing to the engine
 adapter work. No signal logic, no orders - just load data, run an
 always-flat strategy, confirm zero errors.
 
-Tested against nautilus_trader==1.225.0. See commit message for API
-deviations from the original plan.
+Tested against nautilus_trader==1.225.0.
 """
 
 from __future__ import annotations

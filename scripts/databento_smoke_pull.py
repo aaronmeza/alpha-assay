@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""1-day Databento smoke pull for ES 1-min OHLCV bars.
+"""1-day Databento smoke pull for futures 1-min OHLCV bars.
 
-Uses free-trial credits (no paid subscription in Week 2). Writes to
-data/databento_smoke/ which is in .gitignore; DO NOT commit the output
-parquet.
+Uses free-trial credits so a small evaluation pull does not require
+a paid subscription. Writes to data/databento_smoke/ which is in
+.gitignore; DO NOT commit the output parquet.
 
 Usage:
     DATABENTO_API_KEY=db-XXXXX python scripts/databento_smoke_pull.py \

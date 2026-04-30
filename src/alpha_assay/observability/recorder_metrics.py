@@ -8,7 +8,7 @@ All series prefixed `alpha_assay_` (consistent with the core catalog).
 Counters suffixed `_total`.
 
 The recorder service process will expose these on its own HTTP port
-(:8001 container-internal, :18001 host-side Tailscale-gated).
+(:8001 container-internal, :18001 host-side, loopback-only).
 """
 
 from __future__ import annotations

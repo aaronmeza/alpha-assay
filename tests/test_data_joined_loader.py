@@ -130,8 +130,8 @@ def test_load_es_with_breadth_empty_breadth_file_raises(tmp_path):
 
 
 def test_load_es_with_breadth_no_overlap_raises(tmp_path):
-    es_idx = pd.date_range("2026-04-13 09:00", periods=30, freq="1min", tz="America/Chicago")
-    breadth_idx = pd.date_range("2026-05-13 09:00", periods=30, freq="1min", tz="America/Chicago")
+    es_idx = pd.date_range("2024-04-13 09:00", periods=30, freq="1min", tz="America/Chicago")
+    breadth_idx = pd.date_range("2024-05-13 09:00", periods=30, freq="1min", tz="America/Chicago")
     es = tmp_path / "es.parquet"
     tick = tmp_path / "tick.parquet"
     ad = tmp_path / "ad.parquet"

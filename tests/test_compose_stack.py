@@ -45,7 +45,7 @@ def test_compose_yaml_is_valid() -> None:
     for required in ("prometheus_data", "grafana_data"):
         assert required in volumes, f"expected {required} volume; got {sorted(volumes.keys())}"
 
-    # Host-port bindings: non-default + 127.0.0.1 only (Tailscale-gated).
+    # Host-port bindings: non-default + 127.0.0.1 only (loopback-only).
     expected_host_ports = {"13000", "19090", "18000", "18001"}
     seen_host_ports: set[str] = set()
     for svc_name, svc in services.items():
@@ -54,7 +54,7 @@ def test_compose_yaml_is_valid() -> None:
             assert "0.0.0.0" not in port, f"service {svc_name} binds to 0.0.0.0 ({port!r}); must bind 127.0.0.1 only"
             assert port.startswith(
                 "127.0.0.1:"
-            ), f"service {svc_name} port {port!r} must bind 127.0.0.1 for Tailscale-gated access"
+            ), f"service {svc_name} port {port!r} must bind 127.0.0.1 (loopback only)"
             host_port = port.split(":")[1]
             seen_host_ports.add(host_port)
             assert host_port not in {

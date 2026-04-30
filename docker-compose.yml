@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Aaron Meza
 #
-# observability + paper-trader stack for the deployment host deploy.
+# observability + paper-trader stack for a single Linux Docker host.
 #
 # ADR decision 7 constraints:
 #   - Non-default host ports (prometheus 19090, grafana 13000, paper-trader
 #     metrics 18000, breadth-recorder metrics 18001).
-#   - Tailscale-only access: every host port binds 127.0.0.1 only. On the host,
-#     Tailscale magic-DNS routes traffic from approved peers to these ports;
-#     no service is reachable from the public internet.
-#   - Isolated from the existing factory stack: dedicated network
-#     `alphaassay_observability` and container names prefixed `alphaassay-`.
+#   - Loopback-only by default: every host port binds 127.0.0.1, so
+#     services are not reachable from the public internet on a default
+#     deploy. Operators are expected to provide their own access layer
+#     (VPN, reverse-proxy, identity-aware proxy, etc.) on top.
+#   - Dedicated bridge network `alphaassay_observability` and container
+#     names prefixed `alphaassay-` so the stack co-exists with anything
+#     else running on the host.
 #
 # Secrets (IBKR creds, Databento API key) are loaded from `.env.secrets` at the
 # repo root via the `env_file:` directive. That file is in .gitignore; use
@@ -53,7 +55,8 @@ services:
       - path: .env.secrets
         required: false
     ports:
-      # host -> container. 127.0.0.1 only, Tailscale-gated.
+      # host -> container. 127.0.0.1 only - operator's access layer
+      # decides what reaches it.
       - "127.0.0.1:18000:8000"
     networks:
       - alphaassay_observability

@@ -2,9 +2,10 @@
 # Copyright 2026 Aaron Meza
 """Databento parquet loader.
 
-scope: ES 1-min OHLCV only (schema `ohlcv-1m`). Databento does
-NOT carry NYSE `$TICK` / `$ADD` (ADR Appendix B). Those feeds are
-sourced from the IBKR live recorder (Week 3+).
+Scope: futures 1-min OHLCV only (Databento schema `ohlcv-1m`).
+Databento does not carry NYSE breadth indices (TICK-NYSE, AD-NYSE) -
+those are recorded live from IBKR's free CME entitlement (see the
+recorders under `infra/recorders/`).
 
 Canonical schema after load:
     DatetimeIndex name='timestamp' tz='America/Chicago', columns:

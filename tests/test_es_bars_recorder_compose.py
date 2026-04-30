@@ -83,7 +83,7 @@ def test_compose_es_bars_recorder_has_unique_metrics_port() -> None:
     )
 
     ports = rec.get("ports") or []
-    # Tailscale-gated host binding on 18002.
+    # Loopback-only host binding on 18002.
     assert any(
         isinstance(p, str) and p == "127.0.0.1:18002:8002" for p in ports
     ), f"expected host port 127.0.0.1:18002:8002; got {ports}"

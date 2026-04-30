@@ -8,7 +8,7 @@ Open-source backtesting and paper-trading framework for intraday futures strateg
 
 `alpha_assay` is the **shell**: a plugin contract (`BaseStrategy`), a [NautilusTrader](https://nautilustrader.io/)-backed event-driven runner with explicit backtest-to-live parity, adapters for market data ([Databento](https://databento.com/) historical + [IBKR](https://www.interactivebrokers.com/) live via `ib_insync`), and a self-contained Docker Compose stack with private Grafana + Prometheus for observability. Strategies are written as subclasses of `BaseStrategy` and can be kept in your own private repo.
 
-The reference workload is an ES `$TICK` / `$ADD` breadth-fade scalper on 1-minute bars, paper-traded through IBKR. Nothing in the public framework is specific to that strategy.
+The shipped example is an SMA crossover on 1-minute MNQ (Micro E-mini Nasdaq) futures. Walk through it via the Quickstart below; replace it with your own strategy by following "Bring your own strategy."
 
 ## Repo layout
 
@@ -26,8 +26,11 @@ alpha-assay/
 │   └── cli/                 # backtest, paper, report, kill, reset
 ├── examples/
 │   └── sma_crossover.py     # quickstart strategy
-├── apps/
-│   └── paper-trader/        # Dockerfile + entrypoint
+├── infra/
+│   ├── paper-trader/        # paper-trader Dockerfile
+│   ├── recorders/           # IBKR live-bar + breadth recorders
+│   ├── alerts/              # IBKR feed-freshness Telegram alert poller
+│   └── dashboard/           # Streamlit results-browser image
 ├── observability/
 │   ├── prometheus/          # scrape config
 │   └── grafana/             # dashboard JSON + provisioning
@@ -163,13 +166,13 @@ Example (OHLCV-only):
 ```bash
 alpha_assay backtest \
   --strategy examples.sma_crossover:SMACrossoverStrategy \
-  --config configs/sma.yaml \
-  --data data/es_1m.parquet \
-  --out runs/2026-04-27/
+  --config configs/sma_crossover.yaml \
+  --data data/sample/synth_2d.parquet \
+  --out runs/sma-demo/
 ```
 
-Example (with NYSE breadth feeds for breadth-aware strategies like
-a breadth-aware strategy):
+Example (with NYSE breadth feeds, for strategies that consume
+TICK-NYSE / AD-NYSE values alongside OHLCV):
 
 ```bash
 alpha_assay backtest \
@@ -258,14 +261,14 @@ Example end-to-end (backtest then report):
 ```bash
 alpha_assay backtest \
   --strategy examples.sma_crossover:SMACrossoverStrategy \
-  --config configs/sma.yaml \
-  --data data/es_1m.parquet \
-  --out runs/2026-04-27/
+  --config configs/sma_crossover.yaml \
+  --data data/sample/synth_2d.parquet \
+  --out runs/sma-demo/
 
 alpha_assay report \
-  --in runs/2026-04-27/ \
-  --instrument-multiplier 50.0 \
-  --data data/es_1m.parquet \
+  --in runs/sma-demo/ \
+  --instrument-multiplier 2.0 \
+  --data data/sample/synth_2d.parquet \
   --format both
 ```
 
@@ -286,8 +289,9 @@ class MyStrategy(BaseStrategy):
         # return a Series of {-1, 0, +1} aligned to data.index
         ...
 
-    def get_exit_params(self, signal: Signal, data: pd.DataFrame) -> tuple[float, float]:
-        # return (stop_points, target_points) within the framework's hard caps
+    def get_exit_params(self, signal: Signal, data: pd.DataFrame) -> ExitParams:
+        # return ExitParams(stop_points, target_points, time_stop=None) within
+        # the framework's hard caps; time_stop is an optional timedelta.
         ...
 ```
 
@@ -339,7 +343,7 @@ See `docs/guardrails.md` and `docs/go-live-checklist.md`. Highlights:
 
 ## Observability
 
-The project ships a self-contained Grafana + Prometheus stack via Docker Compose. Drop it in via `docker compose up`; the paper-trader exposes `/metrics` on port 9200, Prometheus scrapes, Grafana renders a provisioned dashboard. Metrics cover signal flow (generated / filtered / fired), equity curve, per-trade MAE / MFE / duration, fill slippage, and health (feed freshness, IBKR connection, kill-switch state).
+The project ships a self-contained Grafana + Prometheus stack via Docker Compose. Drop it in via `docker compose up`; the paper-trader exposes `/metrics` on port 8000 (mapped to `127.0.0.1:18000` on the host), Prometheus scrapes, Grafana renders a provisioned dashboard. Metrics cover signal flow (generated / filtered / fired), equity curve, per-trade MAE / MFE / duration, fill slippage, and health (feed freshness, IBKR connection, kill-switch state).
 
 ## License
 
@@ -349,6 +353,3 @@ Apache License 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
 Issues and PRs welcome once the v0.1 contract stabilizes. Until then, treat this as a reference implementation. Coding standards in `docs/coding-standards.md`.
 
-## Related
-
-The reference proprietary strategy implementation (an ES `$TICK` / `$ADD` breadth-fade) lives in a separate private repo. The public framework has no dependency on it; it is one consumer among many.

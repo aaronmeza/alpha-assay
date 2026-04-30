@@ -151,9 +151,10 @@ bar_to_order_seconds = Histogram(
 )
 
 
-def start_metrics_server(port: int = 9200) -> None:
+def start_metrics_server(port: int = 8000) -> None:
     """Start the Prometheus HTTP exporter on the given port. Safe to
     call once per process. The paper-trader container exposes this on
-    :9200; Prometheus on the host scrapes it Tailscale-only.
+    :8000 (mapped to host :18000, loopback-only); Prometheus scrapes
+    it over the alphaassay_observability bridge network.
     """
     start_http_server(port)
