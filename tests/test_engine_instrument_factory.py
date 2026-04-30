@@ -3,7 +3,11 @@ from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.instruments import FuturesContract
 
-from alpha_assay.engine.instrument_factory import make_es_futures, make_mes_futures
+from alpha_assay.engine.instrument_factory import (
+    make_es_futures,
+    make_mes_futures,
+    make_mnq_futures,
+)
 
 
 def test_make_es_futures_returns_futures_contract():
@@ -55,3 +59,20 @@ def test_make_mes_futures_brackets_week1_fixture_window():
     fixture_ts = int(pd.Timestamp("2026-04-28", tz="UTC").value)
     assert mes.activation_ns <= fixture_ts
     assert mes.expiration_ns >= fixture_ts
+
+
+def test_make_mnq_futures_has_2_multiplier_and_nq_underlying():
+    venue = Venue("SIM")
+    mnq = make_mnq_futures(venue)
+    assert int(mnq.multiplier) == 2
+    assert str(mnq.raw_symbol) == "MNQM6"
+    assert mnq.underlying == "NQ"
+    assert mnq.asset_class == AssetClass.INDEX
+
+
+def test_make_mnq_futures_brackets_fixture_window():
+    venue = Venue("SIM")
+    mnq = make_mnq_futures(venue)
+    fixture_ts = int(pd.Timestamp("2026-04-28", tz="UTC").value)
+    assert mnq.activation_ns <= fixture_ts
+    assert mnq.expiration_ns >= fixture_ts

@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Aaron Meza
-"""FuturesContract factories for ES and MES.
+"""FuturesContract factories for the equity-index futures the
+framework knows about today: ES (E-mini S&P 500), MES (Micro E-mini
+S&P), and MNQ (Micro E-mini Nasdaq-100).
 
 Wraps the Nautilus construction ceremony captured in ADR Appendix A:
 activation/expiration as uint64 nanoseconds (not datetime); multiplier
 and lot_size as Quantity; AssetClass.INDEX for equity-index futures.
-Default contract month ESM6 brackets the synthetic fixture.
+Defaults bracket a 2026 Q2 contract month so the synthetic fixture
+plays back cleanly.
 """
 
 from __future__ import annotations
@@ -80,6 +83,28 @@ def make_mes_futures(
         venue=venue,
         symbol=symbol,
         underlying="ES",
+        multiplier=multiplier,
+        activation=activation or pd.Timestamp("2026-03-21", tz="UTC"),
+        expiration=expiration or pd.Timestamp("2026-06-19", tz="UTC"),
+    )
+
+
+def make_mnq_futures(
+    venue: Venue,
+    *,
+    symbol: str = "MNQM6",
+    multiplier: int = 2,
+    activation: pd.Timestamp | None = None,
+    expiration: pd.Timestamp | None = None,
+) -> FuturesContract:
+    """Return an MNQ (Micro E-mini Nasdaq-100) contract. Default
+    MNQM6, $2/pt, brackets 2026 Q2 window. Provided so the public
+    example strategy can exercise the framework against a non-S&P
+    underlying."""
+    return _futures_contract(
+        venue=venue,
+        symbol=symbol,
+        underlying="NQ",
         multiplier=multiplier,
         activation=activation or pd.Timestamp("2026-03-21", tz="UTC"),
         expiration=expiration or pd.Timestamp("2026-06-19", tz="UTC"),

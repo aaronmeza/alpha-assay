@@ -1,0 +1,63 @@
+# Reference SMA crossover configuration.
+#
+# Annotated example exercising every section of the AlphaAssayConfig
+# schema (see src/alpha_assay/config/loader.py). Copy and edit for
+# your own strategy.
+#
+# Run end-to-end against the bundled synthetic fixture:
+#
+#   alpha_assay backtest \
+#     --strategy examples.sma_crossover:SMACrossoverStrategy \
+#     --config configs/sma_crossover.yaml \
+#     --data data/sample/synth_2d.parquet \
+#     --out runs/sma-demo/
+
+# --- strategy ---
+# Plug-in contract: dotted "module:Class" path of any BaseStrategy
+# subclass (yours can live in any importable package). Everything under
+# `params` is opaque to the framework and passed straight to your
+# strategy's __init__/_validate_config.
+strategy:
+  class: examples.sma_crossover:SMACrossoverStrategy
+  params:
+    signal:
+      fast: 5     # short-window SMA, in bars
+      slow: 20    # long-window SMA, in bars
+
+# --- risk_caps ---
+# Hard, engine-enforced bounds on per-trade exit params. Configs
+# violating these are rejected at config-load time, before any data is
+# read. Keeps badly-tuned strategies from putting on absurd brackets.
+risk_caps:
+  max_stop_pts: 5.0                  # any stop > 5 pts -> config error
+  min_target_pts: 1.0                # any target < 1 pt -> config error
+  min_target_to_stop_ratio: 1.5      # require target/stop >= 1.5
+
+# --- session ---
+# RTH-trim window. Engine's session_mask filter blocks signals in the
+# first `minutes_after_open` and last `minutes_before_close` minutes
+# of the regular session (timezone is America/Chicago). Set both to 0
+# to trade the whole session.
+session:
+  minutes_after_open: 15
+  minutes_before_close: 15
+
+# --- execution ---
+# Where the orders are routed and how big they are.
+#
+# - mode: backtest | paper | live. Live requires the three-lock gate
+#   (env + flag + signed checklist) regardless of what the YAML says.
+# - instrument: which contract the runner builds. Currently supported:
+#   ESM6 / MESM6 / MNQM6. Prefix-matched by the runner; pass the
+#   month code you want.
+# - risk_per_trade_pct: optional risk-based position sizing.
+#   contracts = floor(starting_balance * risk_pct / stop_dollar),
+#   clamped to [1, max_contracts]. Omit / set null to keep the legacy
+#   single-contract sizing.
+# - max_contracts: hard cap on contracts per trade. Required when
+#   risk_per_trade_pct is set.
+execution:
+  mode: backtest
+  instrument: MNQM6           # Micro E-mini Nasdaq, $2/pt
+  risk_per_trade_pct: 0.005   # 0.5% of starting balance per trade
+  max_contracts: 10

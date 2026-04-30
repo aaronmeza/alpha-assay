@@ -9,7 +9,7 @@ ExitParams. This adapter bridges.
 Public surface:
     - NautilusBacktestRunner: wraps BacktestEngine, accepts a
       BaseStrategy, a DataFrame (ES OHLCV + TICK + ADD columns), an
-      instrument symbol ("ESM6" or "MESM6"), and a starting balance.
+      instrument symbol (ESM6 / MESM6 / MNQM6), and a starting balance.
       Exposes .run() -> BacktestResult.
     - BacktestResult: engine-agnostic dataclass returned from .run() so
       downstream code (metrics, CLI, tests) never imports Nautilus types.
@@ -42,7 +42,11 @@ from nautilus_trader.trading.strategy import Strategy as NautilusStrategy
 from alpha_assay.engine.bar_adapter import df_to_bars
 from alpha_assay.engine.breadth_adapter import df_to_breadth
 from alpha_assay.engine.custom_data import AddIndicator, TickIndicator
-from alpha_assay.engine.instrument_factory import make_es_futures, make_mes_futures
+from alpha_assay.engine.instrument_factory import (
+    make_es_futures,
+    make_mes_futures,
+    make_mnq_futures,
+)
 from alpha_assay.engine.logging import LOGGING_CONFIG
 from alpha_assay.filters.session_mask import session_mask
 from alpha_assay.observability import metrics as M
@@ -280,6 +284,8 @@ class NautilusBacktestRunner:
         return engine
 
     def _build_instrument(self):
+        if self.instrument_symbol.startswith("MNQ"):
+            return make_mnq_futures(_VENUE, symbol=self.instrument_symbol)
         if self.instrument_symbol.startswith("MES"):
             return make_mes_futures(_VENUE, symbol=self.instrument_symbol)
         return make_es_futures(_VENUE, symbol=self.instrument_symbol)
