@@ -17,11 +17,17 @@ global:
     stack: alphaassay
 
 scrape_configs:
+  # Targets use host.docker.internal so this scrape config works whether
+  # the scraped container runs on the alphaassay_observability bridge
+  # network OR on network_mode: host (which loses bridge-DNS but binds
+  # the metrics port on the host's interface). The prometheus service
+  # gets `extra_hosts: host.docker.internal:host-gateway` in compose so
+  # Linux Docker resolves the name to the bridge gateway IP.
   - job_name: paper-trader
     honor_labels: true
     static_configs:
       - targets:
-          - paper-trader:8000
+          - host.docker.internal:8000
         labels:
           service: paper-trader
           component: engine
@@ -30,7 +36,7 @@ scrape_configs:
     honor_labels: true
     static_configs:
       - targets:
-          - breadth-recorder:8001
+          - host.docker.internal:8001
         labels:
           service: breadth-recorder
           component: recorder
@@ -39,7 +45,7 @@ scrape_configs:
     honor_labels: true
     static_configs:
       - targets:
-          - es-bars-recorder:8002
+          - host.docker.internal:8002
         labels:
           service: es-bars-recorder
           component: recorder

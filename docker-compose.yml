@@ -200,6 +200,13 @@ services:
       - "127.0.0.1:19090:9090"
     networks:
       - alphaassay_observability
+    # Reach scrape targets that run with network_mode: host (recorders,
+    # paper-trader). Linux Docker doesn't auto-provide host.docker.internal;
+    # the explicit host-gateway mapping makes it resolve to the bridge
+    # network gateway IP. Mac Docker Desktop already provides this name
+    # natively but the entry is harmless there.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/ready"]
       interval: 15s
