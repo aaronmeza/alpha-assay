@@ -273,6 +273,16 @@ services:
       - prometheus
     networks:
       - alphaassay_observability
+    healthcheck:
+      # No HTTP surface; PID 1 is the python interpreter running main.py
+      # (CMD form, no shell wrapping). If the loop crashes we want the
+      # container to exit, not stay healthy with a dead poller, so check
+      # the cmdline contains "main.py".
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0 if 'main.py' in open('/proc/1/cmdline').read() else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
 networks:
   alphaassay_observability:

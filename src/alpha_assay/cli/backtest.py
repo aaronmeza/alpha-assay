@@ -109,6 +109,8 @@ def backtest(
         instrument_symbol=cfg.execution.instrument,
         starting_balance_usd=100_000.0,
         risk_caps=risk_caps,
+        risk_per_trade_pct=cfg.execution.risk_per_trade_pct,
+        max_contracts=cfg.execution.max_contracts,
     )
     result = runner.run()
 

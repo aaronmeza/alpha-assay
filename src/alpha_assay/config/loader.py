@@ -48,6 +48,12 @@ class ExecutionSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Literal["backtest", "paper", "live"]
     instrument: str
+    # Risk-based position sizing. Engine computes contracts from
+    # account_balance * risk_per_trade_pct / stop_dollar, then clamps
+    # to [1, max_contracts]. If risk_per_trade_pct is None or 0, falls
+    # back to a single contract per signal (legacy behavior).
+    risk_per_trade_pct: float | None = Field(default=None, ge=0, le=1)
+    max_contracts: int = Field(default=1, ge=1)
 
 
 class AlphaAssayConfig(BaseModel):

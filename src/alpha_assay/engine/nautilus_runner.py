@@ -53,6 +53,39 @@ _VENUE = Venue("SIM")
 _CLIENT_ID = ClientId("BREADTH")
 
 
+@dataclass(frozen=True)
+class PositionSizer:
+    """Risk-based contract sizing.
+
+    Contracts = clamp(floor(account_balance * risk_per_trade_pct /
+    stop_dollar), 1, max_contracts) when risk_per_trade_pct is set.
+    Falls back to 1 when risk_per_trade_pct is None or 0 (legacy
+    behavior - single contract per signal).
+
+    Uses a fixed account_balance reference (not live equity) so risk
+    budget stays stable across drawdowns. Anti-martingale scaling can
+    be added later if desired.
+    """
+
+    account_balance: float
+    instrument_multiplier: float
+    risk_per_trade_pct: float | None = None
+    max_contracts: int = 1
+
+    def compute_contracts(self, stop_points: float) -> int:
+        if self.risk_per_trade_pct is None or self.risk_per_trade_pct <= 0:
+            return 1
+        if stop_points <= 0:
+            # Defensive: zero stop would divide by zero. Fall back to 1 -
+            # the risk-cap layer should have rejected this already, but
+            # the engine must not crash.
+            return 1
+        risk_dollar = self.account_balance * self.risk_per_trade_pct
+        stop_dollar = stop_points * self.instrument_multiplier
+        contracts = int(risk_dollar // stop_dollar)
+        return max(1, min(self.max_contracts, contracts))
+
+
 @dataclass
 class BacktestResult:
     """Engine-agnostic view of a finished backtest."""
@@ -75,6 +108,7 @@ class _NautilusStrategyAdapter(NautilusStrategy):
         instrument_id,
         strategy,
         risk_caps,
+        position_sizer: PositionSizer | None = None,
     ) -> None:
         super().__init__()
         self._bar_type = bar_type
@@ -82,6 +116,7 @@ class _NautilusStrategyAdapter(NautilusStrategy):
         self._strategy = strategy
         self._strategy_name = type(strategy).__name__
         self._risk_caps = risk_caps
+        self._position_sizer = position_sizer
         self._bars_records: list[dict[str, Any]] = []
         self._latest_tick: float = 0.0
         self._latest_add: float = 0.0
@@ -174,10 +209,13 @@ class _NautilusStrategyAdapter(NautilusStrategy):
             snapped = round(p / tick) * tick
             return f"{snapped:.2f}"
 
+        contracts = (
+            self._position_sizer.compute_contracts(exit_params.stop_points) if self._position_sizer is not None else 1
+        )
         bracket = self.order_factory.bracket(
             instrument_id=self._instrument_id,
             order_side=entry_side,
-            quantity=Quantity.from_int(1),
+            quantity=Quantity.from_int(contracts),
             sl_trigger_price=Price.from_str(_snap(sl_px)),
             tp_price=Price.from_str(_snap(tp_px)),
             time_in_force=TimeInForce.GTC,
@@ -214,12 +252,16 @@ class NautilusBacktestRunner:
         instrument_symbol: str,
         starting_balance_usd: float,
         risk_caps: RiskCaps | None = None,
+        risk_per_trade_pct: float | None = None,
+        max_contracts: int = 1,
     ) -> None:
         self.strategy = strategy
         self.data = data
         self.instrument_symbol = instrument_symbol
         self.starting_balance_usd = starting_balance_usd
         self.risk_caps = risk_caps or RiskCaps(max_stop_pts=5.0, min_target_pts=2.5, min_target_to_stop_ratio=2.0)
+        self.risk_per_trade_pct = risk_per_trade_pct
+        self.max_contracts = max_contracts
 
     def _build_engine(self) -> BacktestEngine:
         config = BacktestEngineConfig(
@@ -257,11 +299,19 @@ class NautilusBacktestRunner:
                 engine.add_data(adds, client_id=_CLIENT_ID)
             else:
                 engine.add_data(bars)
+            multiplier = float(instrument.multiplier)
+            position_sizer = PositionSizer(
+                account_balance=self.starting_balance_usd,
+                instrument_multiplier=multiplier,
+                risk_per_trade_pct=self.risk_per_trade_pct,
+                max_contracts=self.max_contracts,
+            )
             adapter = _NautilusStrategyAdapter(
                 bar_type=bar_type,
                 instrument_id=instrument.id,
                 strategy=self.strategy,
                 risk_caps=self.risk_caps,
+                position_sizer=position_sizer,
             )
             engine.add_strategy(adapter)
             engine.run()
