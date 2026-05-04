@@ -14,7 +14,7 @@ import importlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 
@@ -374,6 +374,42 @@ def test_recorder_graceful_shutdown_flushes_pending_bars(tmp_path: Path) -> None
     assert df.iloc[0]["open"] == 100.0
     assert df.iloc[1]["timestamp"] == pd.Timestamp("2026-04-28T14:31:00Z")
     assert df.iloc[1]["open"] == 200.0
+
+
+def _gauge_value(gauge: Any, **labels: str) -> float:
+    child = gauge.labels(**labels) if labels else gauge
+    return child._value.get()
+
+
+def test_recorder_session_gap_is_low_after_in_rth_tick(tmp_path: Path) -> None:
+    rec = BreadthRecorder(adapter=_mk_adapter(), out_dir=tmp_path, symbols=("TICK-NYSE",))
+    rec.ingest_tick(_tick("TICK-NYSE", "2026-04-28T14:30:00Z", 100.0))
+    val = _gauge_value(recorder_mod.RM.recorder_session_gap_seconds, symbol="TICK-NYSE")
+    # Wall-clock-derived: a few microseconds, not exact zero.
+    assert 0.0 <= val < 0.1
+
+
+def test_recorder_session_gap_climbs_when_no_ticks_arrive(tmp_path: Path) -> None:
+    """Mirror test of the es-bars freshness-gauge climb. Frozen ingestion
+    must surface as a growing gap so the healthcheck can flip DEGRADED.
+    """
+    rec = BreadthRecorder(adapter=_mk_adapter(), out_dir=tmp_path, symbols=("TICK-NYSE",))
+    rec.ingest_tick(_tick("TICK-NYSE", "2026-04-28T14:30:00Z", 100.0))
+    receipt_time = rec._last_tick_received_at["TICK-NYSE"]  # type: ignore[attr-defined]
+    assert receipt_time is not None
+    with patch.object(recorder_mod.time, "monotonic", return_value=receipt_time + 47.0):
+        rec._update_session_gap_gauge("TICK-NYSE")
+    val = _gauge_value(recorder_mod.RM.recorder_session_gap_seconds, symbol="TICK-NYSE")
+    assert 46.5 <= val <= 47.5
+
+
+def test_recorder_session_gap_reports_uptime_when_no_tick_yet(tmp_path: Path) -> None:
+    rec = BreadthRecorder(adapter=_mk_adapter(), out_dir=tmp_path, symbols=("TICK-NYSE",))
+    start = rec._recorder_start_monotonic  # type: ignore[attr-defined]
+    with patch.object(recorder_mod.time, "monotonic", return_value=start + 120.0):
+        rec._update_session_gap_gauge("TICK-NYSE")
+    val = _gauge_value(recorder_mod.RM.recorder_session_gap_seconds, symbol="TICK-NYSE")
+    assert 119.5 <= val <= 120.5
 
 
 def test_recorder_metrics_module_is_independent() -> None:

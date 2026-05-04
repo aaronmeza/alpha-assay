@@ -53,6 +53,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
@@ -183,6 +184,19 @@ class ESBarsRecorder:
         # Last in-RTH bar wall-clock - used for the bar-age gauge.
         self._last_rth_bar_utc: pd.Timestamp | None = None
 
+        # Monotonic clock reads. The age gauge is computed from
+        # `now - _last_bar_received_at` so the gauge climbs naturally
+        # when the ingestion path stalls (e.g. adapter reconnect missed a
+        # re-subscribe). On bar receipt we refresh `_last_bar_received_at`
+        # and call `_update_age_gauge()` immediately for prompt feedback;
+        # `_periodic_age_gauge_loop` re-computes between bars so a frozen
+        # ingestion path no longer presents as "fresh" to scrapers and
+        # the healthcheck. If no bar has been received yet, the gauge
+        # reports seconds-since-recorder-start so a never-subscribed
+        # recorder fails the freshness check rather than reading 0.0.
+        self._recorder_start_monotonic: float = time.monotonic()
+        self._last_bar_received_at: float | None = None
+
         # Installed by run(); used by the signal handler.
         self._shutdown_event: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -230,14 +244,16 @@ class ESBarsRecorder:
                 # Replace in place so the most-recent fields win.
                 buf.rows[-1] = clamped
                 self._last_rth_bar_utc = ts
-                RM.last_bar_age_seconds.labels(feed=self._feed_label).set(0.0)
+                self._last_bar_received_at = time.monotonic()
+                self._update_age_gauge()
                 return clamped
             # Out-of-order older bar: ignore defensively.
             return None
 
         buf.rows.append(clamped)
         self._last_rth_bar_utc = ts
-        RM.last_bar_age_seconds.labels(feed=self._feed_label).set(0.0)
+        self._last_bar_received_at = time.monotonic()
+        self._update_age_gauge()
         return clamped
 
     def flush(self) -> int:
@@ -261,13 +277,15 @@ class ESBarsRecorder:
                 self._loop.add_signal_handler(sig, self._request_shutdown)
 
         flush_task = self._loop.create_task(self._periodic_flush_loop())
+        age_task = self._loop.create_task(self._periodic_age_gauge_loop())
 
         try:
             await self._connect_and_stream_forever()
         finally:
-            flush_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await flush_task
+            for task in (flush_task, age_task):
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
             self._drain_and_flush()
 
     # --- internals ------------------------------------------------------
@@ -303,6 +321,29 @@ class ESBarsRecorder:
                 return
             except TimeoutError:
                 self.flush()
+
+    def _update_age_gauge(self) -> None:
+        """Recompute ``last_bar_age_seconds`` from a monotonic delta.
+
+        Called on every bar receipt and from the periodic age-gauge loop.
+        Driving the gauge from monotonic time means it climbs whenever
+        ingestion stalls, which is exactly the freshness signal the
+        healthcheck needs.
+        """
+        anchor = self._last_bar_received_at if self._last_bar_received_at is not None else self._recorder_start_monotonic
+        age = max(0.0, time.monotonic() - anchor)
+        RM.last_bar_age_seconds.labels(feed=self._feed_label).set(age)
+
+    async def _periodic_age_gauge_loop(self) -> None:
+        """Refresh the bar-age gauge between bar receipts so the gauge
+        reflects wall-clock staleness, not just receive events."""
+        assert self._shutdown_event is not None
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=1.0)
+                return
+            except TimeoutError:
+                self._update_age_gauge()
 
     async def _connect_and_stream_forever(self) -> None:
         """Outer loop: connect, stream, on failure back off and retry.

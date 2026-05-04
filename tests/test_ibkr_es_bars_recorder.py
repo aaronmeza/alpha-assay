@@ -13,7 +13,7 @@ import importlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 
@@ -277,7 +277,40 @@ def test_recorder_resets_last_bar_age_on_in_rth_bar(tmp_path: Path) -> None:
     label = "ES-FUT-20260618"
     rec.ingest_bar(_bar("2026-04-28T14:30:00Z"))
     val = _gauge_value(recorder_mod.RM.last_bar_age_seconds, feed=label)
-    assert val == 0.0
+    # Gauge is now wall-clock-derived. On bar arrival it computes
+    # `monotonic_now - bar_received_at`, which is microseconds, not exact
+    # zero. A loose upper bound catches the regression where the gauge
+    # would lie at 0.0 forever.
+    assert 0.0 <= val < 0.1
+
+
+def test_recorder_bar_age_climbs_when_no_bars_arrive(tmp_path: Path) -> None:
+    """The freshness gauge must reflect wall-clock staleness so the
+    healthcheck can detect a frozen ingestion path. Pin the recorder's
+    monotonic clock and verify the gauge tracks the delta forward.
+    """
+    rec = ESBarsRecorder(adapter=_mk_adapter(), out_dir=tmp_path)
+    label = "ES-FUT-20260618"
+    rec.ingest_bar(_bar("2026-04-28T14:30:00Z"))
+    receipt_time = rec._last_bar_received_at  # type: ignore[attr-defined]
+    assert receipt_time is not None
+    # Simulate 47 wall-clock seconds elapsing without any new bars.
+    with patch.object(recorder_mod.time, "monotonic", return_value=receipt_time + 47.0):
+        rec._update_age_gauge()
+    val = _gauge_value(recorder_mod.RM.last_bar_age_seconds, feed=label)
+    assert 46.5 <= val <= 47.5
+
+
+def test_recorder_bar_age_reports_uptime_when_no_bar_yet(tmp_path: Path) -> None:
+    """Before any bar arrives the gauge should report seconds-since-start,
+    not 0.0 - a recorder that never subscribed must still fail freshness."""
+    rec = ESBarsRecorder(adapter=_mk_adapter(), out_dir=tmp_path)
+    label = "ES-FUT-20260618"
+    start = rec._recorder_start_monotonic  # type: ignore[attr-defined]
+    with patch.object(recorder_mod.time, "monotonic", return_value=start + 120.0):
+        rec._update_age_gauge()
+    val = _gauge_value(recorder_mod.RM.last_bar_age_seconds, feed=label)
+    assert 119.5 <= val <= 120.5
 
 
 def test_recorder_metrics_module_is_independent() -> None:

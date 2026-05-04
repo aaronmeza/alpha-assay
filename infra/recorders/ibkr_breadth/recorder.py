@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
@@ -152,6 +153,18 @@ class BreadthRecorder:
         # Track last in-RTH tick timestamps for session-gap gauge.
         self._last_rth_tick: dict[str, pd.Timestamp | None] = {s: None for s in self._symbols}
 
+        # Monotonic clock state for the freshness gauge. The session-gap
+        # gauge is computed from `now - _last_tick_received_at[symbol]`
+        # so it climbs whenever a per-symbol ingestion path stalls. On
+        # tick receipt we refresh the timestamp and call
+        # `_update_session_gap_gauge(symbol)` immediately for prompt
+        # feedback; `_periodic_session_gap_loop` re-computes between
+        # ticks so a frozen ingestion path no longer presents as fresh
+        # to scrapers and the healthcheck. If no tick has arrived yet
+        # for a symbol, the gauge reports seconds-since-recorder-start.
+        self._recorder_start_monotonic: float = time.monotonic()
+        self._last_tick_received_at: dict[str, float | None] = {s: None for s in self._symbols}
+
         # Installed by run(); used by signal handler.
         self._shutdown_event: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -217,7 +230,8 @@ class BreadthRecorder:
         # Ignore defensively; IBKR pendingTickers normally serialize by time.
 
         self._last_rth_tick[symbol] = ts
-        RM.recorder_session_gap_seconds.labels(symbol=symbol).set(0.0)
+        self._last_tick_received_at[symbol] = time.monotonic()
+        self._update_session_gap_gauge(symbol)
         return emitted
 
     def flush(self) -> dict[str, int]:
@@ -262,13 +276,15 @@ class BreadthRecorder:
 
         # Periodic flush task.
         flush_task = self._loop.create_task(self._periodic_flush_loop())
+        gap_task = self._loop.create_task(self._periodic_session_gap_loop())
 
         try:
             await self._connect_and_stream_forever()
         finally:
-            flush_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await flush_task
+            for task in (flush_task, gap_task):
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
             self._drain_and_flush()
 
     # --- internals ------------------------------------------------------
@@ -290,6 +306,29 @@ class BreadthRecorder:
                 return
             except TimeoutError:
                 self.flush()
+
+    def _update_session_gap_gauge(self, symbol: str) -> None:
+        """Recompute the session-gap gauge for one symbol from a monotonic
+        delta. Called on every tick receipt and from the periodic loop;
+        driving the gauge from monotonic time means it climbs whenever
+        per-symbol ingestion stalls.
+        """
+        last = self._last_tick_received_at.get(symbol)
+        anchor = last if last is not None else self._recorder_start_monotonic
+        age = max(0.0, time.monotonic() - anchor)
+        RM.recorder_session_gap_seconds.labels(symbol=symbol).set(age)
+
+    async def _periodic_session_gap_loop(self) -> None:
+        """Refresh per-symbol session-gap gauges between tick receipts so
+        a stalled symbol doesn't keep reading 0.0 to scrapers."""
+        assert self._shutdown_event is not None
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=1.0)
+                return
+            except TimeoutError:
+                for symbol in self._symbols:
+                    self._update_session_gap_gauge(symbol)
 
     async def _connect_and_stream_forever(self) -> None:
         """Outer loop: connect, stream, on failure back off and retry.
