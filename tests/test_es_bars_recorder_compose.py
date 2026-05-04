@@ -97,4 +97,8 @@ def test_prometheus_scrape_includes_es_bars_recorder() -> None:
     targets: list[str] = []
     for sc in job.get("static_configs", []):
         targets.extend(sc.get("targets", []))
-    assert "es-bars-recorder:8002" in targets, f"expected scrape target es-bars-recorder:8002; got {targets}"
+    assert "host.docker.internal:8002" in targets, (
+        f"es-bars-recorder job must target host.docker.internal:8002 so the scrape "
+        f"works whether the container is on the bridge network or network_mode: host; "
+        f"got {targets}"
+    )
