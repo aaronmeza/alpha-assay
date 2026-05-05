@@ -264,6 +264,36 @@ def test_subscribe_bars_increments_freshness_gauge():
     assert val == 0.0
 
 
+def test_refresh_freshness_gauge_climbs_while_idle():
+    """The freshness gauge must climb from a monotonic delta when no
+    events arrive, otherwise the alerter and healthcheck see a permanently-
+    fresh feed when the stream is dead. Regression for 2026-05-05 outage:
+    ES bars went silent for ~16h yet ibkr_feed_freshness_seconds stayed
+    pinned at 0 because the gauge only updated on event arrival.
+    """
+    import time as _time
+
+    feed = "TEST-CLIMB"
+    M.ibkr_feed_freshness_seconds.labels(feed=feed).set(0.0)
+
+    async def run() -> float:
+        last = [_time.monotonic()]
+        task = asyncio.create_task(
+            ibkr_adapter._refresh_freshness_gauge(feed, last, interval=0.05)
+        )
+        await asyncio.sleep(0.25)
+        val = M.ibkr_feed_freshness_seconds.labels(feed=feed)._value.get()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return val
+
+    val = asyncio.run(run())
+    assert 0.15 < val < 0.5, f"gauge should climb to ~0.25s while idle, got {val}"
+
+
 # --- breadth subscription ---------------------------------------------
 
 

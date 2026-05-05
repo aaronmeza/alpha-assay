@@ -100,6 +100,24 @@ def _feed_label(spec: dict[str, Any]) -> str:
     return "-".join(p for p in parts if p)
 
 
+async def _refresh_freshness_gauge(
+    feed: str,
+    last_event: list[float],
+    interval: float = 1.0,
+) -> None:
+    """Climb ibkr_feed_freshness_seconds between events.
+
+    Without this loop the gauge only updates on .set(0.0) at event arrival
+    and stays pinned at 0 when the stream goes silent - the alerter and
+    healthcheck then see a permanently-fresh feed even when it's dead.
+    Mirrors the recorder-side last_bar_age_seconds pattern.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        age = max(0.0, time.monotonic() - last_event[0])
+        M.ibkr_feed_freshness_seconds.labels(feed=feed).set(age)
+
+
 class IBKRAdapter:
     """Read-only IBKR adapter backed by ib_insync.
 
@@ -274,13 +292,25 @@ class IBKRAdapter:
         for raw in list(bars):
             queue.put_nowait(_normalize_bar(raw, feed))
 
+        last_event = [time.monotonic()]
+        M.ibkr_feed_freshness_seconds.labels(feed=feed).set(0.0)
+        refresh_task = asyncio.create_task(
+            _refresh_freshness_gauge(feed, last_event)
+        )
+
         try:
             while True:
                 event = await queue.get()
+                last_event[0] = time.monotonic()
                 M.ibkr_feed_freshness_seconds.labels(feed=feed).set(0.0)
                 yield event
         finally:
             bars.updateEvent -= _on_update
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def historical_bars_async(
         self,
@@ -413,13 +443,26 @@ class IBKRAdapter:
                 )
 
         self._ib.pendingTickersEvent += _on_pending
+
+        last_event = [time.monotonic()]
+        M.ibkr_feed_freshness_seconds.labels(feed=feed).set(0.0)
+        refresh_task = asyncio.create_task(
+            _refresh_freshness_gauge(feed, last_event)
+        )
+
         try:
             while True:
                 event = await queue.get()
+                last_event[0] = time.monotonic()
                 M.ibkr_feed_freshness_seconds.labels(feed=feed).set(0.0)
                 yield event
         finally:
             self._ib.pendingTickersEvent -= _on_pending
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def _normalize_bar(raw: Any, feed: str) -> dict[str, Any]:
