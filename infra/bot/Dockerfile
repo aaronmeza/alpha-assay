@@ -10,7 +10,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata ca-certificates curl \
+    && apt-get install -y --no-install-recommends tzdata ca-certificates curl docker.io \
     && rm -rf /var/lib/apt/lists/* \
     && ln -fs /usr/share/zoneinfo/America/Chicago /etc/localtime
 
