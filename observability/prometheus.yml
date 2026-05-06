@@ -49,3 +49,12 @@ scrape_configs:
         labels:
           service: es-bars-recorder
           component: recorder
+
+  - job_name: ibkr-feed
+    honor_labels: true
+    static_configs:
+      - targets:
+          - host.docker.internal:8003
+        labels:
+          service: ibkr-feed
+          component: producer
