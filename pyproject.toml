@@ -30,6 +30,8 @@ dependencies = [
     "prometheus_client>=0.20",
     "click>=8.1",
     "ib_insync>=0.9.86",
+    "redis>=5.0",
+    "msgpack>=1.1",
 ]
 
 [project.scripts]
@@ -49,6 +51,7 @@ dev = [
     "ruff>=0.6",
     "black>=24",
     "mypy>=1.10",
+    "fakeredis>=2.20",
 ]
 
 [project.urls]
