@@ -51,7 +51,7 @@ dev = [
     "ruff>=0.6",
     "black>=24",
     "mypy>=1.10",
-    "fakeredis>=2.20",
+    "fakeredis[lua]>=2.20",
 ]
 
 [project.urls]

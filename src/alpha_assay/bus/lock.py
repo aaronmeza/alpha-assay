@@ -45,23 +45,33 @@ class FeedLock:
 
         Returns True iff refresh succeeded; False means we lost the lock
         (another process stole it; caller should exit).
+
+        Atomic via Lua eval - GET-then-PEXPIRE has a race window where
+        an expired-then-reacquired key could let us extend a lock we no
+        longer own.
         """
-        # GET to check, then PEXPIRE only if token matches.
-        # Note: redis-py returns bytes from get(), so decode for comparison.
-        current = self._redis.get(self._key)
-        if current is None:
-            return False
-        current_str = current.decode() if isinstance(current, bytes) else current
-        if current_str == self._token:
-            return bool(self._redis.pexpire(self._key, self._ttl_ms))
-        return False
+        script = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "  return redis.call('pexpire', KEYS[1], ARGV[2]) "
+            "else "
+            "  return 0 "
+            "end"
+        )
+        result = self._redis.eval(script, 1, self._key, self._token, self._ttl_ms)
+        return bool(result)
 
     def release(self) -> None:
-        """Delete the key only if it's still ours (token match)."""
-        # GET to check, then DEL only if token matches.
-        current = self._redis.get(self._key)
-        if current is None:
-            return
-        current_str = current.decode() if isinstance(current, bytes) else current
-        if current_str == self._token:
-            self._redis.delete(self._key)
+        """Delete the key only if it's still ours (token match).
+
+        Atomic via Lua eval - GET-then-DEL has a race window where an
+        expired-then-reacquired key could let us delete another holder's
+        lock.
+        """
+        script = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "  return redis.call('del', KEYS[1]) "
+            "else "
+            "  return 0 "
+            "end"
+        )
+        self._redis.eval(script, 1, self._key, self._token)
