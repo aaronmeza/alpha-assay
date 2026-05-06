@@ -112,6 +112,7 @@ def test_daemon_advances_wal_watermark_on_publish(redis_client, tmp_path):
     asyncio.run(_run())
 
     # After publish, watermark should be >=0 (the seq of the published msg).
-    watermarks = list(wal_dir.glob("feed-*.committed"))
+    # Per-stream WAL subdirs since the cross-stream contam fix.
+    watermarks = list(wal_dir.rglob("feed-*.committed"))
     assert len(watermarks) == 1
     assert int(watermarks[0].read_text().strip()) >= 0
