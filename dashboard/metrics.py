@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Aaron Meza
-"""Aggregate metric computations for the backtest results dashboard.
+"""Aggregate metrics for the paper-trial dashboard.
 
-All functions accept a per-trade DataFrame (as returned by
-``loaders.load_per_trade_metrics``) and return plain Python scalars or
-dicts so the Streamlit UI can render them without further processing.
+All functions accept a trade-record DataFrame as returned by
+``loaders.load_trades`` (schema: timestamp, signal_type, entry_price,
+stop, target, mock_fill_price, mock_pnl_dollars,
+account_balance_after).
 """
 
 from __future__ import annotations
@@ -14,130 +15,140 @@ from typing import Any
 
 import pandas as pd
 
+DISPLAY_TZ = "America/Chicago"
 
-def compute_aggregate_metrics(
-    df: pd.DataFrame,
-    starting_balance_usd: float = 100_000.0,
-) -> dict[str, Any]:
-    """Compute headline aggregate metrics over *df*.
 
-    Returns a dict with keys:
-      - total_pnl_usd
-      - total_pnl_pct
-      - n_trades
-      - win_rate      (None if no trades)
-      - profit_factor (None if no losses)
-      - sharpe        (None if < 2 trades)
-      - max_drawdown_usd
+def compute_aggregate_metrics(df: pd.DataFrame) -> dict[str, Any]:
+    """Headline aggregate metrics over *df*.
+
+    Keys: total_pnl_usd, n_trades, win_rate (None when no trades),
+    profit_factor (None when no losses), sharpe (None for <2 trades),
+    max_drawdown_usd, current_balance (latest account_balance_after,
+    None when no trades), avg_pnl_per_trade.
     """
     empty: dict[str, Any] = {
         "total_pnl_usd": 0.0,
-        "total_pnl_pct": 0.0,
         "n_trades": 0,
         "win_rate": None,
         "profit_factor": None,
         "sharpe": None,
         "max_drawdown_usd": 0.0,
+        "current_balance": None,
+        "avg_pnl_per_trade": None,
     }
 
-    if df is None or df.empty or "pnl_usd" not in df.columns:
+    if df is None or df.empty or "mock_pnl_dollars" not in df.columns:
         return empty
 
-    pnl = df["pnl_usd"].dropna()
+    pnl = df["mock_pnl_dollars"].dropna()
     if pnl.empty:
         return empty
 
-    total_pnl = float(pnl.sum())
     n = len(pnl)
     wins = pnl[pnl > 0]
     losses = pnl[pnl < 0]
+    total = float(pnl.sum())
 
     win_rate = len(wins) / n if n > 0 else None
-
     gross_profit = float(wins.sum()) if not wins.empty else 0.0
     gross_loss = abs(float(losses.sum())) if not losses.empty else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
 
-    # Annualised Sharpe on daily PnL series (250 trading days).
     sharpe: float | None = None
     if n >= 2:
         std = float(pnl.std(ddof=1))
         if std > 0:
             sharpe = round((float(pnl.mean()) / std) * math.sqrt(250), 3)
 
-    # Max drawdown on running cumulative PnL.
     cumulative = pnl.cumsum()
-    running_max = cumulative.cummax()
-    drawdown = cumulative - running_max
+    drawdown = cumulative - cumulative.cummax()
     max_dd = float(drawdown.min())
 
+    current_balance: float | None = None
+    if "account_balance_after" in df.columns:
+        bal_series = df.sort_values("timestamp")["account_balance_after"].dropna()
+        if not bal_series.empty:
+            current_balance = float(bal_series.iloc[-1])
+
     return {
-        "total_pnl_usd": round(total_pnl, 2),
-        "total_pnl_pct": (round((total_pnl / starting_balance_usd) * 100, 4) if starting_balance_usd else None),
+        "total_pnl_usd": round(total, 2),
         "n_trades": n,
         "win_rate": round(win_rate, 4) if win_rate is not None else None,
         "profit_factor": round(profit_factor, 3) if profit_factor is not None else None,
         "sharpe": sharpe,
         "max_drawdown_usd": round(max_dd, 2),
+        "current_balance": round(current_balance, 2) if current_balance is not None else None,
+        "avg_pnl_per_trade": round(total / n, 2) if n > 0 else None,
     }
 
 
 def compute_equity_curve(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a DataFrame with columns [entry_ts, cumulative_pnl_usd].
+    """Return ``[timestamp, account_balance_after]`` sorted ascending.
 
-    Sorted by entry_ts ascending so Plotly can render a line chart
-    directly.  Returns an empty DataFrame if input is missing.
+    Uses the recorded balance directly rather than re-cumulating P&L,
+    so deposits/adjustments (when added later) flow through honestly.
     """
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["entry_ts", "cumulative_pnl_usd"])
-    if "entry_ts" not in df.columns or "pnl_usd" not in df.columns:
-        return pd.DataFrame(columns=["entry_ts", "cumulative_pnl_usd"])
+    cols = ["timestamp", "account_balance_after"]
+    if df is None or df.empty or not all(c in df.columns for c in cols):
+        return pd.DataFrame(columns=cols)
 
-    sorted_df = df.sort_values("entry_ts").reset_index(drop=True)
-    sorted_df = sorted_df[["entry_ts", "pnl_usd"]].dropna()
-    sorted_df["cumulative_pnl_usd"] = sorted_df["pnl_usd"].cumsum()
-    return sorted_df[["entry_ts", "cumulative_pnl_usd"]]
+    out = df[cols].dropna().sort_values("timestamp").reset_index(drop=True)
+    return out
 
 
-def compute_per_day_summary(
-    df: pd.DataFrame,
-    starting_balance_usd: float = 100_000.0,
-) -> list[dict[str, Any]]:
-    """Return one summary dict per session date, sorted ascending.
+def compute_per_day_summary(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Per-session-date summary, sorted ascending by date.
 
-    Each dict contains:
-      date, n_trades, n_long, n_short, total_pnl_usd, total_pnl_pct,
-      win_rate, largest_win_usd, largest_loss_usd, avg_hold_seconds
+    Each entry: date, n_trades, total_pnl_usd, win_rate,
+    largest_win_usd, largest_loss_usd, ending_balance.
     """
-    if df is None or df.empty or "entry_ts" not in df.columns:
+    if df is None or df.empty or "timestamp" not in df.columns:
         return []
 
-    working = df.copy()
-    working["_date"] = working["entry_ts"].dt.tz_convert("America/Chicago").dt.date
+    work = df.copy()
+    work["_date"] = work["timestamp"].dt.tz_convert(DISPLAY_TZ).dt.date
 
-    summaries = []
-    for date, group in working.groupby("_date"):
-        pnl = group["pnl_usd"].dropna()
+    out: list[dict[str, Any]] = []
+    for date, group in work.groupby("_date"):
+        pnl = group["mock_pnl_dollars"].dropna()
         n = len(group)
         wins = pnl[pnl > 0]
-        losses = pnl[pnl <= 0]
-        total_pnl = float(pnl.sum())
-        summaries.append(
+        losses = pnl[pnl < 0]
+        ending_bal = None
+        if "account_balance_after" in group.columns:
+            bal = group.sort_values("timestamp")["account_balance_after"].dropna()
+            if not bal.empty:
+                ending_bal = round(float(bal.iloc[-1]), 2)
+        out.append(
             {
                 "date": str(date),
                 "n_trades": n,
-                "n_long": int((group["side"] == "long").sum()) if "side" in group.columns else None,
-                "n_short": (int((group["side"] == "short").sum()) if "side" in group.columns else None),
-                "total_pnl_usd": round(total_pnl, 2),
-                "total_pnl_pct": (round((total_pnl / starting_balance_usd) * 100, 4) if starting_balance_usd else None),
+                "total_pnl_usd": round(float(pnl.sum()), 2),
                 "win_rate": round(len(wins) / n, 4) if n > 0 else None,
                 "largest_win_usd": round(float(wins.max()), 2) if not wins.empty else None,
                 "largest_loss_usd": round(float(losses.min()), 2) if not losses.empty else None,
-                "avg_hold_seconds": (
-                    round(float(group["hold_seconds"].mean()), 1) if "hold_seconds" in group.columns else None
-                ),
+                "ending_balance": ending_bal,
             }
         )
 
-    summaries.sort(key=lambda x: x["date"])
-    return summaries
+    out.sort(key=lambda x: x["date"])
+    return out
+
+
+def compute_signal_histogram(df: pd.DataFrame) -> pd.DataFrame:
+    """Count of trades per ``signal_type``, with summed P&L per type.
+
+    Columns: signal_type, n_trades, total_pnl_usd. Sorted descending by
+    n_trades.
+    """
+    cols = ["signal_type", "n_trades", "total_pnl_usd"]
+    if df is None or df.empty or "signal_type" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    grouped = df.groupby("signal_type", dropna=False).agg(
+        n_trades=("signal_type", "size"),
+        total_pnl_usd=("mock_pnl_dollars", "sum"),
+    ).reset_index()
+    grouped["total_pnl_usd"] = grouped["total_pnl_usd"].round(2)
+    grouped = grouped.sort_values("n_trades", ascending=False).reset_index(drop=True)
+    return grouped[cols]

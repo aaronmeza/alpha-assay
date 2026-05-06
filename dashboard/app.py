@@ -1,71 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Aaron Meza
-"""alpha_assay backtest results dashboard.
+"""Paper-trial P&L dashboard.
+
+Reads ``trades.parquet`` from ``RUNS_DIR`` (default ``/runs``) and
+renders aggregate stats, an equity curve, per-day P&L, and a signal
+breakdown over a user-selected date range.
 
 Launch::
 
     RUNS_DIR=/path/to/runs streamlit run dashboard/app.py
-
-The app reads run output directories from RUNS_DIR (default: /runs).
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from dashboard.loaders import (
-    describe_run,
-    discover_runs,
-    filter_by_time_range,
-    load_all_runs,
-    load_per_trade_metrics,
-    load_session_metrics,
-)
+from dashboard.loaders import filter_by_date_range, load_trades, trade_log_summary
 from dashboard.metrics import (
+    DISPLAY_TZ,
     compute_aggregate_metrics,
     compute_equity_curve,
     compute_per_day_summary,
+    compute_signal_histogram,
 )
-
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
-
-st.set_page_config(
-    page_title="Backtest Results",
-    page_icon=None,
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 _DEFAULT_RUNS_DIR = "/runs"
-_ALL_RUNS_LABEL = "All runs (default)"
-_TRADE_DISPLAY_COLS = [
-    "entry_ts",
-    "exit_ts",
-    "side",
-    "entry_price",
-    "exit_price",
-    "pnl_points",
-    "pnl_usd",
-    "hold_seconds",
-    "exit_reason",
-    "mae_points",
-    "mfe_points",
-]
+_DEFAULT_LOOKBACK_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Formatting helpers
 # ---------------------------------------------------------------------------
 
 
@@ -76,11 +45,10 @@ def _fmt_usd(v: float | None) -> str:
     return f"{sign}${v:,.2f}"
 
 
-def _fmt_pct(v: float | None) -> str:
+def _fmt_balance(v: float | None) -> str:
     if v is None:
         return "-"
-    sign = "+" if v > 0 else ""
-    return f"{sign}{v:.3f}%"
+    return f"${v:,.2f}"
 
 
 def _fmt_ratio(v: float | None) -> str:
@@ -95,187 +63,141 @@ def _fmt_winrate(v: float | None) -> str:
     return f"{v * 100:.1f}%"
 
 
-def _build_time_range(
-    preset: str, df: pd.DataFrame | None, custom_start=None, custom_end=None
-) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    """Translate a preset label into (start, end) UTC timestamps."""
-    now = pd.Timestamp.utcnow()
+def _resolve_default_range(df: pd.DataFrame) -> tuple[date, date]:
+    """Pick a sensible default date range.
 
-    if preset == "custom":
-        start = pd.Timestamp(custom_start, tz="UTC") if custom_start else None
-        end = pd.Timestamp(custom_end, tz="UTC") if custom_end else None
-        return start, end
+    If trades exist, default to the trade-data range capped at the last
+    30 days. Otherwise, fall back to today minus 30 days through today.
+    """
+    today = pd.Timestamp.utcnow().tz_convert(DISPLAY_TZ).date()
+    if df is None or df.empty:
+        return today - timedelta(days=_DEFAULT_LOOKBACK_DAYS), today
 
-    if preset == "all" or df is None or df.empty:
-        return None, None
-
-    cutoffs = {
-        "1h": now - pd.Timedelta(hours=1),
-        "6h": now - pd.Timedelta(hours=6),
-        "1d": now - pd.Timedelta(days=1),
-        "1w": now - pd.Timedelta(weeks=1),
-        "1mo": now - pd.Timedelta(days=30),
-        "ytd": pd.Timestamp(f"{now.year}-01-01", tz="UTC"),
-    }
-    start = cutoffs.get(preset)
-    return start, None
+    trade_start = df["timestamp"].min().tz_convert(DISPLAY_TZ).date()
+    trade_end = df["timestamp"].max().tz_convert(DISPLAY_TZ).date()
+    default_start = max(trade_start, trade_end - timedelta(days=_DEFAULT_LOOKBACK_DAYS))
+    return default_start, trade_end
 
 
 # ---------------------------------------------------------------------------
-# Page header (always rendered)
+# Page
 # ---------------------------------------------------------------------------
 
-st.title("Backtest Results")
-st.caption("Historical paper-trading session data.")
+st.set_page_config(
+    page_title="Paper P&L",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ---------------------------------------------------------------------------
-# Discover runs
-# ---------------------------------------------------------------------------
+st.title("Paper P&L")
+st.caption("Live paper-trading session results. Filter by date range to see how the strategy would have performed.")
 
 runs_dir = os.environ.get("RUNS_DIR", _DEFAULT_RUNS_DIR)
-run_names = discover_runs(runs_dir)
+trades_df = load_trades(runs_dir)
+log_status = trade_log_summary(runs_dir)
 
 # ---------------------------------------------------------------------------
-# Sidebar (always rendered)
+# Sidebar: date range
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("Data source")
+    st.header("Date range")
 
-    if not run_names:
-        run_picker_options = [_ALL_RUNS_LABEL.replace("default", "0 found")]
-    else:
-        friendly_labels = [describe_run(Path(runs_dir) / name) for name in run_names]
-        run_picker_options = [_ALL_RUNS_LABEL] + friendly_labels
+    default_start, default_end = _resolve_default_range(trades_df)
 
-    selected_label = st.selectbox(
-        "Session",
-        run_picker_options,
-        index=0,
-        help="'All runs' aggregates every session found under RUNS_DIR.",
-    )
+    start_input = st.date_input("From", value=default_start)
+    end_input = st.date_input("To", value=default_end)
 
     st.divider()
-    st.header("Time range")
+    st.header("Data source")
+    st.caption(f"Path: `{log_status['path']}`")
+    if log_status["exists"]:
+        st.caption(f"Rows: {log_status['n_rows']:,}")
+        if log_status["modified_at"] is not None:
+            mod_local = log_status["modified_at"].tz_convert(DISPLAY_TZ)
+            st.caption(f"Updated: {mod_local.strftime('%Y-%m-%d %H:%M %Z')}")
+        size_kb = log_status["size_bytes"] / 1024.0
+        st.caption(f"Size: {size_kb:,.1f} KB")
+    else:
+        st.caption("Trade log not yet created.")
 
-    time_preset = st.radio(
-        "Preset",
-        options=["all", "ytd", "1mo", "1w", "1d", "6h", "1h", "custom"],
-        index=0,
-        horizontal=False,
+# ---------------------------------------------------------------------------
+# Apply filter
+# ---------------------------------------------------------------------------
+
+start_ts = pd.Timestamp(start_input, tz=DISPLAY_TZ).tz_convert("UTC") if start_input else None
+end_input_inclusive = (end_input + timedelta(days=1)) if end_input else None
+end_ts = pd.Timestamp(end_input_inclusive, tz=DISPLAY_TZ).tz_convert("UTC") if end_input_inclusive else None
+
+filtered = filter_by_date_range(trades_df, start_ts, end_ts)
+if filtered is None:
+    filtered = trades_df
+
+has_trades = filtered is not None and not filtered.empty
+
+# ---------------------------------------------------------------------------
+# Empty-state banner (when zero rows in the file)
+# ---------------------------------------------------------------------------
+
+if not log_status["exists"]:
+    st.info(
+        "No trade log found yet. Once the paper-trader fires a signal, "
+        "it will write `trades.parquet` to the configured runs directory "
+        "and rows will appear here."
     )
-
-    custom_start = None
-    custom_end = None
-    if time_preset == "custom":
-        custom_start = st.date_input("From", value=None)
-        custom_end = st.date_input("To", value=None)
+elif log_status["n_rows"] == 0:
+    st.info("Trade log exists but contains no rows yet.")
 
 # ---------------------------------------------------------------------------
-# Load data based on selection
+# Aggregate cards
 # ---------------------------------------------------------------------------
 
-# Resolve which run (if any) was explicitly picked.
-selected_run: str | None = None
-if run_names and selected_label != _ALL_RUNS_LABEL:
-    # Match the friendly label back to a run name.
-    for name in run_names:
-        if describe_run(Path(runs_dir) / name) == selected_label:
-            selected_run = name
-            break
-
-if selected_run is not None:
-    run_dir = Path(runs_dir) / selected_run
-    trades_df = load_per_trade_metrics(run_dir)
-    session_meta = load_session_metrics(run_dir)
-    starting_balance = session_meta.get("starting_balance_usd", 100_000.0) or 100_000.0
-else:
-    # "All runs" (or no runs found) - aggregate everything.
-    trades_df = load_all_runs(runs_dir)
-    session_meta = {}
-    starting_balance = 100_000.0
-
-# Normalise: treat None as empty DataFrame.
-if trades_df is None:
-    trades_df = pd.DataFrame()
-
-# ---------------------------------------------------------------------------
-# No-run-data banner (muted, not a takeover)
-# ---------------------------------------------------------------------------
-
-if not run_names:
-    st.info("No session outputs found yet. " "Results will appear here once sessions have completed.")
-
-# ---------------------------------------------------------------------------
-# Apply time filter
-# ---------------------------------------------------------------------------
-
-start_ts, end_ts = _build_time_range(time_preset, trades_df, custom_start, custom_end)
-filtered_df = filter_by_time_range(trades_df, start_ts, end_ts, ts_col="entry_ts")
-
-# After filtering, normalise None -> empty DataFrame.
-if filtered_df is None:
-    filtered_df = pd.DataFrame()
-
-has_trades = not filtered_df.empty
-
-# ---------------------------------------------------------------------------
-# Aggregate header cards (always rendered)
-# ---------------------------------------------------------------------------
-
-agg = compute_aggregate_metrics(filtered_df, starting_balance_usd=starting_balance)
+agg = compute_aggregate_metrics(filtered if has_trades else pd.DataFrame())
 
 col1, col2, col3, col4, col5, col6 = st.columns(6)
-col1.metric("Total PnL", _fmt_usd(agg["total_pnl_usd"]) if has_trades else "-")
-col2.metric("PnL %", _fmt_pct(agg["total_pnl_pct"]) if has_trades else "-")
-col3.metric("Trades", str(agg["n_trades"]))
-col4.metric("Win Rate", _fmt_winrate(agg["win_rate"]) if has_trades else "-")
-col5.metric("Profit Factor", _fmt_ratio(agg["profit_factor"]) if has_trades else "-")
-col6.metric("Sharpe", _fmt_ratio(agg["sharpe"]) if has_trades else "-")
+col1.metric("Total P&L", _fmt_usd(agg["total_pnl_usd"]) if has_trades else "-")
+col2.metric("Trades", str(agg["n_trades"]))
+col3.metric("Win Rate", _fmt_winrate(agg["win_rate"]) if has_trades else "-")
+col4.metric("Profit Factor", _fmt_ratio(agg["profit_factor"]) if has_trades else "-")
+col5.metric("Avg P&L / trade", _fmt_usd(agg["avg_pnl_per_trade"]) if has_trades else "-")
+col6.metric("Account Balance", _fmt_balance(agg["current_balance"]) if has_trades else "-")
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Equity curve (always rendered)
+# Equity curve
 # ---------------------------------------------------------------------------
 
 st.subheader("Equity curve")
 
-if has_trades:
-    equity_df = compute_equity_curve(filtered_df)
+equity_df = compute_equity_curve(filtered) if has_trades else pd.DataFrame()
 
-    if not equity_df.empty:
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=equity_df["entry_ts"],
-                y=equity_df["cumulative_pnl_usd"],
-                mode="lines+markers",
-                name="Cumulative PnL",
-                line=dict(color="#4C8BF5", width=2),
-                marker=dict(size=5),
-                hovertemplate="<b>%{x}</b><br>PnL: $%{y:,.2f}<extra></extra>",
-            )
+fig = go.Figure()
+if not equity_df.empty:
+    fig.add_trace(
+        go.Scatter(
+            x=equity_df["timestamp"],
+            y=equity_df["account_balance_after"],
+            mode="lines+markers",
+            name="Account balance",
+            line=dict(color="#4C8BF5", width=2),
+            marker=dict(size=5),
+            hovertemplate="<b>%{x}</b><br>Balance: $%{y:,.2f}<extra></extra>",
         )
-        fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
-        fig.update_layout(
-            height=320,
-            margin=dict(l=20, r=20, t=20, b=20),
-            xaxis_title="Entry timestamp",
-            yaxis_title="Cumulative PnL (USD)",
-            showlegend=False,
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            xaxis=dict(gridcolor="rgba(128,128,128,0.15)"),
-            yaxis=dict(gridcolor="rgba(128,128,128,0.15)"),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No data for equity curve.")
+    )
+    fig.update_layout(
+        height=320,
+        margin=dict(l=20, r=20, t=20, b=20),
+        xaxis_title="Trade time",
+        yaxis_title="Account balance (USD)",
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(gridcolor="rgba(128,128,128,0.15)"),
+        yaxis=dict(gridcolor="rgba(128,128,128,0.15)"),
+    )
 else:
-    # Empty-state placeholder inside the chart frame.
-    placeholder_fig = go.Figure()
-    placeholder_fig.update_layout(
+    fig.update_layout(
         height=320,
         margin=dict(l=20, r=20, t=20, b=20),
         plot_bgcolor="rgba(0,0,0,0)",
@@ -294,72 +216,130 @@ else:
             )
         ],
     )
-    st.plotly_chart(placeholder_fig, use_container_width=True)
+st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Per-day summary cards + expandable trade tables (always rendered)
+# Per-day P&L bar chart + table
 # ---------------------------------------------------------------------------
 
-st.subheader("Per-session breakdown")
+st.subheader("Per-day P&L")
 
-if not has_trades:
-    st.info("No trades in the selected time range.")
+day_summaries = compute_per_day_summary(filtered) if has_trades else []
+
+if day_summaries:
+    daily_df = pd.DataFrame(day_summaries)
+    bar = go.Figure()
+    bar.add_trace(
+        go.Bar(
+            x=daily_df["date"],
+            y=daily_df["total_pnl_usd"],
+            marker_color=[
+                "#2EAA5C" if v >= 0 else "#D04A4A" for v in daily_df["total_pnl_usd"]
+            ],
+            hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<extra></extra>",
+        )
+    )
+    bar.update_layout(
+        height=280,
+        margin=dict(l=20, r=20, t=20, b=20),
+        xaxis_title="Session date (CT)",
+        yaxis_title="Daily P&L (USD)",
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(gridcolor="rgba(128,128,128,0.15)"),
+        yaxis=dict(gridcolor="rgba(128,128,128,0.15)"),
+    )
+    st.plotly_chart(bar, use_container_width=True)
+
+    table_rows = [
+        {
+            "Date": s["date"],
+            "Trades": s["n_trades"],
+            "P&L": _fmt_usd(s["total_pnl_usd"]),
+            "Win rate": _fmt_winrate(s["win_rate"]),
+            "Best trade": _fmt_usd(s["largest_win_usd"]),
+            "Worst trade": _fmt_usd(s["largest_loss_usd"]),
+            "Ending balance": _fmt_balance(s["ending_balance"]),
+        }
+        for s in day_summaries
+    ]
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 else:
-    day_summaries = compute_per_day_summary(filtered_df, starting_balance_usd=starting_balance)
-
-    if not day_summaries:
-        st.info("No sessions in the selected time range.")
-    else:
-        for summary in day_summaries:
-            date_str = summary["date"]
-            pnl_label = f"{_fmt_usd(summary['total_pnl_usd'])}  ({_fmt_pct(summary['total_pnl_pct'])})"
-            trades_label = f"{summary['n_trades']} trades" + (
-                f"  ({summary['n_long']}L / {summary['n_short']}S)" if summary["n_long"] is not None else ""
-            )
-
-            # Card row
-            with st.container(border=True):
-                card_cols = st.columns([2, 2, 2, 2, 2, 2])
-                card_cols[0].markdown(f"**{date_str}**")
-                card_cols[1].markdown(trades_label)
-                card_cols[2].markdown(pnl_label)
-                card_cols[3].markdown(f"Win rate: {_fmt_winrate(summary['win_rate'])}")
-                card_cols[4].markdown(
-                    f"Best: {_fmt_usd(summary['largest_win_usd'])}  |  Worst: {_fmt_usd(summary['largest_loss_usd'])}"
-                )
-                avg_hold = summary["avg_hold_seconds"]
-                card_cols[5].markdown(f"Avg hold: {int(avg_hold)}s" if avg_hold is not None else "Avg hold: -")
-
-            # Expandable trade table for this day.
-            day_df = filtered_df[
-                filtered_df["entry_ts"].dt.tz_convert("America/Chicago").dt.date.astype(str) == date_str
-            ]
-
-            display_cols = [c for c in _TRADE_DISPLAY_COLS if c in day_df.columns]
-            display_df = day_df[display_cols].copy()
-
-            # Format timestamps for readability.
-            for ts_col in ("entry_ts", "exit_ts"):
-                if ts_col in display_df.columns:
-                    display_df[ts_col] = (
-                        display_df[ts_col].dt.tz_convert("America/Chicago").dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-                    )
-
-            with st.expander(f"Trades for {date_str} ({len(day_df)} rows)", expanded=False):
-                st.dataframe(
-                    display_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
+    st.info("No trades in the selected date range.")
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Footer: run metadata (only when a single run is selected)
+# Signal breakdown
 # ---------------------------------------------------------------------------
 
-if session_meta:
-    with st.expander("Session metadata", expanded=False):
-        st.json(session_meta)
+st.subheader("Signal breakdown")
+
+hist_df = compute_signal_histogram(filtered) if has_trades else pd.DataFrame()
+
+if not hist_df.empty:
+    hist_fig = go.Figure()
+    hist_fig.add_trace(
+        go.Bar(
+            x=hist_df["signal_type"],
+            y=hist_df["n_trades"],
+            marker_color="#7B9CFE",
+            customdata=hist_df["total_pnl_usd"],
+            hovertemplate="<b>%{x}</b><br>Trades: %{y}<br>P&L: $%{customdata:,.2f}<extra></extra>",
+        )
+    )
+    hist_fig.update_layout(
+        height=260,
+        margin=dict(l=20, r=20, t=20, b=20),
+        xaxis_title="Signal type",
+        yaxis_title="Number of trades",
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(hist_fig, use_container_width=True)
+
+    sig_table = hist_df.rename(
+        columns={
+            "signal_type": "Signal",
+            "n_trades": "Trades",
+            "total_pnl_usd": "Total P&L",
+        }
+    )
+    sig_table["Total P&L"] = sig_table["Total P&L"].apply(_fmt_usd)
+    st.dataframe(sig_table, use_container_width=True, hide_index=True)
+else:
+    st.info("No signals fired in the selected date range.")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Trade log table
+# ---------------------------------------------------------------------------
+
+st.subheader("Trades")
+
+if has_trades:
+    display_df = filtered.copy()
+    display_df["timestamp"] = (
+        display_df["timestamp"].dt.tz_convert(DISPLAY_TZ).dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    )
+    display_df = display_df.rename(
+        columns={
+            "timestamp": "Time",
+            "signal_type": "Signal",
+            "entry_price": "Entry",
+            "stop": "Stop",
+            "target": "Target",
+            "mock_fill_price": "Fill",
+            "mock_pnl_dollars": "P&L",
+            "account_balance_after": "Balance after",
+        }
+    )
+    display_df = display_df.sort_values("Time", ascending=False).reset_index(drop=True)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+else:
+    st.info("No trades to display.")
