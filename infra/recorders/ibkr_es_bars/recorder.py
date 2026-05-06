@@ -63,7 +63,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import redis as redis_pkg
 
+from alpha_assay.bus.consumer import Consumer
+from alpha_assay.bus.streams import stream_name_for_bars
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from infra.recorders.ibkr_es_bars import recorder_metrics as RM
 
@@ -154,12 +157,14 @@ class ESBarsRecorder:
     def __init__(
         self,
         *,
-        adapter: IBKRAdapter,
+        adapter: IBKRAdapter | None = None,
         out_dir: Path,
         contract_spec: dict[str, Any] | None = None,
         feed_label: str | None = None,
         flush_period_seconds: int = FLUSH_PERIOD_SECONDS,
         shutdown_timeout_seconds: int = 30,
+        bus_redis: redis_pkg.Redis | None = None,
+        bus_consumer_id: str = "es-bars-recorder",
     ) -> None:
         self._adapter = adapter
         self._out_dir = Path(out_dir)
@@ -177,6 +182,21 @@ class ESBarsRecorder:
         self._feed_label = feed_label or self._derive_feed_label(self._contract_spec)
         self._flush_period_seconds = flush_period_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
+
+        # Bus-consumer mode: if bus_redis is provided, the recorder reads
+        # from a Redis Stream instead of subscribing directly to IBKR.
+        self._bus_redis = bus_redis
+        self._stream = stream_name_for_bars(self._contract_spec)
+        self._consumer: Consumer | None = (
+            Consumer(
+                redis_client=bus_redis,
+                stream=self._stream,
+                consumer_id=bus_consumer_id,
+                start_id="0",
+            )
+            if bus_redis is not None
+            else None
+        )
 
         # Day buffer (single feed per recorder instance). Preserved across reconnects.
         self._day_buffer: _DayBuffer | None = None
@@ -263,10 +283,28 @@ class ESBarsRecorder:
             return 0
         return self._flush_one(buf)
 
+    async def consume_n_messages_for_test(self, n: int) -> None:
+        """Test helper: drain N messages from the bus into the day buffer."""
+        assert self._consumer is not None, "bus_redis required for consumer mode"
+        consumed = 0
+        for msg in self._consumer.iter_messages(max_messages=n, block_ms=1000):
+            bar = {
+                "timestamp": pd.Timestamp(msg.payload["ts_minute_utc"], unit="s", tz="UTC"),
+                "open": msg.payload["open"],
+                "high": msg.payload["high"],
+                "low": msg.payload["low"],
+                "close": msg.payload["close"],
+                "volume": msg.payload["volume"],
+                "feed": self._feed_label,
+            }
+            self.ingest_bar(bar)
+            consumed += 1
+            if consumed >= n:
+                break
+
     async def run(self) -> None:
-        """Main loop. Connect, subscribe, ingest until SIGTERM. On
-        adapter-side failure, reconnect with exponential backoff and
-        resume.
+        """Main loop. Either consume from bus or connect/subscribe directly to IBKR.
+        Runs until SIGTERM/SIGINT.
         """
         self._loop = asyncio.get_running_loop()
         self._shutdown_event = asyncio.Event()
@@ -276,17 +314,27 @@ class ESBarsRecorder:
             with suppress(NotImplementedError):
                 self._loop.add_signal_handler(sig, self._request_shutdown)
 
-        flush_task = self._loop.create_task(self._periodic_flush_loop())
         age_task = self._loop.create_task(self._periodic_age_gauge_loop())
 
         try:
-            await self._connect_and_stream_forever()
+            if self._consumer is not None:
+                await self._run_bus_consumer()
+            else:
+                flush_task = self._loop.create_task(self._periodic_flush_loop())
+                try:
+                    await self._connect_and_stream_forever()
+                finally:
+                    flush_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await flush_task
+                    self._drain_and_flush()
         finally:
-            for task in (flush_task, age_task):
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-            self._drain_and_flush()
+            age_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await age_task
+            if self._consumer is None:
+                # drain_and_flush already called above for direct mode.
+                pass
 
     # --- internals ------------------------------------------------------
 
@@ -330,7 +378,11 @@ class ESBarsRecorder:
         ingestion stalls, which is exactly the freshness signal the
         healthcheck needs.
         """
-        anchor = self._last_bar_received_at if self._last_bar_received_at is not None else self._recorder_start_monotonic
+        anchor = (
+            self._last_bar_received_at
+            if self._last_bar_received_at is not None
+            else self._recorder_start_monotonic
+        )
         age = max(0.0, time.monotonic() - anchor)
         RM.last_bar_age_seconds.labels(feed=self._feed_label).set(age)
 
@@ -435,6 +487,39 @@ class ESBarsRecorder:
                     await connection_watcher
             with suppress(Exception):
                 await gen.aclose()
+
+    async def _run_bus_consumer(self) -> None:
+        """Bus-consumer mode: iterate messages from Redis Stream, ingest_bar each."""
+        assert self._consumer is not None
+        assert self._shutdown_event is not None
+        # Run flush loop concurrently.
+        flush_task = asyncio.create_task(self._periodic_flush_loop())
+        try:
+            # XREAD BLOCK is sync (redis-py is sync). Run in a thread to avoid
+            # blocking the asyncio event loop.
+            await asyncio.get_running_loop().run_in_executor(None, self._consume_loop_sync)
+        finally:
+            flush_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await flush_task
+            self._drain_and_flush()
+
+    def _consume_loop_sync(self) -> None:
+        """Synchronous consume loop run in an executor thread."""
+        assert self._consumer is not None
+        for msg in self._consumer.iter_messages(block_ms=1000):
+            if self._shutdown_event is not None and self._shutdown_event.is_set():
+                return
+            bar = {
+                "timestamp": pd.Timestamp(msg.payload["ts_minute_utc"], unit="s", tz="UTC"),
+                "open": msg.payload["open"],
+                "high": msg.payload["high"],
+                "low": msg.payload["low"],
+                "close": msg.payload["close"],
+                "volume": msg.payload["volume"],
+                "feed": self._feed_label,
+            }
+            self.ingest_bar(bar)
 
     def _flush_one(self, buf: _DayBuffer) -> int:
         if not buf.rows:

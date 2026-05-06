@@ -33,6 +33,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import redis as redis_pkg
 from prometheus_client import start_http_server
 
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
@@ -63,21 +64,8 @@ def main() -> None:
 
     out_dir = Path(os.environ.get("OUT_DIR", "/data/es_bars"))
     metrics_port = int(os.environ.get("METRICS_PORT", "8002"))
-    ibkr_host = os.environ.get("IBKR_HOST", "127.0.0.1")
-    ibkr_port = int(os.environ.get("IBKR_PORT", "4002"))
-    client_id = int(os.environ.get("IBKR_CLIENT_ID", str(_DEFAULT_CLIENT_ID)))
-    account = os.environ.get("IBKR_ACCOUNT", "")
     contract_spec = _build_contract_spec()
-
-    log.info(
-        "es-bars-recorder starting (out_dir=%s metrics_port=%d ibkr=%s:%d " "client_id=%d contract=%s)",
-        out_dir,
-        metrics_port,
-        ibkr_host,
-        ibkr_port,
-        client_id,
-        contract_spec,
-    )
+    bus_redis_url = os.environ.get("BUS_REDIS_URL", "")
 
     if contract_spec["expiry"] == _DEFAULT_ES_EXPIRY:
         log.warning(
@@ -89,18 +77,50 @@ def main() -> None:
     # succeed immediately.
     start_http_server(metrics_port)
 
-    adapter = IBKRAdapter(
-        host=ibkr_host,
-        port=ibkr_port,
-        client_id=client_id,
-        account=account or None,
-        read_only=True,
-    )
-    recorder = ESBarsRecorder(
-        adapter=adapter,
-        out_dir=out_dir,
-        contract_spec=contract_spec,
-    )
+    if bus_redis_url:
+        # Bus-consumer mode: read bars from Redis Stream produced by the ibkr-feed daemon.
+        log.info(
+            "es-bars-recorder starting in bus-consumer mode (out_dir=%s metrics_port=%d bus=%s contract=%s)",
+            out_dir,
+            metrics_port,
+            bus_redis_url,
+            contract_spec,
+        )
+        bus_redis = redis_pkg.from_url(bus_redis_url)
+        recorder = ESBarsRecorder(
+            out_dir=out_dir,
+            contract_spec=contract_spec,
+            bus_redis=bus_redis,
+            bus_consumer_id=os.environ.get("BUS_CONSUMER_ID", "es-bars-recorder"),
+        )
+    else:
+        # Direct-IBKR mode (legacy): recorder subscribes directly to IB Gateway.
+        ibkr_host = os.environ.get("IBKR_HOST", "127.0.0.1")
+        ibkr_port = int(os.environ.get("IBKR_PORT", "4002"))
+        client_id = int(os.environ.get("IBKR_CLIENT_ID", str(_DEFAULT_CLIENT_ID)))
+        account = os.environ.get("IBKR_ACCOUNT", "")
+        log.info(
+            "es-bars-recorder starting in direct-IBKR mode (out_dir=%s metrics_port=%d ibkr=%s:%d "
+            "client_id=%d contract=%s)",
+            out_dir,
+            metrics_port,
+            ibkr_host,
+            ibkr_port,
+            client_id,
+            contract_spec,
+        )
+        adapter = IBKRAdapter(
+            host=ibkr_host,
+            port=ibkr_port,
+            client_id=client_id,
+            account=account or None,
+            read_only=True,
+        )
+        recorder = ESBarsRecorder(
+            adapter=adapter,
+            out_dir=out_dir,
+            contract_spec=contract_spec,
+        )
 
     asyncio.run(recorder.run())
 
