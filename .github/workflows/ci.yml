@@ -38,5 +38,10 @@ jobs:
       - name: Lint - black
         run: black --check .
 
+      - name: Generate test fixtures
+        run: |
+          python tests/fixtures/make_sample.py --out tests/fixtures/sample_2d.csv --days 2
+          python tests/fixtures/make_sample.py --out tests/fixtures/sample_2d.parquet --days 2
+
       - name: Test
         run: pytest -q
