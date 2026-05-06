@@ -21,11 +21,10 @@ COPY configs ./configs
 
 RUN pip install --upgrade pip && pip install -e .
 
-RUN useradd -u 10001 -m feed && \
-    mkdir -p /var/lib/alphaassay/wal && \
-    chown -R feed:feed /var/lib/alphaassay
-
-USER feed
+# Run as root inside container to match the recorder/dashboard pattern;
+# bind-mounts from the host are owned by the host user (ameza) and the
+# container needs write access to the WAL directory.
+RUN mkdir -p /var/lib/alphaassay/wal
 
 EXPOSE 8003
 
