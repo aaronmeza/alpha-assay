@@ -510,15 +510,24 @@ class ESBarsRecorder:
         for msg in self._consumer.iter_messages(block_ms=1000):
             if self._shutdown_event is not None and self._shutdown_event.is_set():
                 return
-            bar = {
-                "timestamp": pd.Timestamp(msg.payload["ts_minute_utc"], unit="s", tz="UTC"),
-                "open": msg.payload["open"],
-                "high": msg.payload["high"],
-                "low": msg.payload["low"],
-                "close": msg.payload["close"],
-                "volume": msg.payload["volume"],
-                "feed": self._feed_label,
-            }
+            try:
+                bar = {
+                    "timestamp": pd.Timestamp(msg.payload["ts_minute_utc"], unit="s", tz="UTC"),
+                    "open": msg.payload["open"],
+                    "high": msg.payload["high"],
+                    "low": msg.payload["low"],
+                    "close": msg.payload["close"],
+                    "volume": msg.payload["volume"],
+                    "feed": self._feed_label,
+                }
+            except KeyError:
+                LOG.error(
+                    "es-bars recorder: skipping malformed bar msg seq=%s stream=%s payload_keys=%s",
+                    getattr(msg, "seq", "?"),
+                    getattr(msg, "stream", "?"),
+                    sorted(msg.payload.keys()) if isinstance(msg.payload, dict) else type(msg.payload),
+                )
+                continue
             self.ingest_bar(bar)
 
     def _flush_one(self, buf: _DayBuffer) -> int:
