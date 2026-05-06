@@ -55,7 +55,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import redis as redis_pkg
 
+from alpha_assay.bus.consumer import Consumer
+from alpha_assay.bus.streams import stream_name_for_ticks
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.observability import recorder_metrics as RM
 
@@ -134,17 +137,40 @@ class BreadthRecorder:
     def __init__(
         self,
         *,
-        adapter: IBKRAdapter,
+        adapter: IBKRAdapter | None = None,
         out_dir: Path,
+        symbol: str | None = None,
         symbols: tuple[str, ...] = ("TICK-NYSE", "AD-NYSE"),
         flush_period_seconds: int = FLUSH_PERIOD_SECONDS,
         shutdown_timeout_seconds: int = 30,
+        bus_redis: redis_pkg.Redis | None = None,
+        bus_consumer_id: str = "breadth-recorder",
     ) -> None:
         self._adapter = adapter
         self._out_dir = Path(out_dir)
-        self._symbols = tuple(symbols)
+        # ``symbol`` (singular) is the bus-consumer shorthand for a single-symbol
+        # instance. When provided it overrides ``symbols``. Direct-IBKR mode
+        # continues to use ``symbols`` (multiple symbols per recorder instance).
+        if symbol is not None:
+            self._symbols = (symbol,)
+        else:
+            self._symbols = tuple(symbols)
         self._flush_period_seconds = flush_period_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
+
+        # Bus-consumer mode: if bus_redis is provided, the recorder reads from a
+        # Redis Stream instead of subscribing directly to IBKR. In bus mode a
+        # single recorder instance handles one symbol (the ``symbol`` kwarg).
+        self._bus_redis = bus_redis
+        self._consumer: Consumer | None = None
+        if bus_redis is not None:
+            bus_symbol = symbol if symbol is not None else self._symbols[0]
+            self._consumer = Consumer(
+                redis_client=bus_redis,
+                stream=stream_name_for_ticks(bus_symbol),
+                consumer_id=bus_consumer_id,
+                start_id="0",
+            )
 
         # Per-symbol aggregation state. Preserved across reconnects.
         self._buckets: dict[str, _Bucket | None] = {s: None for s in self._symbols}
@@ -260,10 +286,41 @@ class BreadthRecorder:
             written[symbol] = len(buf.rows)
         return written
 
+    async def consume_n_messages_for_test(self, n: int) -> None:
+        """Test helper: drain N messages from the bus into the aggregation state.
+
+        Converts each bus Message payload (``value`` + ``symbol``) plus
+        ``ts_event_ns`` (nanoseconds since epoch) into the canonical tick dict
+        expected by ``ingest_tick`` and calls it.
+
+        After draining, any in-flight buckets whose minute has elapsed by
+        wall-clock are emitted into the day buffer so that a subsequent
+        ``flush()`` call writes them to parquet. This mirrors the
+        ``_drain_and_flush`` behaviour that runs at process shutdown.
+        """
+        assert self._consumer is not None, "bus_redis required for consumer mode"
+        consumed = 0
+        for msg in self._consumer.iter_messages(max_messages=n, block_ms=1000):
+            tick = {
+                "timestamp": pd.Timestamp(msg.ts_event_ns, unit="ns", tz="UTC"),
+                "value": msg.payload["value"],
+                "symbol": msg.payload["symbol"],
+            }
+            self.ingest_tick(tick)
+            consumed += 1
+            if consumed >= n:
+                break
+        # Emit any elapsed in-flight buckets so the caller can flush them.
+        now_utc = pd.Timestamp.now(tz="UTC")
+        for symbol in self._symbols:
+            bucket = self._buckets.get(symbol)
+            if bucket is not None and now_utc.floor("1min") > bucket.minute:
+                self._emit(symbol, bucket)
+                self._buckets[symbol] = None
+
     async def run(self) -> None:
-        """Main loop. Connect, subscribe to every symbol, aggregate until
-        SIGTERM. On adapter-side failure, reconnect with exponential
-        backoff and resume.
+        """Main loop. Either consume from bus or connect/subscribe directly to IBKR.
+        Runs until SIGTERM/SIGINT.
         """
         self._loop = asyncio.get_running_loop()
         self._shutdown_event = asyncio.Event()
@@ -274,18 +331,26 @@ class BreadthRecorder:
             with suppress(NotImplementedError):
                 self._loop.add_signal_handler(sig, self._request_shutdown)
 
-        # Periodic flush task.
-        flush_task = self._loop.create_task(self._periodic_flush_loop())
         gap_task = self._loop.create_task(self._periodic_session_gap_loop())
 
         try:
-            await self._connect_and_stream_forever()
+            if self._consumer is not None:
+                await self._run_bus_consumer()
+            else:
+                # Periodic flush task is only needed in direct-IBKR mode; bus
+                # mode manages its own flush loop inside _run_bus_consumer.
+                flush_task = self._loop.create_task(self._periodic_flush_loop())
+                try:
+                    await self._connect_and_stream_forever()
+                finally:
+                    flush_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await flush_task
+                    self._drain_and_flush()
         finally:
-            for task in (flush_task, gap_task):
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-            self._drain_and_flush()
+            gap_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await gap_task
 
     # --- internals ------------------------------------------------------
 
@@ -293,6 +358,35 @@ class BreadthRecorder:
         LOG.info("breadth-recorder: shutdown requested")
         if self._shutdown_event is not None:
             self._shutdown_event.set()
+
+    async def _run_bus_consumer(self) -> None:
+        """Bus-consumer mode: iterate messages from Redis Stream, ingest_tick each."""
+        assert self._consumer is not None
+        assert self._shutdown_event is not None
+        # Run flush loop concurrently.
+        flush_task = asyncio.create_task(self._periodic_flush_loop())
+        try:
+            # XREAD BLOCK is sync (redis-py is sync). Run in a thread to avoid
+            # blocking the asyncio event loop.
+            await asyncio.get_running_loop().run_in_executor(None, self._consume_loop_sync)
+        finally:
+            flush_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await flush_task
+            self._drain_and_flush()
+
+    def _consume_loop_sync(self) -> None:
+        """Synchronous consume loop run in an executor thread."""
+        assert self._consumer is not None
+        for msg in self._consumer.iter_messages(block_ms=1000):
+            if self._shutdown_event is not None and self._shutdown_event.is_set():
+                return
+            tick = {
+                "timestamp": pd.Timestamp(msg.ts_event_ns, unit="ns", tz="UTC"),
+                "value": msg.payload["value"],
+                "symbol": msg.payload["symbol"],
+            }
+            self.ingest_tick(tick)
 
     async def _periodic_flush_loop(self) -> None:
         """Flush every `flush_period_seconds`. Exits when shutdown is set."""
