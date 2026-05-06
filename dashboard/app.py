@@ -235,9 +235,7 @@ if day_summaries:
         go.Bar(
             x=daily_df["date"],
             y=daily_df["total_pnl_usd"],
-            marker_color=[
-                "#2EAA5C" if v >= 0 else "#D04A4A" for v in daily_df["total_pnl_usd"]
-            ],
+            marker_color=["#2EAA5C" if v >= 0 else "#D04A4A" for v in daily_df["total_pnl_usd"]],
             hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<extra></extra>",
         )
     )
@@ -324,9 +322,7 @@ st.subheader("Trades")
 
 if has_trades:
     display_df = filtered.copy()
-    display_df["timestamp"] = (
-        display_df["timestamp"].dt.tz_convert(DISPLAY_TZ).dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-    )
+    display_df["timestamp"] = display_df["timestamp"].dt.tz_convert(DISPLAY_TZ).dt.strftime("%Y-%m-%d %H:%M:%S %Z")
     display_df = display_df.rename(
         columns={
             "timestamp": "Time",

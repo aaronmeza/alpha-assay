@@ -74,7 +74,11 @@ def test_daemon_publishes_bars_to_correct_stream(redis_client, tmp_path):
 def test_daemon_advances_wal_watermark_on_publish(redis_client, tmp_path):
     bar_event = {
         "timestamp": "2026-05-06T13:30:00+00:00",
-        "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1,
+        "open": 1.0,
+        "high": 1.0,
+        "low": 1.0,
+        "close": 1.0,
+        "volume": 1,
         "feed": "ES-FUT-20260618",
     }
 

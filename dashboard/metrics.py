@@ -145,10 +145,14 @@ def compute_signal_histogram(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or "signal_type" not in df.columns:
         return pd.DataFrame(columns=cols)
 
-    grouped = df.groupby("signal_type", dropna=False).agg(
-        n_trades=("signal_type", "size"),
-        total_pnl_usd=("mock_pnl_dollars", "sum"),
-    ).reset_index()
+    grouped = (
+        df.groupby("signal_type", dropna=False)
+        .agg(
+            n_trades=("signal_type", "size"),
+            total_pnl_usd=("mock_pnl_dollars", "sum"),
+        )
+        .reset_index()
+    )
     grouped["total_pnl_usd"] = grouped["total_pnl_usd"].round(2)
     grouped = grouped.sort_values("n_trades", ascending=False).reset_index(drop=True)
     return grouped[cols]

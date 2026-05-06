@@ -379,9 +379,7 @@ class ESBarsRecorder:
         healthcheck needs.
         """
         anchor = (
-            self._last_bar_received_at
-            if self._last_bar_received_at is not None
-            else self._recorder_start_monotonic
+            self._last_bar_received_at if self._last_bar_received_at is not None else self._recorder_start_monotonic
         )
         age = max(0.0, time.monotonic() - anchor)
         RM.last_bar_age_seconds.labels(feed=self._feed_label).set(age)

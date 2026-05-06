@@ -226,9 +226,11 @@ class AlwaysFlatStrategy:
         target = fill + atr_target if signal > 0 else fill - atr_target
         # P&L is zero at entry; will be updated on exit (future extension).
         record = TradeRecord(
-            timestamp=pd.Timestamp(bar.get("timestamp", "")).tz_convert("UTC")
-            if isinstance(bar.get("timestamp"), (pd.Timestamp,))
-            else pd.Timestamp(str(bar.get("timestamp", "")), tz="UTC"),
+            timestamp=(
+                pd.Timestamp(bar.get("timestamp", "")).tz_convert("UTC")
+                if isinstance(bar.get("timestamp"), (pd.Timestamp,))
+                else pd.Timestamp(str(bar.get("timestamp", "")), tz="UTC")
+            ),
             signal_type="long_entry" if signal > 0 else "short_entry",
             entry_price=close,
             stop=stop,
@@ -629,9 +631,7 @@ def run(cfg: DryrunConfig) -> int:
             bus_consumers[0]._stream,
             bus_consumers[1]._stream,
         )
-        return asyncio.run(
-            _async_main(cfg, None, strategy, stop_event, bus_consumers=bus_consumers)
-        )
+        return asyncio.run(_async_main(cfg, None, strategy, stop_event, bus_consumers=bus_consumers))
 
     # Direct-IBKR mode (backward-compatible default).
     adapter, exec_adapter = build_adapters(cfg)

@@ -294,9 +294,7 @@ class IBKRAdapter:
 
         last_event = [time.monotonic()]
         M.ibkr_feed_freshness_seconds.labels(feed=feed).set(0.0)
-        refresh_task = asyncio.create_task(
-            _refresh_freshness_gauge(feed, last_event)
-        )
+        refresh_task = asyncio.create_task(_refresh_freshness_gauge(feed, last_event))
 
         try:
             while True:
@@ -446,9 +444,7 @@ class IBKRAdapter:
 
         last_event = [time.monotonic()]
         M.ibkr_feed_freshness_seconds.labels(feed=feed).set(0.0)
-        refresh_task = asyncio.create_task(
-            _refresh_freshness_gauge(feed, last_event)
-        )
+        refresh_task = asyncio.create_task(_refresh_freshness_gauge(feed, last_event))
 
         try:
             while True:

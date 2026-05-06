@@ -53,9 +53,7 @@ def stream_name_for_bars(contract_spec: dict[str, Any]) -> str:
     exchange = contract_spec.get("exchange")
 
     if not symbol or not exchange:
-        raise ValueError(
-            f"contract_spec missing required fields: needs 'symbol' and 'exchange'; got {contract_spec!r}"
-        )
+        raise ValueError(f"contract_spec missing required fields: needs 'symbol' and 'exchange'; got {contract_spec!r}")
 
     symbol_lower = str(symbol).lower()
     venue_lower = str(exchange).lower()
@@ -103,8 +101,7 @@ def unpack(raw: bytes) -> Message:
     v = int(decoded.get("v", 0))
     if v != CURRENT_VERSION:
         raise SchemaVersionError(
-            f"bus message major version {v} != supported {CURRENT_VERSION}; "
-            f"coordinated upgrade required"
+            f"bus message major version {v} != supported {CURRENT_VERSION}; " f"coordinated upgrade required"
         )
 
     # Validate required fields.

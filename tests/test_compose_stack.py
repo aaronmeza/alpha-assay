@@ -119,9 +119,9 @@ def test_prometheus_scrape_targets() -> None:
             )
         elif job["job_name"] == "breadth-recorder":
             targets = job["static_configs"][0]["targets"]
-            assert "host.docker.internal:8001" in targets, (
-                f"breadth-recorder job must target host.docker.internal:8001; got {targets}"
-            )
+            assert (
+                "host.docker.internal:8001" in targets
+            ), f"breadth-recorder job must target host.docker.internal:8001; got {targets}"
 
 
 def test_grafana_dashboard_json_is_valid() -> None:

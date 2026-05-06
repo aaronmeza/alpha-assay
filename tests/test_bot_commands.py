@@ -30,8 +30,10 @@ def _ctx(**overrides):
 def test_health_runs_script_and_returns_summary(monkeypatch):
     def fake_run(cmd, **kw):
         return subprocess.CompletedProcess(
-            args=cmd, returncode=0,
-            stdout="PASS: 22 WARN: 0 FAIL: 0\nRESULT: READY", stderr="",
+            args=cmd,
+            returncode=0,
+            stdout="PASS: 22 WARN: 0 FAIL: 0\nRESULT: READY",
+            stderr="",
         )
 
     monkeypatch.setattr(subprocess, "run", fake_run)

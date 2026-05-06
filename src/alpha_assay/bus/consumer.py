@@ -33,9 +33,7 @@ class Consumer:
         start_id: str = "$",
     ) -> None:
         if start_id not in _VALID_START_IDS:
-            raise ValueError(
-                f"start_id must be '0' (replay) or '$' (latest); got {start_id!r}"
-            )
+            raise ValueError(f"start_id must be '0' (replay) or '$' (latest); got {start_id!r}")
         self._redis = redis_client
         self._stream = stream
         self._consumer_id = consumer_id
@@ -69,13 +67,9 @@ class Consumer:
             for entry_id, fields in items:
                 raw: bytes = fields[b"data"]
                 msg = unpack(raw)
-                BM.bus_consume_total.labels(
-                    stream=self._stream, consumer=self._consumer_id
-                ).inc()
+                BM.bus_consume_total.labels(stream=self._stream, consumer=self._consumer_id).inc()
                 lag_s = max(0.0, (time.time_ns() - msg.ts_event_ns) / 1e9)
-                BM.bus_consume_lag_seconds.labels(
-                    stream=self._stream, consumer=self._consumer_id
-                ).observe(lag_s)
+                BM.bus_consume_lag_seconds.labels(stream=self._stream, consumer=self._consumer_id).observe(lag_s)
                 self._cursor = entry_id.decode() if isinstance(entry_id, bytes) else entry_id
                 yield msg
                 delivered += 1

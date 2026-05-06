@@ -65,9 +65,7 @@ def test_unpack_unknown_major_version_raises():
     # Forge a v=2 message; consumers must hard-fail.
     import msgpack
 
-    raw = msgpack.packb(
-        {"v": 2, "seq": 0, "ts_recv_ns": 0, "ts_event_ns": 0, "stream": "x", "payload": {}}
-    )
+    raw = msgpack.packb({"v": 2, "seq": 0, "ts_recv_ns": 0, "ts_event_ns": 0, "stream": "x", "payload": {}})
     with pytest.raises(SchemaVersionError, match="major version"):
         unpack(raw)
 

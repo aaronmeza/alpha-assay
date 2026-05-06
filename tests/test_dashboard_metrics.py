@@ -96,12 +96,7 @@ def test_aggregate_mixed():
 
 
 def test_aggregate_max_drawdown_zero_for_winners():
-    df = _df(
-        [
-            _row(ts=f"2026-04-0{i} 14:00:00+00:00", pnl=50.0, balance=100_000.0 + 50.0 * i)
-            for i in range(1, 5)
-        ]
-    )
+    df = _df([_row(ts=f"2026-04-0{i} 14:00:00+00:00", pnl=50.0, balance=100_000.0 + 50.0 * i) for i in range(1, 5)])
     m = compute_aggregate_metrics(df)
     assert m["max_drawdown_usd"] == pytest.approx(0.0)
 

@@ -67,8 +67,7 @@ def main() -> None:
 
     if bus_redis_url:
         log.info(
-            "breadth-recorder starting in bus-consumer mode "
-            "(out_dir=%s metrics_port=%d symbols=%s bus=%s)",
+            "breadth-recorder starting in bus-consumer mode " "(out_dir=%s metrics_port=%d symbols=%s bus=%s)",
             out_dir,
             metrics_port,
             symbols,
@@ -97,8 +96,7 @@ def main() -> None:
         client_id = int(os.environ.get("IBKR_CLIENT_ID", "21"))
 
         log.info(
-            "breadth-recorder starting in direct-IBKR mode "
-            "(out_dir=%s metrics_port=%d symbols=%s ibkr=%s:%d)",
+            "breadth-recorder starting in direct-IBKR mode " "(out_dir=%s metrics_port=%d symbols=%s ibkr=%s:%d)",
             out_dir,
             metrics_port,
             symbols,
