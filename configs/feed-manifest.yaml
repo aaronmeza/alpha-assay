@@ -1,0 +1,16 @@
+# Default subscriptions for ibkr-feed. Edit + restart feed to change.
+# Every entry produces one Redis Stream.
+subscriptions:
+  - kind: bars
+    contract:
+      symbol: ES
+      sec_type: FUT
+      exchange: CME
+      currency: USD
+      expiry: "20260618"
+    bar_size: "1 min"
+    what_to_show: TRADES
+  - kind: ticks
+    symbol: TICK-NYSE
+  - kind: ticks
+    symbol: AD-NYSE
