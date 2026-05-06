@@ -4,11 +4,10 @@ publishes to Redis Streams via the alpha_assay.bus module."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,13 +15,12 @@ import pandas as pd
 import redis as redis_pkg
 import yaml
 
+from alpha_assay.bus import metrics as BM
 from alpha_assay.bus.lock import FeedLock, FeedLockHeldError
 from alpha_assay.bus.producer import Producer
-from alpha_assay.bus.streams import CURRENT_VERSION, Message
+from alpha_assay.bus.streams import CURRENT_VERSION, Message, stream_name_for_bars, stream_name_for_ticks
 from alpha_assay.bus.streams import pack as pack_msg
-from alpha_assay.bus.streams import stream_name_for_bars, stream_name_for_ticks
 from alpha_assay.bus.wal import WALAppender
-from alpha_assay.bus import metrics as BM
 
 LOG = logging.getLogger(__name__)
 
@@ -122,7 +120,7 @@ class IBKRFeedDaemon:
         BM.feed_lock_state.labels(contract=stream).set(1)
 
         # Drain any uncommitted WAL records first.
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        day = datetime.now(UTC).strftime("%Y-%m-%d")
         wal = WALAppender(directory=self._wal_dir, day=day)
         for record in wal.read_uncommitted():
             self._redis.xadd(stream, {"data": record.msg_bytes}, maxlen=3600, approximate=True)
