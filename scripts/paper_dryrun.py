@@ -341,24 +341,28 @@ def _consume_bars_from_bus_sync(
 ) -> None:
     """Synchronous bus-consumer loop for ES bars.
 
-    Runs in an executor thread (same pattern as ESBarsRecorder). Yields
-    to the executor every bar so the stop-event poll is responsive.
+    Runs in an executor thread. iter_messages returns on block timeout
+    (no messages within block_ms), so wrap in an outer while loop that
+    keeps re-entering iter_messages until stop_event is set.
     """
     feed_label = "es"
-    for msg in consumer.iter_messages(block_ms=1000):
-        if stop_event.is_set():
-            return
-        bar = {
-            "timestamp": pd.Timestamp(msg.payload["ts_minute_utc"], unit="s", tz="UTC"),
-            "open": msg.payload["open"],
-            "high": msg.payload["high"],
-            "low": msg.payload["low"],
-            "close": msg.payload["close"],
-            "volume": msg.payload["volume"],
-        }
-        strategy.on_bar(bar, feed_label=feed_label)
-        if stop_event.is_set():
-            return
+    while not stop_event.is_set():
+        for msg in consumer.iter_messages(block_ms=1000):
+            if stop_event.is_set():
+                return
+            try:
+                bar = {
+                    "timestamp": pd.Timestamp(msg.payload["ts_minute_utc"], unit="s", tz="UTC"),
+                    "open": msg.payload["open"],
+                    "high": msg.payload["high"],
+                    "low": msg.payload["low"],
+                    "close": msg.payload["close"],
+                    "volume": msg.payload["volume"],
+                }
+            except KeyError:
+                _LOG.error("paper-trader bars: skipping malformed payload=%r", msg.payload)
+                continue
+            strategy.on_bar(bar, feed_label=feed_label)
 
 
 def _consume_breadth_from_bus_sync(
@@ -368,17 +372,20 @@ def _consume_breadth_from_bus_sync(
 ) -> None:
     """Synchronous bus-consumer loop for TICK-NYSE breadth."""
     feed_label = "tick_nyse"
-    for msg in consumer.iter_messages(block_ms=1000):
-        if stop_event.is_set():
-            return
-        tick = {
-            "timestamp": pd.Timestamp(msg.payload.get("ts_utc", 0), unit="s", tz="UTC"),
-            "value": msg.payload.get("value", 0.0),
-            "symbol": "TICK-NYSE",
-        }
-        strategy.on_breadth_tick(tick, feed_label=feed_label)
-        if stop_event.is_set():
-            return
+    while not stop_event.is_set():
+        for msg in consumer.iter_messages(block_ms=1000):
+            if stop_event.is_set():
+                return
+            try:
+                tick = {
+                    "timestamp": pd.Timestamp(msg.ts_event_ns, unit="ns", tz="UTC"),
+                    "value": msg.payload["value"],
+                    "symbol": msg.payload.get("symbol", "TICK-NYSE"),
+                }
+            except KeyError:
+                _LOG.error("paper-trader breadth: skipping malformed payload=%r", msg.payload)
+                continue
+            strategy.on_breadth_tick(tick, feed_label=feed_label)
 
 
 # ----------------------------------------------------------------------
