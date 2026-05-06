@@ -3,10 +3,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pandas as pd
-import pytest
 
 from alpha_assay.exec.trade_log import TradeLog, TradeRecord
 
