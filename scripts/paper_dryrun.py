@@ -50,6 +50,17 @@ Environment
                              SIGINT). Set to a positive int for
                              time-bounded runs (used by the integration
                              test).
+``BUS_REDIS_URL``            Optional. Redis URL for bus-consumer mode
+                             (e.g. ``redis://localhost:6379/0``). When
+                             set, bars + breadth are read from the bus
+                             instead of subscribing directly to IBKR.
+                             Leave unset for direct-IBKR mode
+                             (backward-compatible default).
+``RUNS_DIR``                 Optional. Directory for trade-record
+                             parquet output. Default
+                             ``/app/runs/paper-live``. Set to a temp
+                             path in tests/CI. Empty string disables
+                             trade logging.
 ``ES_EXPIRY``                Front-month contract code, ``YYYYMMDD``.
                              Hardcoded fallback ``20260618`` (ESM6,
                              E-mini S&P June 2026; verified via
@@ -73,18 +84,27 @@ import signal
 import sys
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from types import FrameType
 from typing import Any
 
+import pandas as pd
 from prometheus_client import start_http_server
 
+from alpha_assay.bus.consumer import Consumer
+from alpha_assay.bus.streams import stream_name_for_bars, stream_name_for_ticks
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.exec.ibkr import ExecMode, IBKRExecAdapter
+from alpha_assay.exec.trade_log import TradeLog, TradeRecord
 from alpha_assay.observability import metrics as M
 
 HEARTBEAT_INTERVAL_SECONDS = 30
 DRAIN_TIMEOUT_SECONDS = 20
 DEFAULT_ES_EXPIRY = "20260618"  # ESM6 (June 2026 E-mini S&P); documented staleness risk on roll.
+
+# Default runs directory inside the container. Override via RUNS_DIR env var.
+# Outside container (local dev / CI) set RUNS_DIR to a temp path.
+DEFAULT_RUNS_DIR = "/app/runs/paper-live"
 
 _LOG = logging.getLogger("alpha_assay.paper_dryrun")
 
@@ -104,6 +124,13 @@ class DryrunConfig:
     metrics_port: int
     es_expiry: str
     duration_seconds: int
+    # Bus-consumer mode: if set, reads bars/ticks from the Redis bus
+    # instead of subscribing directly to IBKR. Format: redis://host:port/db
+    # or redis://user:password@host:port/db. Leave empty for direct-IBKR mode.
+    bus_redis_url: str = ""
+    # Root directory for trade-record output. Set to a temp path in tests.
+    # Empty string disables trade logging (no parquet written).
+    runs_dir: str = DEFAULT_RUNS_DIR
 
 
 def load_config_from_env() -> DryrunConfig:
@@ -119,6 +146,8 @@ def load_config_from_env() -> DryrunConfig:
         metrics_port=int(os.environ.get("METRICS_PORT", "8000")),
         es_expiry=os.environ.get("ES_EXPIRY", DEFAULT_ES_EXPIRY),
         duration_seconds=int(os.environ.get("DRYRUN_DURATION_SECONDS", "0")),
+        bus_redis_url=os.environ.get("BUS_REDIS_URL", ""),
+        runs_dir=os.environ.get("RUNS_DIR", DEFAULT_RUNS_DIR),
     )
 
 
@@ -151,33 +180,88 @@ class AlwaysFlatStrategy:
     is the Prometheus label value (NOT the raw IBKR feed name): we use
     short, stable labels (``"es"``, ``"tick_nyse"``) so dashboards and
     alerts can target a known set without depending on contract roll.
+
+    The optional ``trade_log`` argument wires in per-trade parquet
+    emission. When ``decide`` returns a non-zero signal (which this
+    class never does, but subclasses may), ``_maybe_emit_trade`` writes
+    a :class:`~alpha_assay.exec.trade_log.TradeRecord` to the log.
     """
 
-    def __init__(self, *, exec_adapter: IBKRExecAdapter | object) -> None:
+    def __init__(
+        self,
+        *,
+        exec_adapter: IBKRExecAdapter | object,
+        trade_log: TradeLog | None = None,
+    ) -> None:
         self._exec_adapter = exec_adapter
+        self._trade_log = trade_log
         self.bars_seen = 0
         self.ticks_seen = 0
         self.disconnect_count = 0
+        # Running mock account balance for P&L tracking.
+        self._account_balance = 100_000.0
 
     def decide(self, _bar: dict[str, Any]) -> int:
         """Return 0 unconditionally. The always-flat invariant."""
         return 0
+
+    def _maybe_emit_trade(self, bar: dict[str, Any], signal: int) -> None:
+        """Emit a TradeRecord if a trade_log is configured and signal != 0.
+
+        Called from ``on_bar`` after ``decide``. This path is never
+        exercised by ``AlwaysFlatStrategy`` itself (``decide`` always
+        returns 0), but is available for subclasses that override
+        ``decide`` with real signal logic.
+        """
+        if self._trade_log is None or signal == 0:
+            return
+        close = float(bar.get("close", 0.0))
+        # Mock fill: assume market-on-open, fill at close + 0.25 tick slippage.
+        tick_slip = 0.25
+        fill = close + tick_slip if signal > 0 else close - tick_slip
+        # Mock ATR-based stop/target (placeholder - 2-point hard stop, 4-point target).
+        atr_stop = 2.0
+        atr_target = 4.0
+        stop = fill - atr_stop if signal > 0 else fill + atr_stop
+        target = fill + atr_target if signal > 0 else fill - atr_target
+        # P&L is zero at entry; will be updated on exit (future extension).
+        record = TradeRecord(
+            timestamp=pd.Timestamp(bar.get("timestamp", "")).tz_convert("UTC")
+            if isinstance(bar.get("timestamp"), (pd.Timestamp,))
+            else pd.Timestamp(str(bar.get("timestamp", "")), tz="UTC"),
+            signal_type="long_entry" if signal > 0 else "short_entry",
+            entry_price=close,
+            stop=stop,
+            target=target,
+            mock_fill_price=fill,
+            mock_pnl_dollars=0.0,
+            account_balance_after=self._account_balance,
+        )
+        self._trade_log.write(record)
+        _LOG.info(
+            "trade emitted: signal=%d fill=%.2f stop=%.2f target=%.2f",
+            signal,
+            fill,
+            stop,
+            target,
+        )
 
     def on_bar(self, bar: dict[str, Any], *, feed_label: str) -> None:
         """Handle one ES bar event.
 
         Increments the per-feed bar counter and consults ``decide``
         only as a sanity check that the always-flat invariant holds.
+        For subclasses that override ``decide``, signals are passed
+        through to ``_maybe_emit_trade``.
         """
         self.bars_seen += 1
         M.bars_processed_total.labels(feed=feed_label).inc()
-        # Pure paranoia: assert the always-flat invariant inline. If
-        # someone subclasses AlwaysFlatStrategy and breaks decide(),
-        # this will surface in the heartbeat logs without ever
-        # reaching place_bracket_order.
         sig = self.decide(bar)
         if sig != 0:
+            # In this class, this branch is a paranoia guard (always-flat invariant).
+            # Subclasses that override decide() with real signal logic will reach here.
             _LOG.error("always-flat invariant violation: decide returned %s; refusing to act", sig)
+        self._maybe_emit_trade(bar, sig)
 
     def on_breadth_tick(self, _tick: dict[str, Any], *, feed_label: str) -> None:
         """Handle one breadth tick. Increments the per-feed counter."""
@@ -215,6 +299,86 @@ def build_adapters(cfg: DryrunConfig) -> tuple[IBKRAdapter, IBKRExecAdapter]:
         dry_run=True,
     )
     return adapter, exec_adapter
+
+
+# ----------------------------------------------------------------------
+# Bus-consumer helpers
+# ----------------------------------------------------------------------
+
+
+def _build_bus_consumers(
+    cfg: DryrunConfig,
+    redis_client: Any,
+) -> tuple[Consumer, Consumer]:
+    """Build bar + breadth bus consumers for the given config.
+
+    Returns ``(bars_consumer, breadth_consumer)``. Both use
+    ``start_id="$"`` so they consume only new messages (latest-only
+    mode for the paper-trader - we don't replay historical bars).
+    """
+    spec = es_contract_spec(cfg)
+    bars_stream = stream_name_for_bars(spec)
+    breadth_stream = stream_name_for_ticks("TICK-NYSE")
+    bars_consumer = Consumer(
+        redis_client=redis_client,
+        stream=bars_stream,
+        consumer_id="paper-trader-bars",
+        start_id="$",
+    )
+    breadth_consumer = Consumer(
+        redis_client=redis_client,
+        stream=breadth_stream,
+        consumer_id="paper-trader-breadth",
+        start_id="$",
+    )
+    return bars_consumer, breadth_consumer
+
+
+def _consume_bars_from_bus_sync(
+    consumer: Consumer,
+    strategy: AlwaysFlatStrategy,
+    stop_event: threading.Event,
+) -> None:
+    """Synchronous bus-consumer loop for ES bars.
+
+    Runs in an executor thread (same pattern as ESBarsRecorder). Yields
+    to the executor every bar so the stop-event poll is responsive.
+    """
+    feed_label = "es"
+    for msg in consumer.iter_messages(block_ms=1000):
+        if stop_event.is_set():
+            return
+        bar = {
+            "timestamp": pd.Timestamp(msg.payload["ts_minute_utc"], unit="s", tz="UTC"),
+            "open": msg.payload["open"],
+            "high": msg.payload["high"],
+            "low": msg.payload["low"],
+            "close": msg.payload["close"],
+            "volume": msg.payload["volume"],
+        }
+        strategy.on_bar(bar, feed_label=feed_label)
+        if stop_event.is_set():
+            return
+
+
+def _consume_breadth_from_bus_sync(
+    consumer: Consumer,
+    strategy: AlwaysFlatStrategy,
+    stop_event: threading.Event,
+) -> None:
+    """Synchronous bus-consumer loop for TICK-NYSE breadth."""
+    feed_label = "tick_nyse"
+    for msg in consumer.iter_messages(block_ms=1000):
+        if stop_event.is_set():
+            return
+        tick = {
+            "timestamp": pd.Timestamp(msg.payload.get("ts_utc", 0), unit="s", tz="UTC"),
+            "value": msg.payload.get("value", 0.0),
+            "symbol": "TICK-NYSE",
+        }
+        strategy.on_breadth_tick(tick, feed_label=feed_label)
+        if stop_event.is_set():
+            return
 
 
 # ----------------------------------------------------------------------
@@ -275,17 +439,22 @@ async def _consume_breadth(
 
 async def _heartbeat_loop(
     strategy: AlwaysFlatStrategy,
-    adapter: IBKRAdapter,
+    adapter: IBKRAdapter | None,
     stop_event: asyncio.Event,
 ) -> None:
-    """One-line stdout heartbeat every HEARTBEAT_INTERVAL_SECONDS."""
+    """One-line stdout heartbeat every HEARTBEAT_INTERVAL_SECONDS.
+
+    ``adapter`` may be None in bus-consumer mode; IBKR connectivity is
+    reported as ``n/a`` in that case since the paper-trader is no longer
+    a direct IBKR subscriber.
+    """
     while not stop_event.is_set():
         # Sleep in 1s slices so SIGTERM is responsive.
         for _ in range(HEARTBEAT_INTERVAL_SECONDS):
             if stop_event.is_set():
                 return
             await asyncio.sleep(1)
-        connected = "yes" if adapter.is_connected else "no"
+        connected = "n/a(bus)" if adapter is None else ("yes" if adapter.is_connected else "no")
         print(
             "paper-dryrun heartbeat: "
             f"bars={strategy.bars_seen} ticks={strategy.ticks_seen} "
@@ -296,11 +465,17 @@ async def _heartbeat_loop(
 
 async def _async_main(
     cfg: DryrunConfig,
-    adapter: IBKRAdapter,
+    adapter: IBKRAdapter | None,
     strategy: AlwaysFlatStrategy,
     stop_event_thread: threading.Event,
+    bus_consumers: tuple[Consumer, Consumer] | None = None,
 ) -> int:
-    """Async portion of the dry-run loop."""
+    """Async portion of the dry-run loop.
+
+    If ``bus_consumers`` is provided the bar + breadth streams are read
+    from the bus (executor threads). Otherwise the direct-IBKR path is
+    used (``adapter`` must not be None in that case).
+    """
     spec = es_contract_spec(cfg)
     stop_event = asyncio.Event()
 
@@ -313,9 +488,38 @@ async def _async_main(
             await asyncio.sleep(0.2)
         stop_event.set()
 
-    bars_task = asyncio.create_task(_consume_bars(adapter, spec, strategy, stop_event))
-    breadth_task = asyncio.create_task(_consume_breadth(adapter, "TICK-NYSE", strategy, stop_event))
-    heartbeat_task = asyncio.create_task(_heartbeat_loop(strategy, adapter, stop_event))
+    if bus_consumers is not None:
+        # Bus-consumer mode: run sync loops in executor threads.
+        bars_consumer, breadth_consumer = bus_consumers
+        loop = asyncio.get_running_loop()
+
+        bars_task = asyncio.create_task(
+            loop.run_in_executor(
+                None,
+                _consume_bars_from_bus_sync,
+                bars_consumer,
+                strategy,
+                stop_event_thread,
+            )
+        )
+        breadth_task = asyncio.create_task(
+            loop.run_in_executor(
+                None,
+                _consume_breadth_from_bus_sync,
+                breadth_consumer,
+                strategy,
+                stop_event_thread,
+            )
+        )
+        # Heartbeat loop needs a mock adapter-like object for connectivity reporting.
+        # In bus mode, IBKR connectivity is not directly observable - use None sentinel.
+        heartbeat_task = asyncio.create_task(_heartbeat_loop(strategy, None, stop_event))
+    else:
+        assert adapter is not None, "adapter required for direct-IBKR mode"
+        bars_task = asyncio.create_task(_consume_bars(adapter, spec, strategy, stop_event))
+        breadth_task = asyncio.create_task(_consume_breadth(adapter, "TICK-NYSE", strategy, stop_event))
+        heartbeat_task = asyncio.create_task(_heartbeat_loop(strategy, adapter, stop_event))
+
     bridge_task = asyncio.create_task(_bridge_stop())
 
     deadline_task: asyncio.Task[None] | None = None
@@ -347,6 +551,14 @@ async def _async_main(
         except TimeoutError:
             _LOG.warning("drain timeout exceeded; some tasks may have leaked")
 
+        # Flush trade log on shutdown so in-memory records are persisted.
+        if strategy._trade_log is not None:
+            try:
+                strategy._trade_log.flush()
+                _LOG.info("trade log flushed on shutdown")
+            except Exception:
+                _LOG.exception("trade log flush failed on shutdown; records may be lost")
+
     return 0
 
 
@@ -355,19 +567,24 @@ def run(cfg: DryrunConfig) -> int:
     constructs adapters, and runs the async loop.
 
     Returns the process exit code (always 0 on clean drain).
+
+    Bus-consumer mode is active when ``cfg.bus_redis_url`` is set.
+    Direct-IBKR mode is used otherwise (backward-compatible default).
     """
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     _LOG.info(
-        "paper-dryrun starting: ibkr=%s:%d client_id=%d metrics_port=%d es_expiry=%s " "duration_seconds=%d",
+        "paper-dryrun starting: ibkr=%s:%d client_id=%d metrics_port=%d es_expiry=%s "
+        "duration_seconds=%d bus_mode=%s",
         cfg.ibkr_host,
         cfg.ibkr_port,
         cfg.ibkr_client_id,
         cfg.metrics_port,
         cfg.es_expiry,
         cfg.duration_seconds,
+        "yes" if cfg.bus_redis_url else "no",
     )
     if cfg.es_expiry == DEFAULT_ES_EXPIRY:
         _LOG.warning(
@@ -382,8 +599,34 @@ def run(cfg: DryrunConfig) -> int:
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)
 
+    # Construct TradeLog if RUNS_DIR is configured.
+    trade_log: TradeLog | None = None
+    if cfg.runs_dir:
+        trade_log = TradeLog(out_dir=Path(cfg.runs_dir))
+        _LOG.info("trade log enabled at %s/trades.parquet", cfg.runs_dir)
+
+    if cfg.bus_redis_url:
+        # Bus-consumer mode: no IBKR connection needed.
+        import redis as redis_pkg
+
+        redis_client = redis_pkg.from_url(cfg.bus_redis_url)
+        # Build a stub exec adapter (never used in always-flat, but satisfies the
+        # constructor contract so the compose stack remains uniform).
+        exec_adapter_stub = object()
+        strategy = AlwaysFlatStrategy(exec_adapter=exec_adapter_stub, trade_log=trade_log)
+        bus_consumers = _build_bus_consumers(cfg, redis_client)
+        _LOG.info(
+            "bus-consumer mode active; bars stream=%s breadth stream=%s",
+            bus_consumers[0]._stream,
+            bus_consumers[1]._stream,
+        )
+        return asyncio.run(
+            _async_main(cfg, None, strategy, stop_event, bus_consumers=bus_consumers)
+        )
+
+    # Direct-IBKR mode (backward-compatible default).
     adapter, exec_adapter = build_adapters(cfg)
-    strategy = AlwaysFlatStrategy(exec_adapter=exec_adapter)
+    strategy = AlwaysFlatStrategy(exec_adapter=exec_adapter, trade_log=trade_log)
 
     # Best-effort connect. If the connection fails (no Gateway up) we
     # still serve /metrics so health probes can detect the issue and
