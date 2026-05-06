@@ -52,6 +52,13 @@ async def _main() -> int:
     start_http_server(metrics_port)
     LOG.info("metrics listening on :%d", metrics_port)
 
+    # Connect ONCE before launching subscription tasks. Each subscription
+    # task otherwise races to call connectAsync simultaneously, and IBKR
+    # rejects all but one of the duplicate connection attempts.
+    LOG.info("connecting to IBKR at %s:%d clientId=%d", ibkr_host, ibkr_port, client_id)
+    await adapter.connect_async()
+    LOG.info("IBKR connected")
+
     daemon = IBKRFeedDaemon(adapter=adapter, redis_client=redis_client, wal_dir=wal_dir)
 
     stop = asyncio.Event()
