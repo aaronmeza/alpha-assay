@@ -243,6 +243,32 @@ services:
       retries: 3
       start_period: 30s
 
+  bot:
+    profiles:
+      - bot
+    build:
+      context: .
+      dockerfile: infra/bot/Dockerfile
+    image: alphaassay/bot:0.1.0
+    container_name: alphaassay-bot
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PROM_URL: http://prometheus:9090
+      OFFSET_PATH: /var/lib/alphaassay/bot/offset
+      TZ: America/Chicago
+    env_file:
+      - path: .env.bot
+        required: false
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - alphaassay_observability
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - bot_state:/var/lib/alphaassay/bot
+
   prometheus:
     image: prom/prometheus:v2.55.0
     container_name: alphaassay-prometheus
@@ -376,3 +402,5 @@ volumes:
     name: alphaassay_redis_data
   feed_wal:
     name: alphaassay_feed_wal
+  bot_state:
+    name: alphaassay_bot_state
