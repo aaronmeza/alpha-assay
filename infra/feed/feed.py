@@ -119,9 +119,14 @@ class IBKRFeedDaemon:
             raise
         BM.feed_lock_state.labels(contract=stream).set(1)
 
-        # Drain any uncommitted WAL records first.
+        # Drain any uncommitted WAL records first. Per-stream WAL subdirs
+        # so concurrent subscriptions don't share state (otherwise each
+        # task's drain would republish messages from other subscriptions
+        # to its own Redis stream - the cause of the cross-stream contam
+        # bug observed during the first SER9 deploy).
+        wal_subdir = self._wal_dir / stream
         day = datetime.now(UTC).strftime("%Y-%m-%d")
-        wal = WALAppender(directory=self._wal_dir, day=day)
+        wal = WALAppender(directory=wal_subdir, day=day)
         for record in wal.read_uncommitted():
             self._redis.xadd(stream, {"data": record.msg_bytes}, maxlen=3600, approximate=True)
             wal.advance_committed(record.seq)
