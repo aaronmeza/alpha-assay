@@ -16,7 +16,7 @@ RUN apt-get update \
 
 # Install docker CLI (static binary). The bot's /health command shells
 # out to `docker inspect/exec/logs` against the host's docker socket.
-RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-26.1.5.tgz \
+RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-29.4.3.tgz \
     | tar xz -C /tmp \
     && mv /tmp/docker/docker /usr/local/bin/docker \
     && rm -rf /tmp/docker
