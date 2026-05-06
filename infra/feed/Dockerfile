@@ -19,7 +19,7 @@ COPY src ./src
 COPY infra/feed ./infra/feed
 COPY configs ./configs
 
-RUN pip install --upgrade pip && pip install -e .
+RUN pip install --upgrade pip && pip install -e . && pip install tzdata
 
 # Run as root inside container to match the recorder/dashboard pattern;
 # bind-mounts from the host are owned by the host user (ameza) and the
