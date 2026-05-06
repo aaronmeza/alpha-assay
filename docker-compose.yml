@@ -268,6 +268,14 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - bot_state:/var/lib/alphaassay/bot
+    healthcheck:
+      # PID 1 is python running infra.bot.main; if the loop crashes we
+      # want the container to exit, not stay healthy with a dead poller.
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0 if 'main' in open('/proc/1/cmdline').read() else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   prometheus:
     image: prom/prometheus:v2.55.0
