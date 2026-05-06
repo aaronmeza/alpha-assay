@@ -184,6 +184,65 @@ services:
       retries: 5
       start_period: 15s
 
+  redis:
+    # Single-host bus for the alpha-assay market-data pipeline.
+    # AOF appendfsync always: zero-loss on host crash; ~0.5ms publish-side
+    # latency cost which is invisible relative to IBKR order RTT.
+    image: redis:7-alpine
+    container_name: alphaassay-redis
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync always
+      --auto-aof-rewrite-percentage 100
+      --auto-aof-rewrite-min-size 64mb
+      --maxmemory-policy noeviction
+    restart: unless-stopped
+    networks:
+      - alphaassay_observability
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  ibkr-feed:
+    # Single producer holding the IBKR subscription per contract.
+    # Publishes to Redis Streams via alpha_assay.bus.Producer with WAL.
+    profiles:
+      - feed
+    build:
+      context: .
+      dockerfile: infra/feed/Dockerfile
+    image: alphaassay/ibkr-feed:0.1.0
+    container_name: alphaassay-ibkr-feed
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MANIFEST_PATH: /app/configs/feed-manifest.yaml
+      METRICS_PORT: "8003"
+      IBKR_HOST: 127.0.0.1
+      IBKR_PORT: "4002"
+      IBKR_CLIENT_ID: "30"
+      WAL_DIR: /var/lib/alphaassay/wal
+      TZ: America/Chicago
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - alphaassay_observability
+    volumes:
+      - feed_wal:/var/lib/alphaassay/wal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8003/metrics', timeout=2).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
   prometheus:
     image: prom/prometheus:v2.55.0
     container_name: alphaassay-prometheus
@@ -313,3 +372,7 @@ volumes:
     name: alphaassay_breadth_parquet
   es_bars_parquet:
     name: alphaassay_es_bars_parquet
+  redis_data:
+    name: alphaassay_redis_data
+  feed_wal:
+    name: alphaassay_feed_wal
