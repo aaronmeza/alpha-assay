@@ -2,6 +2,7 @@
 """Single-producer / many-consumer market-data bus over Redis Streams."""
 
 from alpha_assay.bus.streams import (
+    MalformedMessageError,
     Message,
     SchemaVersionError,
     pack,
@@ -11,6 +12,7 @@ from alpha_assay.bus.streams import (
 )
 
 __all__ = [
+    "MalformedMessageError",
     "Message",
     "SchemaVersionError",
     "pack",

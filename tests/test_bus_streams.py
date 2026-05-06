@@ -5,6 +5,7 @@ import time
 import pytest
 
 from alpha_assay.bus.streams import (
+    MalformedMessageError,
     Message,
     SchemaVersionError,
     pack,
@@ -88,3 +89,32 @@ def test_unpack_tolerates_unknown_minor_field():
     )
     msg = unpack(raw)
     assert msg.v == 1
+
+
+def test_stream_name_for_bars_raises_on_missing_symbol():
+    with pytest.raises(ValueError, match="symbol"):
+        stream_name_for_bars({"sec_type": "FUT", "exchange": "CME"})
+
+
+def test_stream_name_for_bars_raises_on_missing_exchange():
+    with pytest.raises(ValueError, match="exchange"):
+        stream_name_for_bars({"symbol": "ES", "sec_type": "FUT"})
+
+
+def test_stream_name_for_bars_raises_on_empty_dict():
+    with pytest.raises(ValueError):
+        stream_name_for_bars({})
+
+
+def test_stream_name_for_ticks_raises_on_empty_string():
+    with pytest.raises(ValueError):
+        stream_name_for_ticks("")
+
+
+def test_unpack_raises_on_missing_required_field():
+    import msgpack
+
+    # Missing 'seq'.
+    raw = msgpack.packb({"v": 1, "ts_recv_ns": 0, "ts_event_ns": 0, "stream": "x", "payload": {}})
+    with pytest.raises(MalformedMessageError, match="seq"):
+        unpack(raw)

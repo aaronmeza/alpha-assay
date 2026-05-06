@@ -22,6 +22,10 @@ class SchemaVersionError(RuntimeError):
     """Raised when a consumer reads a message with an incompatible major version."""
 
 
+class MalformedMessageError(RuntimeError):
+    """Raised when a required wire field is missing from a message."""
+
+
 @dataclass(frozen=True)
 class Message:
     """Wire-format message on the bus.
@@ -42,10 +46,20 @@ def stream_name_for_bars(contract_spec: dict[str, Any]) -> str:
 
     Format: ``bars.{symbol}.{venue}.{expiry}`` -- symbol/venue lowercased;
     expiry omitted for non-futures.
+
+    Raises ValueError if 'symbol' or 'exchange' is missing or empty.
     """
-    symbol = str(contract_spec.get("symbol", "")).lower()
-    venue = str(contract_spec.get("exchange", "")).lower()
-    parts = ["bars", symbol, venue]
+    symbol = contract_spec.get("symbol")
+    exchange = contract_spec.get("exchange")
+
+    if not symbol or not exchange:
+        raise ValueError(
+            f"contract_spec missing required fields: needs 'symbol' and 'exchange'; got {contract_spec!r}"
+        )
+
+    symbol_lower = str(symbol).lower()
+    venue_lower = str(exchange).lower()
+    parts = ["bars", symbol_lower, venue_lower]
     expiry = contract_spec.get("expiry")
     if expiry:
         parts.append(str(expiry))
@@ -56,7 +70,11 @@ def stream_name_for_ticks(symbol: str) -> str:
     """Build a deterministic stream name for a tick feed.
 
     Format: ``ticks.{symbol-lowered}``.
+
+    Raises ValueError if symbol is None or empty.
     """
+    if not symbol:
+        raise ValueError("symbol must be non-empty string")
     return f"ticks.{symbol.lower()}"
 
 
@@ -79,6 +97,7 @@ def unpack(raw: bytes) -> Message:
     """Deserialize msgpack bytes back to a Message.
 
     Hard-fail on major version mismatch. Tolerate unknown additive fields.
+    Raises MalformedMessageError if any required field is missing.
     """
     decoded = msgpack.unpackb(raw, raw=False)
     v = int(decoded.get("v", 0))
@@ -87,6 +106,13 @@ def unpack(raw: bytes) -> Message:
             f"bus message major version {v} != supported {CURRENT_VERSION}; "
             f"coordinated upgrade required"
         )
+
+    # Validate required fields.
+    required_fields = ["seq", "ts_recv_ns", "ts_event_ns", "stream", "payload"]
+    for field in required_fields:
+        if field not in decoded:
+            raise MalformedMessageError(f"required field missing: {field}")
+
     return Message(
         v=v,
         seq=int(decoded["seq"]),
