@@ -41,9 +41,7 @@ def test_paper_dryrun_consumer_construction_works(tmp_path: Path):
         "low": 7246.5,
         "close": 7247.25,
         "volume": 14338,
-        "ts_minute_utc": int(
-            pd.Timestamp("2026-05-06T13:30:00+00:00").value // 10**9
-        ),
+        "ts_minute_utc": int(pd.Timestamp("2026-05-06T13:30:00+00:00").value // 10**9),
     }
     # Publish BEFORE constructing consumer (consumer uses start_id="0" for test ergonomics
     # since fakeredis blocking semantics are tricky).

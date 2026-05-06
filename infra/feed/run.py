@@ -72,9 +72,7 @@ async def _main() -> int:
     ]
     stop_task = asyncio.create_task(stop.wait(), name="stop")
 
-    done, pending = await asyncio.wait(
-        [*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED
-    )
+    done, pending = await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
     for t in pending:
         t.cancel()
     await asyncio.gather(*pending, return_exceptions=True)

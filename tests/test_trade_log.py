@@ -55,20 +55,34 @@ def test_trade_log_multiple_appends_in_one_session(tmp_path):
 def test_trade_log_preserves_history_across_sessions(tmp_path):
     """Re-opening the log appends to existing rows, doesn't overwrite."""
     log1 = TradeLog(out_dir=tmp_path / "paper-live")
-    log1.write(TradeRecord(
-        timestamp=pd.Timestamp("2026-05-06T13:30:00", tz="UTC"),
-        signal_type="long_entry", entry_price=100.0, stop=99.0, target=101.0,
-        mock_fill_price=100.0, mock_pnl_dollars=0.0, account_balance_after=100_000.0,
-    ))
+    log1.write(
+        TradeRecord(
+            timestamp=pd.Timestamp("2026-05-06T13:30:00", tz="UTC"),
+            signal_type="long_entry",
+            entry_price=100.0,
+            stop=99.0,
+            target=101.0,
+            mock_fill_price=100.0,
+            mock_pnl_dollars=0.0,
+            account_balance_after=100_000.0,
+        )
+    )
     log1.flush()
 
     # New session, same path.
     log2 = TradeLog(out_dir=tmp_path / "paper-live")
-    log2.write(TradeRecord(
-        timestamp=pd.Timestamp("2026-05-07T13:30:00", tz="UTC"),
-        signal_type="short_entry", entry_price=200.0, stop=201.0, target=199.0,
-        mock_fill_price=200.0, mock_pnl_dollars=5.0, account_balance_after=100_005.0,
-    ))
+    log2.write(
+        TradeRecord(
+            timestamp=pd.Timestamp("2026-05-07T13:30:00", tz="UTC"),
+            signal_type="short_entry",
+            entry_price=200.0,
+            stop=201.0,
+            target=199.0,
+            mock_fill_price=200.0,
+            mock_pnl_dollars=5.0,
+            account_balance_after=100_005.0,
+        )
+    )
     log2.flush()
 
     df = pd.read_parquet(tmp_path / "paper-live" / "trades.parquet")

@@ -1,157 +1,136 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Aaron Meza
-"""Data loading helpers for the backtest results dashboard.
+"""Load paper-trial trade records for the dashboard.
 
-Reads parquet, CSV, and JSON run artifacts from a directory layout::
+The paper-trader writes ``trades.parquet`` to ``RUNS_DIR`` via
+``alpha_assay.exec.trade_log.TradeLog``. The schema is the
+``TradeRecord`` dataclass:
 
-    <runs_dir>/
-        <run-name>/
-            report/
-                per_trade_metrics.csv
-                session_metrics.json
-            backtest/
-                trades.csv
+    timestamp, signal_type, entry_price, stop, target,
+    mock_fill_price, mock_pnl_dollars, account_balance_after
+
+All loader functions tolerate a missing or empty parquet file by
+returning an empty DataFrame so the UI can render an empty-state
+banner without crashing.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pandas as pd
 
+TRADES_FILENAME = "trades.parquet"
 
-def discover_runs(runs_dir: str | Path) -> list[str]:
-    """Return run names (directory basenames) sorted newest-first.
+_REQUIRED_COLUMNS = (
+    "timestamp",
+    "signal_type",
+    "entry_price",
+    "stop",
+    "target",
+    "mock_fill_price",
+    "mock_pnl_dollars",
+    "account_balance_after",
+)
 
-    A directory qualifies as a run if it contains at least one of the
-    standard report files.  Directories that match none of the expected
-    paths are silently skipped.
+_NUMERIC_COLUMNS = (
+    "entry_price",
+    "stop",
+    "target",
+    "mock_fill_price",
+    "mock_pnl_dollars",
+    "account_balance_after",
+)
+
+
+def empty_trades_df() -> pd.DataFrame:
+    """Return a typed empty DataFrame with the trade-log schema."""
+    df = pd.DataFrame({col: pd.Series(dtype="float64") for col in _NUMERIC_COLUMNS})
+    df.insert(0, "signal_type", pd.Series(dtype="object"))
+    df.insert(0, "timestamp", pd.Series(dtype="datetime64[ns, UTC]"))
+    return df
+
+
+def load_trades(runs_dir: str | Path) -> pd.DataFrame:
+    """Load ``trades.parquet`` from *runs_dir*.
+
+    Returns an empty (but typed) DataFrame when the file is absent or
+    empty. Timestamps are normalised to UTC; numeric columns are coerced
+    to float64. Rows are sorted by timestamp ascending.
     """
-    root = Path(runs_dir)
-    if not root.is_dir():
-        return []
-
-    runs: list[tuple[float, str]] = []
-    for entry in root.iterdir():
-        if not entry.is_dir():
-            continue
-        has_report = (
-            (entry / "report" / "per_trade_metrics.csv").exists()
-            or (entry / "report" / "session_metrics.json").exists()
-            or (entry / "backtest" / "trades.csv").exists()
-        )
-        if has_report:
-            mtime = entry.stat().st_mtime
-            runs.append((mtime, entry.name))
-
-    runs.sort(reverse=True)
-    return [name for _, name in runs]
-
-
-def describe_run(run_dir: Path) -> str:
-    """Return a human-readable label for a run directory.
-
-    Format: ``<name> (<n> trades, <start> -> <end>)`` when trade data is
-    available, otherwise just the directory name.
-    """
-    name = run_dir.name
-    df = load_per_trade_metrics(run_dir)
-    if df is None or df.empty or "entry_ts" not in df.columns:
-        return name
-
-    n = len(df)
-    try:
-        start = df["entry_ts"].min().tz_convert("UTC").strftime("%Y-%m-%d")
-        end = df["entry_ts"].max().tz_convert("UTC").strftime("%Y-%m-%d")
-        return f"{name} ({n} trades, {start} -> {end})"
-    except Exception:
-        return f"{name} ({n} trades)"
-
-
-def load_all_runs(runs_dir: str | Path) -> pd.DataFrame | None:
-    """Load and concatenate per-trade rows across all runs under *runs_dir*.
-
-    Returns a combined DataFrame with an added ``run_name`` column so
-    individual sessions can still be identified.  Returns None when no
-    run directories with trade data are found.
-    """
-    root = Path(runs_dir)
-    run_names = discover_runs(root)
-    frames: list[pd.DataFrame] = []
-    for name in run_names:
-        df = load_per_trade_metrics(root / name)
-        if df is not None and not df.empty:
-            df = df.copy()
-            df["run_name"] = name
-            frames.append(df)
-
-    if not frames:
-        return None
-
-    combined = pd.concat(frames, ignore_index=True)
-    if "entry_ts" in combined.columns:
-        combined = combined.sort_values("entry_ts").reset_index(drop=True)
-    return combined
-
-
-def load_per_trade_metrics(run_dir: Path) -> pd.DataFrame | None:
-    """Load per-trade metrics CSV.  Returns None if the file is absent."""
-    path = run_dir / "report" / "per_trade_metrics.csv"
+    path = Path(runs_dir) / TRADES_FILENAME
     if not path.exists():
-        return None
+        return empty_trades_df()
 
-    df = pd.read_csv(path)
+    df = pd.read_parquet(path)
+    if df.empty:
+        return empty_trades_df()
 
-    # Parse timestamp columns as UTC-aware datetimes.
-    for col in ("entry_ts", "exit_ts", "entry_signal_ts"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
 
-    # Ensure numeric columns are the right dtype.
-    numeric_cols = [
-        "pnl_points",
-        "pnl_usd",
-        "hold_seconds",
-        "entry_price",
-        "exit_price",
-        "quantity",
-        "mae_points",
-        "mfe_points",
-        "fill_latency_seconds",
-    ]
-    for col in numeric_cols:
+    for col in _NUMERIC_COLUMNS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "timestamp" in df.columns:
+        df = df.sort_values("timestamp").reset_index(drop=True)
 
     return df
 
 
-def load_session_metrics(run_dir: Path) -> dict:
-    """Load session-level metrics JSON.  Returns empty dict if absent."""
-    path = run_dir / "report" / "session_metrics.json"
-    if not path.exists():
-        return {}
-    with path.open() as fh:
-        return json.load(fh)
-
-
-def filter_by_time_range(
+def filter_by_date_range(
     df: pd.DataFrame,
     start: pd.Timestamp | None,
     end: pd.Timestamp | None,
-    ts_col: str = "entry_ts",
+    ts_col: str = "timestamp",
 ) -> pd.DataFrame:
     """Return rows where *ts_col* falls within [start, end] (inclusive).
 
-    Either bound may be None (meaning no bound on that side).
+    Either bound may be None. Naive bounds are interpreted as UTC.
     """
-    if df is None or df.empty:
-        return df
+    if df is None or df.empty or ts_col not in df.columns:
+        return df if df is not None else empty_trades_df()
 
     mask = pd.Series(True, index=df.index)
     if start is not None:
+        if start.tzinfo is None:
+            start = start.tz_localize("UTC")
         mask &= df[ts_col] >= start
     if end is not None:
+        if end.tzinfo is None:
+            end = end.tz_localize("UTC")
         mask &= df[ts_col] <= end
     return df[mask].copy()
+
+
+def trade_log_summary(runs_dir: str | Path) -> dict:
+    """Lightweight metadata about the trade log file (for status display).
+
+    Returns ``{"path": ..., "exists": bool, "size_bytes": int,
+    "modified_at": pd.Timestamp | None, "n_rows": int}``.
+    """
+    path = Path(runs_dir) / TRADES_FILENAME
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+            "size_bytes": 0,
+            "modified_at": None,
+            "n_rows": 0,
+        }
+
+    stat = path.stat()
+    df = load_trades(runs_dir)
+    return {
+        "path": str(path),
+        "exists": True,
+        "size_bytes": stat.st_size,
+        "modified_at": pd.Timestamp(stat.st_mtime, unit="s", tz="UTC"),
+        "n_rows": len(df),
+    }
+
+
+def required_columns() -> tuple[str, ...]:
+    """Return the canonical column ordering for a trade record."""
+    return _REQUIRED_COLUMNS

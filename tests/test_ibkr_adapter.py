@@ -278,9 +278,7 @@ def test_refresh_freshness_gauge_climbs_while_idle():
 
     async def run() -> float:
         last = [_time.monotonic()]
-        task = asyncio.create_task(
-            ibkr_adapter._refresh_freshness_gauge(feed, last, interval=0.05)
-        )
+        task = asyncio.create_task(ibkr_adapter._refresh_freshness_gauge(feed, last, interval=0.05))
         await asyncio.sleep(0.25)
         val = M.ibkr_feed_freshness_seconds.labels(feed=feed)._value.get()
         task.cancel()

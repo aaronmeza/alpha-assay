@@ -75,10 +75,7 @@ class WALAppender:
         self._fp.write(line)
         self._unflushed += 1
         BM.bus_wal_pending.inc()
-        if (
-            self._unflushed >= self._fsync_every_n
-            or (self._now_ms() - self._last_flush_ms) >= self._fsync_every_ms
-        ):
+        if self._unflushed >= self._fsync_every_n or (self._now_ms() - self._last_flush_ms) >= self._fsync_every_ms:
             self.flush()
 
     def flush(self) -> None:

@@ -62,8 +62,6 @@ class Producer:
             maxlen=self._maxlen,
             approximate=True,
         )
-        BM.bus_publish_lag_seconds.labels(stream=stream).observe(
-            time.monotonic() - publish_start
-        )
+        BM.bus_publish_lag_seconds.labels(stream=stream).observe(time.monotonic() - publish_start)
         BM.bus_publish_total.labels(stream=stream).inc()
         return seq
