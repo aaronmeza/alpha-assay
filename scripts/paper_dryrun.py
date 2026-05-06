@@ -490,10 +490,12 @@ async def _async_main(
 
     if bus_consumers is not None:
         # Bus-consumer mode: run sync loops in executor threads.
+        # run_in_executor returns a Future (already awaitable); wrap with
+        # ensure_future so it composes with asyncio.wait below.
         bars_consumer, breadth_consumer = bus_consumers
         loop = asyncio.get_running_loop()
 
-        bars_task = asyncio.create_task(
+        bars_task = asyncio.ensure_future(
             loop.run_in_executor(
                 None,
                 _consume_bars_from_bus_sync,
@@ -502,7 +504,7 @@ async def _async_main(
                 stop_event_thread,
             )
         )
-        breadth_task = asyncio.create_task(
+        breadth_task = asyncio.ensure_future(
             loop.run_in_executor(
                 None,
                 _consume_breadth_from_bus_sync,
