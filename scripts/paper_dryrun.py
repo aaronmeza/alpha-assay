@@ -352,18 +352,14 @@ def _consume_bars_from_bus_sync(
         for msg in consumer.iter_messages(block_ms=1000):
             if stop_event.is_set():
                 return
-            try:
-                bar = {
-                    "timestamp": pd.Timestamp(msg.payload["ts_minute_utc"], unit="s", tz="UTC"),
-                    "open": msg.payload["open"],
-                    "high": msg.payload["high"],
-                    "low": msg.payload["low"],
-                    "close": msg.payload["close"],
-                    "volume": msg.payload["volume"],
-                }
-            except KeyError:
-                _LOG.error("paper-trader bars: skipping malformed payload=%r", msg.payload)
-                continue
+            bar = {
+                "timestamp": pd.Timestamp(msg.payload["ts_minute_utc"], unit="s", tz="UTC"),
+                "open": msg.payload["open"],
+                "high": msg.payload["high"],
+                "low": msg.payload["low"],
+                "close": msg.payload["close"],
+                "volume": msg.payload["volume"],
+            }
             strategy.on_bar(bar, feed_label=feed_label)
 
 
@@ -378,15 +374,11 @@ def _consume_breadth_from_bus_sync(
         for msg in consumer.iter_messages(block_ms=1000):
             if stop_event.is_set():
                 return
-            try:
-                tick = {
-                    "timestamp": pd.Timestamp(msg.ts_event_ns, unit="ns", tz="UTC"),
-                    "value": msg.payload["value"],
-                    "symbol": msg.payload.get("symbol", "TICK-NYSE"),
-                }
-            except KeyError:
-                _LOG.error("paper-trader breadth: skipping malformed payload=%r", msg.payload)
-                continue
+            tick = {
+                "timestamp": pd.Timestamp(msg.ts_event_ns, unit="ns", tz="UTC"),
+                "value": msg.payload["value"],
+                "symbol": msg.payload.get("symbol", "TICK-NYSE"),
+            }
             strategy.on_breadth_tick(tick, feed_label=feed_label)
 
 
