@@ -382,20 +382,11 @@ class BreadthRecorder:
             for msg in self._consumer.iter_messages(block_ms=1000):
                 if self._shutdown_event is not None and self._shutdown_event.is_set():
                     return
-                try:
-                    tick = {
-                        "timestamp": pd.Timestamp(msg.ts_event_ns, unit="ns", tz="UTC"),
-                        "value": msg.payload["value"],
-                        "symbol": msg.payload["symbol"],
-                    }
-                except KeyError:
-                    LOG.error(
-                        "breadth recorder: skipping malformed tick msg seq=%s stream=%s payload=%r",
-                        getattr(msg, "seq", "?"),
-                        getattr(msg, "stream", "?"),
-                        msg.payload,
-                    )
-                    continue
+                tick = {
+                    "timestamp": pd.Timestamp(msg.ts_event_ns, unit="ns", tz="UTC"),
+                    "value": msg.payload["value"],
+                    "symbol": msg.payload["symbol"],
+                }
                 self.ingest_tick(tick)
 
     async def _periodic_flush_loop(self) -> None:
