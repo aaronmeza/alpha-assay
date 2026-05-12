@@ -237,11 +237,19 @@ services:
     volumes:
       - feed_wal:/var/lib/alphaassay/wal
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8003/metrics', timeout=2).status == 200 else 1)"]
+      # Healthy only when /metrics reports an active IBKR connection. A
+      # wedged feed (socket dropped, the watchdog about to exit, or the
+      # container mid-restart) serves `alpha_assay_ibkr_connected 0.0` or
+      # nothing at all - the old "HTTP 200 on /metrics" check passed
+      # straight through that. Brief unhealthy windows during the nightly
+      # IBC cycle are expected and self-heal once the feed reconnects;
+      # start_period gives the post-restart connect room before failures
+      # count, and `restart: unless-stopped` is what actually recycles.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; m=urllib.request.urlopen('http://localhost:8003/metrics',timeout=3).read().decode(); sys.exit(0 if 'alpha_assay_ibkr_connected 1.0' in m else 1)"]
       interval: 30s
       timeout: 5s
-      retries: 3
-      start_period: 30s
+      retries: 4
+      start_period: 45s
 
   bot:
     profiles:
