@@ -569,3 +569,60 @@ def test_live_check_cli_flag_alone_is_not_enough(tmp_path, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(cli_main, ["live-check", "--live"])
     assert result.exit_code == 2
+
+
+@pytest.mark.parametrize(
+    "env_set,cli_flag,checklist_signed,expected_exit,case_name",
+    [
+        (False, False, False, 2, "000_all_missing"),
+        (True, False, False, 2, "100_env_only"),
+        (False, True, False, 2, "010_cli_only"),
+        (False, False, True, 2, "001_checklist_only"),
+        (True, True, False, 2, "110_env_and_cli"),
+        (True, False, True, 2, "101_env_and_checklist"),
+        (False, True, True, 2, "011_cli_and_checklist"),
+        (True, True, True, 0, "111_all_engaged"),
+    ],
+)
+def test_live_check_cli_8_case_matrix(
+    env_set, cli_flag, checklist_signed, expected_exit, case_name, tmp_path, monkeypatch
+):
+    """`alpha_assay live-check [--live]` exits 0 only when all three locks are engaged.
+
+    The CLI is the operator's pre-flip gate, so cover the full 2^3 matrix
+    here too - a two-of-three shortcut in the CLI plumbing would otherwise
+    only be caught by the build_exec_adapter path (test_lock_matrix_8_cases).
+    Each case sets its own env/flag/checklist; nothing is shared across rows.
+    """
+    if env_set:
+        monkeypatch.setenv("ALPHA_ASSAY_LIVE", "1")
+    else:
+        monkeypatch.delenv("ALPHA_ASSAY_LIVE", raising=False)
+    checklist = tmp_path / f"signed_{case_name}"
+    if checklist_signed:
+        _write_checklist(checklist)
+    # Always pin the checklist path so a real ~/.alpha_assay file can't leak in.
+    monkeypatch.setenv("ALPHA_ASSAY_CHECKLIST_PATH", str(checklist))
+
+    args = ["live-check", "--live"] if cli_flag else ["live-check"]
+    result = CliRunner().invoke(cli_main, args)
+
+    assert result.exit_code == expected_exit, (
+        f"case {case_name}: env={env_set} cli={cli_flag} checklist={checklist_signed} "
+        f"-> expected exit {expected_exit}, got {result.exit_code}; output:\n{result.output}"
+    )
+    if expected_exit == 0:
+        assert "mode=LIVE" in result.output
+    else:
+        assert "mode=PAPER" in result.output
+        # The "missing locks:" line must name exactly the un-engaged locks.
+        missing_line = next(ln for ln in result.output.splitlines() if ln.startswith("missing locks:"))
+        named = {tok.strip() for tok in missing_line.split(":", 1)[1].split(",") if tok.strip()}
+        expected_missing = (
+            ({"env"} if not env_set else set())
+            | ({"cli"} if not cli_flag else set())
+            | ({"checklist"} if not checklist_signed else set())
+        )
+        assert (
+            named == expected_missing
+        ), f"case {case_name}: missing-locks line names {named}, expected {expected_missing}"
