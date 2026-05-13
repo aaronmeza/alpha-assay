@@ -134,6 +134,14 @@ live_lock_state = Gauge(
     labelnames=("lock",),
 )
 
+# --- Contract resolution ---
+
+front_month_expiry = Gauge(
+    f"{_PREFIX}front_month_expiry",
+    "Currently-resolved front-month expiry as YYYYMMDD int.",
+    ["symbol", "exchange"],
+)
+
 # --- Session state ---
 
 in_session = Gauge(f"{_PREFIX}in_session", "1 if inside strategy session window, else 0.")

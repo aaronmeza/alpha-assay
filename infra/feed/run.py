@@ -34,9 +34,10 @@ from pathlib import Path
 import redis
 from prometheus_client import start_http_server
 
+from alpha_assay.data.front_month import write_front_month
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.observability import metrics as M
-from infra.feed.feed import FeedManifest, IBKRFeedDaemon
+from infra.feed.feed import FeedManifest, IBKRFeedDaemon, Subscription
 
 LOG = logging.getLogger("alpha_assay.ibkr_feed")
 logging.basicConfig(
@@ -159,6 +160,93 @@ async def _run_subscriptions(
     return EXIT_RESTART
 
 
+async def _resolve_or_pin_es(
+    manifest: FeedManifest,
+    adapter,
+    redis_client,
+) -> list[Subscription]:
+    """Resolve (or pin) the ES front-month expiry and return a patched subscription list.
+
+    Three paths:
+
+    1. **Skip** - no ES bars subscriptions in the manifest. Logs and returns
+       ``manifest.subscriptions`` unchanged. No IBKR call, no Redis write, no
+       gauge update. Appropriate for breadth-only deployments.
+
+    2. **Override** - ``ES_EXPIRY`` env var is set. Uses the operator-pinned
+       value; skips the ContFuture IBKR call (useful during rollover or when
+       the ContFuture qualify would fail).
+
+    3. **Auto-resolve** - ``ES_EXPIRY`` is unset. Calls
+       ``adapter.resolve_front_month_future`` once; the returned
+       ``lastTradeDateOrContractMonth`` becomes the expiry. Any exception
+       propagates to the caller (daemon exits and the container restart policy
+       reconnects).
+
+    In paths 2 and 3 the resolved expiry is written to Redis via
+    ``write_front_month`` and exposed as ``alpha_assay_front_month_expiry``
+    so consumers learn which stream is live without their own IBKR call.
+    """
+    es_sub_count = sum(
+        1
+        for s in manifest.subscriptions
+        if s.kind == "bars"
+        and s.contract is not None
+        and s.contract.get("symbol") == "ES"
+        and s.contract.get("exchange") == "CME"
+    )
+    if es_sub_count == 0:
+        LOG.info("no ES bars subscriptions in manifest; skipping ContFuture resolve")
+        return list(manifest.subscriptions)
+
+    # Resolve (or pin) the ES front-month expiry.
+    es_expiry_override = os.environ.get("ES_EXPIRY", "").strip()
+    if es_expiry_override:
+        # Emergency override: pin to the operator-specified contract.
+        LOG.info("ES_EXPIRY override set to %s; skipping ContFuture", es_expiry_override)
+        resolved_expiry = es_expiry_override
+    else:
+        # Auto-resolve via ContFuture. Exception propagates and exits the
+        # daemon (watchdog restarts the container) - no error swallowing.
+        fut = await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
+        resolved_expiry = fut.lastTradeDateOrContractMonth
+        LOG.info(
+            "ContFuture resolved ES@CME -> %s (%s)",
+            resolved_expiry,
+            fut.localSymbol,
+        )
+
+    # Patch any bars subscription for ES@CME to use the resolved expiry,
+    # overriding whatever is hardcoded in the manifest file.
+    patched_subs = []
+    for sub in manifest.subscriptions:
+        if (
+            sub.kind == "bars"
+            and sub.contract is not None
+            and sub.contract.get("symbol") == "ES"
+            and sub.contract.get("exchange") == "CME"
+        ):
+            patched_contract = {**sub.contract, "expiry": resolved_expiry}
+            patched_subs.append(
+                Subscription(
+                    kind=sub.kind,
+                    contract=patched_contract,
+                    bar_size=sub.bar_size,
+                    what_to_show=sub.what_to_show,
+                )
+            )
+        else:
+            patched_subs.append(sub)
+
+    # Publish to Redis so consumers learn which stream is live.
+    write_front_month(redis_client, symbol="ES", exchange="CME", expiry=resolved_expiry)
+
+    # Expose as a Prometheus label for observability.
+    M.front_month_expiry.labels(symbol="ES", exchange="CME").set(int(resolved_expiry))
+
+    return patched_subs
+
+
 async def _main() -> int:
     manifest_path = Path(os.environ.get("MANIFEST_PATH", "/app/configs/feed-manifest.yaml"))
     redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -185,6 +273,8 @@ async def _main() -> int:
     await _connect_with_retry(adapter)
     LOG.info("IBKR connected")
 
+    patched_subs = await _resolve_or_pin_es(manifest, adapter, redis_client)
+
     daemon = IBKRFeedDaemon(adapter=adapter, redis_client=redis_client, wal_dir=wal_dir)
 
     stop = asyncio.Event()
@@ -192,7 +282,7 @@ async def _main() -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
-    return await _run_subscriptions(daemon, adapter, manifest.subscriptions, stop)
+    return await _run_subscriptions(daemon, adapter, patched_subs, stop)
 
 
 def main() -> int:

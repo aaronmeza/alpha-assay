@@ -16,8 +16,13 @@ from unittest.mock import AsyncMock, MagicMock
 import fakeredis
 import pytest
 
-from infra.feed.feed import IBKRFeedDaemon, Subscription
-from infra.feed.run import _connect_with_retry, _run_subscriptions, _watch_connection
+from infra.feed.feed import FeedManifest, IBKRFeedDaemon, Subscription
+from infra.feed.run import (
+    _connect_with_retry,
+    _resolve_or_pin_es,
+    _run_subscriptions,
+    _watch_connection,
+)
 
 
 @pytest.fixture
@@ -194,3 +199,152 @@ def test_connect_with_retry_raises_after_exhausting_attempts():
     with pytest.raises(ConnectionRefusedError):
         asyncio.run(_connect_with_retry(adapter, attempts=3, base_delay=0.001, max_delay=0.01))
     assert calls["n"] == 3
+
+
+# --- _resolve_or_pin_es --------------------------------------------------
+
+
+def _es_bars_manifest() -> FeedManifest:
+    """A manifest with one ES bars subscription and one breadth ticks subscription."""
+    return FeedManifest(
+        subscriptions=[
+            Subscription(
+                kind="bars",
+                contract={"symbol": "ES", "sec_type": "FUT", "exchange": "CME", "expiry": "20250919"},
+            ),
+            Subscription(kind="ticks", symbol="ADD"),
+        ]
+    )
+
+
+def _breadth_only_manifest() -> FeedManifest:
+    """A manifest with no ES bars subscriptions - breadth-only deployment."""
+    return FeedManifest(
+        subscriptions=[
+            Subscription(kind="ticks", symbol="TICK"),
+            Subscription(kind="ticks", symbol="ADD"),
+        ]
+    )
+
+
+def test_resolve_or_pin_es_override_path(monkeypatch):
+    """ES_EXPIRY set: adapter.resolve_front_month_future NOT called,
+    manifest ES sub patched with override value, Redis write + gauge set."""
+    monkeypatch.setenv("ES_EXPIRY", "20251219")
+
+    fake_fut = MagicMock()
+    fake_fut.lastTradeDateOrContractMonth = "20251219"
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = AsyncMock(return_value=fake_fut)
+
+    redis_client = fakeredis.FakeRedis()
+    manifest = _es_bars_manifest()
+
+    async def _run():
+        import infra.feed.run as run_mod
+
+        calls = []
+        original_write = run_mod.write_front_month
+
+        def capturing_write(*args, **kwargs):
+            calls.append((args, kwargs))
+            return original_write(*args, **kwargs)
+
+        monkeypatch.setattr(run_mod, "write_front_month", capturing_write)
+        result = await _resolve_or_pin_es(manifest, adapter, redis_client)
+        return result, calls
+
+    result, write_calls = asyncio.run(_run())
+
+    # resolve_front_month_future must NOT have been called
+    adapter.resolve_front_month_future.assert_not_called()
+
+    # The ES bars sub must carry the override expiry
+    es_subs = [s for s in result if s.kind == "bars" and s.contract and s.contract.get("symbol") == "ES"]
+    assert len(es_subs) == 1
+    assert es_subs[0].contract["expiry"] == "20251219"
+
+    # write_front_month must have been called with the override value
+    assert len(write_calls) == 1
+    assert write_calls[0][1].get("expiry") == "20251219" or write_calls[0][0][2] == "20251219"
+
+
+def test_resolve_or_pin_es_auto_resolve_path(monkeypatch):
+    """ES_EXPIRY unset: adapter.resolve_front_month_future called once,
+    resolved expiry flows into the patched sub, Redis write + gauge set."""
+    monkeypatch.delenv("ES_EXPIRY", raising=False)
+
+    resolved_expiry = "20251219"
+    fake_fut = MagicMock()
+    fake_fut.lastTradeDateOrContractMonth = resolved_expiry
+    fake_fut.localSymbol = "ESZ5"
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = AsyncMock(return_value=fake_fut)
+
+    redis_client = fakeredis.FakeRedis()
+    manifest = _es_bars_manifest()
+
+    async def _run():
+        import infra.feed.run as run_mod
+
+        write_calls = []
+        original_write = run_mod.write_front_month
+
+        def capturing_write(*args, **kwargs):
+            write_calls.append((args, kwargs))
+            return original_write(*args, **kwargs)
+
+        monkeypatch.setattr(run_mod, "write_front_month", capturing_write)
+        result = await _resolve_or_pin_es(manifest, adapter, redis_client)
+        return result, write_calls
+
+    result, write_calls = asyncio.run(_run())
+
+    # resolve_front_month_future must have been called exactly once
+    adapter.resolve_front_month_future.assert_awaited_once()
+
+    # The ES bars sub must carry the resolved expiry
+    es_subs = [s for s in result if s.kind == "bars" and s.contract and s.contract.get("symbol") == "ES"]
+    assert len(es_subs) == 1
+    assert es_subs[0].contract["expiry"] == resolved_expiry
+
+    # write_front_month must have been called with the resolved value
+    assert len(write_calls) == 1
+    assert write_calls[0][1].get("expiry") == resolved_expiry or write_calls[0][0][2] == resolved_expiry
+
+
+def test_resolve_or_pin_es_skip_when_no_es_bars(monkeypatch):
+    """Manifest has no ES bars subscriptions: resolve NOT called,
+    write_front_month NOT called, subscriptions returned unchanged."""
+    monkeypatch.delenv("ES_EXPIRY", raising=False)
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = AsyncMock()
+
+    redis_client = fakeredis.FakeRedis()
+    manifest = _breadth_only_manifest()
+
+    async def _run():
+        import infra.feed.run as run_mod
+
+        write_calls = []
+        original_write = run_mod.write_front_month
+
+        def capturing_write(*args, **kwargs):
+            write_calls.append((args, kwargs))
+            return original_write(*args, **kwargs)
+
+        monkeypatch.setattr(run_mod, "write_front_month", capturing_write)
+        result = await _resolve_or_pin_es(manifest, adapter, redis_client)
+        return result, write_calls
+
+    result, write_calls = asyncio.run(_run())
+
+    # resolve_front_month_future must NOT have been called
+    adapter.resolve_front_month_future.assert_not_called()
+
+    # write_front_month must NOT have been called
+    assert write_calls == []
+
+    # The subscription list must be returned unchanged
+    assert result == list(manifest.subscriptions)
