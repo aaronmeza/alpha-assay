@@ -11,6 +11,7 @@ policy recycles it with a fresh connection.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import fakeredis
@@ -19,8 +20,10 @@ import pytest
 from infra.feed.feed import FeedManifest, IBKRFeedDaemon, Subscription
 from infra.feed.run import (
     _connect_with_retry,
+    _pre_open_requalify_loop,
     _resolve_or_pin_es,
     _run_subscriptions,
+    _seconds_until_next_pre_open,
     _watch_connection,
 )
 
@@ -348,3 +351,168 @@ def test_resolve_or_pin_es_skip_when_no_es_bars(monkeypatch):
 
     # The subscription list must be returned unchanged
     assert result == list(manifest.subscriptions)
+
+
+# --- _seconds_until_next_pre_open -----------------------------------------
+
+
+def test_seconds_until_next_pre_open_before_target():
+    """At 07:00 CT, next 08:00 CT is exactly 1 hour (3600 s) away."""
+    from zoneinfo import ZoneInfo
+
+    chi = ZoneInfo("America/Chicago")
+    now = datetime(2026, 5, 14, 7, 0, 0, tzinfo=chi)
+    assert _seconds_until_next_pre_open(now) == 3600.0
+
+
+def test_seconds_until_next_pre_open_after_target():
+    """At 09:00 CT, next 08:00 CT is tomorrow - exactly 23 hours away."""
+    from zoneinfo import ZoneInfo
+
+    chi = ZoneInfo("America/Chicago")
+    now = datetime(2026, 5, 14, 9, 0, 0, tzinfo=chi)
+    assert _seconds_until_next_pre_open(now) == 23 * 3600.0
+
+
+def test_seconds_until_next_pre_open_exactly_at_target():
+    """At exactly 08:00:00 CT, the target is not in the future so the
+    function targets tomorrow's 08:00 - returning 24 hours."""
+    from zoneinfo import ZoneInfo
+
+    chi = ZoneInfo("America/Chicago")
+    now = datetime(2026, 5, 14, 8, 0, 0, tzinfo=chi)
+    assert _seconds_until_next_pre_open(now) == 24 * 3600.0
+
+
+def test_seconds_until_next_pre_open_end_of_month():
+    """Month-boundary: May 31 -> June 1 must not produce an invalid date."""
+    from zoneinfo import ZoneInfo
+
+    chi = ZoneInfo("America/Chicago")
+    # 09:00 CT on May 31 - next 08:00 is June 1 (23 h later)
+    now = datetime(2026, 5, 31, 9, 0, 0, tzinfo=chi)
+    result = _seconds_until_next_pre_open(now)
+    assert result == 23 * 3600.0
+
+
+# --- _pre_open_requalify_loop -------------------------------------------
+
+
+def test_requalify_loop_logs_unchanged_and_continues(monkeypatch, caplog):
+    """When IBKR returns the same expiry that is in Redis, the loop logs
+    INFO 'unchanged' and continues without writing Redis or updating the gauge."""
+    import logging
+
+    import fakeredis
+
+    import infra.feed.run as run_mod
+    from alpha_assay.data.front_month import read_front_month, write_front_month
+
+    redis_client = fakeredis.FakeRedis()
+    write_front_month(redis_client, symbol="ES", exchange="CME", expiry="20260619")
+
+    fake_fut = MagicMock()
+    fake_fut.lastTradeDateOrContractMonth = "20260619"  # same as Redis - unchanged
+    fake_fut.localSymbol = "ESM6"
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = AsyncMock(return_value=fake_fut)
+
+    # Patch _seconds_until_next_pre_open to return 0 so the loop fires immediately.
+    monkeypatch.setattr(run_mod, "_seconds_until_next_pre_open", lambda _now: 0.0)
+
+    async def _run():
+        task = asyncio.create_task(_pre_open_requalify_loop(adapter, redis_client))
+        # Give the loop time to fire one iteration (sleep(0) + resolve + compare).
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    with caplog.at_level(logging.INFO, logger="alpha_assay.ibkr_feed"):
+        asyncio.run(_run())
+
+    # resolve was actually awaited (branch was exercised, not short-circuited by cancel)
+    adapter.resolve_front_month_future.assert_awaited()
+    # Redis key must remain unchanged
+    assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260619"
+    # The unchanged branch emits an INFO log with "unchanged" in the message
+    assert any("unchanged" in r.message for r in caplog.records if r.levelno == logging.INFO)
+
+
+def test_requalify_loop_detects_rollover(monkeypatch):
+    """When IBKR returns a new expiry the loop writes the new key + sets the gauge."""
+    import fakeredis
+
+    import infra.feed.run as run_mod
+    from alpha_assay.data.front_month import read_front_month, write_front_month
+
+    redis_client = fakeredis.FakeRedis()
+    write_front_month(redis_client, symbol="ES", exchange="CME", expiry="20260620")
+
+    fake_fut = MagicMock()
+    fake_fut.lastTradeDateOrContractMonth = "20260918"  # new front month
+    fake_fut.localSymbol = "ESU6"
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = AsyncMock(return_value=fake_fut)
+
+    # Patch _seconds_until_next_pre_open to return 0 so the loop fires immediately.
+    monkeypatch.setattr(run_mod, "_seconds_until_next_pre_open", lambda _now: 0.0)
+
+    async def _run():
+        task = asyncio.create_task(_pre_open_requalify_loop(adapter, redis_client))
+        # Give the loop time to fire one iteration (sleep(0) + resolve + write).
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run())
+
+    adapter.resolve_front_month_future.assert_awaited()
+    assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260918"
+
+
+def test_requalify_loop_continues_on_ibkr_error(monkeypatch):
+    """An IBKR exception on one iteration must not kill the loop - it
+    continues sleeping until the next 08:00 CT."""
+    import fakeredis
+
+    import infra.feed.run as run_mod
+    from alpha_assay.data.front_month import read_front_month, write_front_month
+
+    redis_client = fakeredis.FakeRedis()
+    write_front_month(redis_client, symbol="ES", exchange="CME", expiry="20260620")
+
+    call_count = {"n": 0}
+
+    async def flaky_resolve(**_kw):
+        call_count["n"] += 1
+        raise RuntimeError("IBKR timeout")
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = flaky_resolve
+
+    monkeypatch.setattr(run_mod, "_seconds_until_next_pre_open", lambda _now: 0.0)
+
+    async def _run():
+        task = asyncio.create_task(_pre_open_requalify_loop(adapter, redis_client))
+        # Let multiple iterations fire.
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run())
+
+    # Loop must have attempted more than one iteration despite the errors.
+    assert call_count["n"] > 1
+    # Redis key must remain unchanged (no write on failure).
+    assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260620"
