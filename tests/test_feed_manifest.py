@@ -10,7 +10,8 @@ from infra.feed.feed import FeedManifest, ManifestError
 
 def test_parse_default_manifest(tmp_path: Path):
     p = tmp_path / "m.yaml"
-    p.write_text("""
+    p.write_text(
+        """
 subscriptions:
   - kind: bars
     contract:
@@ -23,7 +24,8 @@ subscriptions:
     what_to_show: TRADES
   - kind: ticks
     symbol: TICK-NYSE
-""")
+"""
+    )
     m = FeedManifest.from_yaml(p)
     assert len(m.subscriptions) == 2
     bars_sub = m.subscriptions[0]

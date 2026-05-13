@@ -50,10 +50,18 @@ services:
       IBKR_PORT: ${IBKR_PORT:-4002}
       IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
       IBKR_ACCOUNT: ${IBKR_ACCOUNT:-}
-      ES_EXPIRY: ${ES_EXPIRY:-20260618}
+      # ES_EXPIRY left intentionally unset - the daemon resolves the front-month
+      # via IBKR ContFuture at startup. Set ES_EXPIRY here ONLY as an emergency
+      # override (force-pin to a specific YYYYMMDD contract).
+      ES_EXPIRY: ${ES_EXPIRY:-}
     env_file:
       - path: .env.secrets
         required: false
+    depends_on:
+      redis:
+        condition: service_healthy
+      ibkr-feed:
+        condition: service_healthy
     ports:
       # host -> container. 127.0.0.1 only - operator's access layer
       # decides what reaches it.
@@ -132,10 +140,18 @@ services:
       IBKR_PORT: ${IBKR_PORT:-4002}
       IBKR_CLIENT_ID: ${ES_BARS_IBKR_CLIENT_ID:-22}
       IBKR_ACCOUNT: ${IBKR_ACCOUNT:-}
-      ES_EXPIRY: ${ES_EXPIRY:-20260618}
+      # ES_EXPIRY left intentionally unset - the daemon resolves the front-month
+      # via IBKR ContFuture at startup. Set ES_EXPIRY here ONLY as an emergency
+      # override (force-pin to a specific YYYYMMDD contract).
+      ES_EXPIRY: ${ES_EXPIRY:-}
     env_file:
       - path: .env.secrets
         required: false
+    depends_on:
+      redis:
+        condition: service_healthy
+      ibkr-feed:
+        condition: service_healthy
     command: ["python", "-u", "/app/infra/recorders/ibkr_es_bars/run.py"]
     ports:
       - "127.0.0.1:18002:8002"

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
+import pytest
 
 from alpha_assay.data import ibkr_adapter
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
@@ -426,6 +427,74 @@ def test_connection_event_counter_increments_on_error():
         pass
     after = _counter_value(M.ibkr_connection_events_total, event="error")
     assert after == before + 1
+
+
+# --- resolve_front_month_future ----------------------------------------
+
+
+def test_resolve_front_month_future_returns_qualified_contract():
+    """ContFuture(symbol=ES, exchange=CME) qualifies via ib.qualifyContractsAsync,
+    and the returned contract has lastTradeDateOrContractMonth populated."""
+    mock_ib = MagicMock()
+    resolved = MagicMock()
+    resolved.symbol = "ES"
+    resolved.exchange = "CME"
+    resolved.lastTradeDateOrContractMonth = "20260619"
+    resolved.localSymbol = "ESM6"
+    mock_ib.qualifyContractsAsync = AsyncMock(return_value=[resolved])
+
+    adapter = _make_adapter(ib=mock_ib)
+
+    async def _run():
+        return await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
+
+    fut = asyncio.run(_run())
+
+    assert fut.lastTradeDateOrContractMonth == "20260619"
+    assert fut.localSymbol == "ESM6"
+    cf_arg = mock_ib.qualifyContractsAsync.call_args.args[0]
+    assert cf_arg.__class__.__name__ == "ContFuture"
+    assert cf_arg.symbol == "ES"
+    assert cf_arg.exchange == "CME"
+
+
+def test_resolve_front_month_future_raises_on_empty_qualify():
+    """If IBKR returns no qualified contracts, raise IBKRAdapterError."""
+    from alpha_assay.data.ibkr_adapter import IBKRAdapterError
+
+    mock_ib = MagicMock()
+    mock_ib.qualifyContractsAsync = AsyncMock(return_value=[])
+    adapter = _make_adapter(ib=mock_ib)
+
+    async def _run():
+        return await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
+
+    with pytest.raises(IBKRAdapterError, match="no qualified front-month"):
+        asyncio.run(_run())
+
+
+def test_resolve_front_month_future_raises_on_timeout():
+    """If qualifyContractsAsync hangs, we time out and raise IBKRAdapterError."""
+    from unittest.mock import patch
+
+    from alpha_assay.data.ibkr_adapter import IBKRAdapterError
+
+    mock_ib = MagicMock(name="IB")
+
+    async def _hang(*args, **kwargs):
+        await asyncio.sleep(60)  # would hang forever without timeout
+
+    mock_ib.qualifyContractsAsync = AsyncMock(side_effect=_hang)
+
+    adapter = _make_adapter(ib=mock_ib)
+
+    async def _run():
+        return await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
+
+    # Temporarily lower the timeout so the test completes in <1s.
+    with patch("alpha_assay.data.ibkr_adapter.FRONT_MONTH_QUALIFY_TIMEOUT_SECONDS", 0.1):
+        with pytest.raises(IBKRAdapterError, match="timed out"):
+            asyncio.run(_run())
 
 
 # --- / boundary ---------------------------------------

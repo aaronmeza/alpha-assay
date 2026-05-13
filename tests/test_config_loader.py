@@ -5,7 +5,8 @@ from pydantic import ValidationError
 
 from alpha_assay.config.loader import AlphaAssayConfig, load_config
 
-VALID = textwrap.dedent("""\
+VALID = textwrap.dedent(
+    """\
     strategy:
       class: mypkg.my_strategy:MyStrategy
       params:
@@ -20,7 +21,8 @@ VALID = textwrap.dedent("""\
     execution:
       mode: paper
       instrument: MES
-""")
+"""
+)
 
 
 def test_loads_valid_config(tmp_path):

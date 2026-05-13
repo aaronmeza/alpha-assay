@@ -17,6 +17,14 @@ days after the Phase T deploy). The watchdog notices
 and the daemon exits non-zero so the container restart policy
 (``restart: unless-stopped``) recycles it with a fresh connection.
 
+A daily pre-open re-qualify loop fires at 08:00 CT each day to
+detect front-month rollovers without operator action. On change it
+updates the Redis metadata key and the Prometheus gauge so consumers
+pick up the new stream key on their next restart. The running
+subscription loop stays on the boot-time stream by design (the
+stream name is baked into ``run_subscription`` at startup from the
+patched manifest).
+
 Exits non-zero on connection loss, FeedLockHeldError, a subscription
 fault, or fatal Redis errors so the container restart policy kicks in.
 A clean SIGTERM / SIGINT exits zero.
@@ -29,14 +37,22 @@ import logging
 import os
 import signal
 import sys
+from datetime import datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import redis
 from prometheus_client import start_http_server
 
+from alpha_assay.data.front_month import (
+    read_front_month,
+    validate_yyyymmdd,
+    write_front_month,
+)
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.observability import metrics as M
-from infra.feed.feed import FeedManifest, IBKRFeedDaemon
+from infra.feed.feed import FeedManifest, IBKRFeedDaemon, Subscription
 
 LOG = logging.getLogger("alpha_assay.ibkr_feed")
 logging.basicConfig(
@@ -47,6 +63,28 @@ logging.basicConfig(
 # Docker `restart: unless-stopped` recycles the container on any non-zero exit.
 EXIT_OK = 0
 EXIT_RESTART = 2
+
+# Daily pre-open re-qualify schedule.
+CHICAGO = ZoneInfo("America/Chicago")
+_PRE_OPEN_TIME = dt_time(8, 0)  # 08:00 CT
+
+
+def _seconds_until_next_pre_open(now: datetime) -> float:
+    """Return the number of seconds from *now* until the next 08:00 CT.
+
+    If *now* is before 08:00 CT today, targets today's 08:00.
+    If *now* is at or after 08:00 CT today, targets tomorrow's 08:00.
+    *now* must be timezone-aware (America/Chicago recommended).
+    """
+    target = now.replace(
+        hour=_PRE_OPEN_TIME.hour,
+        minute=_PRE_OPEN_TIME.minute,
+        second=0,
+        microsecond=0,
+    )
+    if target <= now:
+        target = target + timedelta(days=1)
+    return (target - now).total_seconds()
 
 
 async def _watch_connection(adapter, poll_seconds: float = 5.0) -> None:
@@ -159,6 +197,177 @@ async def _run_subscriptions(
     return EXIT_RESTART
 
 
+async def _pre_open_requalify_loop(
+    adapter,
+    redis_client,
+) -> None:
+    """Re-qualify the ES front-month every day at 08:00 CT.
+
+    Reads the current expiry from Redis (the source of truth written at
+    startup by ``_resolve_or_pin_es``). If IBKR resolves a different
+    expiry a rollover has occurred: the Redis key and the Prometheus gauge
+    are updated so consumers pick up the new stream key on their next
+    restart.
+
+    The running subscription loop is NOT torn down - the stream name is
+    baked at startup inside ``run_subscription`` and stays on the
+    boot-time stream for the rest of the process lifetime. Stream-key
+    switch takes effect on the next feed restart; mid-session the
+    producer stays on the boot-time stream by design.
+
+    A single-iteration failure (IBKR error, Redis unavailable) is logged
+    as WARNING and skipped; the loop continues sleeping until the next
+    08:00 CT. The coroutine only exits via cancellation (SIGTERM/stop).
+    """
+    while True:
+        now = datetime.now(CHICAGO)
+        delay = _seconds_until_next_pre_open(now)
+        target = now + timedelta(seconds=delay)
+        LOG.info("next pre-open re-qualify at %s CT (in %.0fs)", target.strftime("%Y-%m-%d %H:%M:%S"), delay)
+        await asyncio.sleep(delay)
+
+        # --- Resolve via IBKR ---
+        try:
+            fut = await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
+            # Validate IBKR's response before using. InvalidExpiryError is a
+            # subclass of ValueError and is caught by the broad except below,
+            # so a malformed IBKR response logs a warning and skips this
+            # iteration rather than killing the loop.
+            new_expiry = validate_yyyymmdd(
+                fut.lastTradeDateOrContractMonth, source="IBKR ContFuture qualify (requalify)"
+            )
+        except Exception as exc:  # noqa: BLE001 - single-iteration failure must not kill the loop
+            LOG.warning("pre-open re-qualify: IBKR resolve failed (%s); retrying tomorrow", exc)
+            continue
+
+        # --- Compare against current Redis value ---
+        try:
+            current_expiry = read_front_month(redis_client, symbol="ES", exchange="CME")
+        except Exception as exc:  # noqa: BLE001 - Redis unavailable; skip this iteration
+            LOG.warning("pre-open re-qualify: could not read current expiry from Redis (%s); retrying tomorrow", exc)
+            continue
+
+        if new_expiry == current_expiry:
+            LOG.info("pre-open re-qualify: front-month unchanged (%s)", new_expiry)
+            continue
+
+        # --- Rollover detected ---
+        LOG.warning(
+            "FRONT-MONTH ROLLOVER detected: %s -> %s (%s); "
+            "updating Redis key + gauge. "
+            "Stream-key switch takes effect on the next feed restart; "
+            "the mid-session producer stays on the boot-time stream by design.",
+            current_expiry,
+            new_expiry,
+            fut.localSymbol,
+        )
+        try:
+            # validate_yyyymmdd already ran above; write_front_month validates
+            # again internally (defense-in-depth). Gauge int cast is safe.
+            write_front_month(redis_client, symbol="ES", exchange="CME", expiry=new_expiry)
+            M.front_month_expiry.labels(symbol="ES", exchange="CME").set(int(new_expiry))
+        except Exception as exc:  # noqa: BLE001 - best-effort write; log and continue
+            LOG.warning(
+                "pre-open re-qualify: failed to persist new expiry %s (%s); "
+                "consumers will not learn of the rollover until the write succeeds; "
+                "manual restart may be required.",
+                new_expiry,
+                exc,
+            )
+
+
+async def _resolve_or_pin_es(
+    manifest: FeedManifest,
+    adapter,
+    redis_client,
+) -> list[Subscription]:
+    """Resolve (or pin) the ES front-month expiry and return a patched subscription list.
+
+    Three paths:
+
+    1. **Skip** - no ES bars subscriptions in the manifest. Logs and returns
+       ``manifest.subscriptions`` unchanged. No IBKR call, no Redis write, no
+       gauge update. Appropriate for breadth-only deployments.
+
+    2. **Override** - ``ES_EXPIRY`` env var is set. Uses the operator-pinned
+       value; skips the ContFuture IBKR call (useful during rollover or when
+       the ContFuture qualify would fail).
+
+    3. **Auto-resolve** - ``ES_EXPIRY`` is unset. Calls
+       ``adapter.resolve_front_month_future`` once; the returned
+       ``lastTradeDateOrContractMonth`` becomes the expiry. Any exception
+       propagates to the caller (daemon exits and the container restart policy
+       reconnects).
+
+    In paths 2 and 3 the resolved expiry is written to Redis via
+    ``write_front_month`` and exposed as ``alpha_assay_front_month_expiry``
+    so consumers learn which stream is live without their own IBKR call.
+    """
+    es_sub_count = sum(
+        1
+        for s in manifest.subscriptions
+        if s.kind == "bars"
+        and s.contract is not None
+        and s.contract.get("symbol") == "ES"
+        and s.contract.get("exchange") == "CME"
+    )
+    if es_sub_count == 0:
+        LOG.info("no ES bars subscriptions in manifest; skipping ContFuture resolve")
+        return list(manifest.subscriptions)
+
+    # Resolve (or pin) the ES front-month expiry.
+    es_expiry_override = os.environ.get("ES_EXPIRY", "").strip()
+    if es_expiry_override:
+        # Emergency override: pin to the operator-specified contract.
+        # Validate before using - bad env value must fail loudly, not persist
+        # to Redis or crash later on int(...) cast.
+        resolved_expiry = validate_yyyymmdd(es_expiry_override, source="ES_EXPIRY env override")
+        LOG.info("ES_EXPIRY override set to %s; skipping ContFuture", resolved_expiry)
+    else:
+        # Auto-resolve via ContFuture. Exception propagates and exits the
+        # daemon (watchdog restarts the container) - no error swallowing.
+        fut = await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
+        # Validate IBKR's response before trusting it. IBKR can return
+        # malformed or partial data on a bad qualify; reject at the gate.
+        resolved_expiry = validate_yyyymmdd(fut.lastTradeDateOrContractMonth, source="IBKR ContFuture qualify")
+        LOG.info(
+            "ContFuture resolved ES@CME -> %s (%s)",
+            resolved_expiry,
+            fut.localSymbol,
+        )
+
+    # Patch any bars subscription for ES@CME to use the resolved expiry,
+    # overriding whatever is hardcoded in the manifest file.
+    patched_subs = []
+    for sub in manifest.subscriptions:
+        if (
+            sub.kind == "bars"
+            and sub.contract is not None
+            and sub.contract.get("symbol") == "ES"
+            and sub.contract.get("exchange") == "CME"
+        ):
+            patched_contract = {**sub.contract, "expiry": resolved_expiry}
+            patched_subs.append(
+                Subscription(
+                    kind=sub.kind,
+                    contract=patched_contract,
+                    bar_size=sub.bar_size,
+                    what_to_show=sub.what_to_show,
+                )
+            )
+        else:
+            patched_subs.append(sub)
+
+    # Validate-then-write ordering: validated above, write now, then set gauge.
+    # write_front_month also validates internally (defense-in-depth).
+    write_front_month(redis_client, symbol="ES", exchange="CME", expiry=resolved_expiry)
+
+    # Safe int cast: resolved_expiry is guaranteed 8 digits by validate_yyyymmdd.
+    M.front_month_expiry.labels(symbol="ES", exchange="CME").set(int(resolved_expiry))
+
+    return patched_subs
+
+
 async def _main() -> int:
     manifest_path = Path(os.environ.get("MANIFEST_PATH", "/app/configs/feed-manifest.yaml"))
     redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -172,6 +381,8 @@ async def _main() -> int:
     LOG.info("loaded %d subscriptions from %s", len(manifest.subscriptions), manifest_path)
 
     adapter = IBKRAdapter(host=ibkr_host, port=ibkr_port, client_id=client_id)
+    # Sync Redis client (codebase convention; blocking calls are intentional - one
+    # ping per startup, plus per-publish XADD inside the subscription tasks).
     redis_client = redis.from_url(redis_url)
     redis_client.ping()  # fail fast if unreachable
 
@@ -185,6 +396,8 @@ async def _main() -> int:
     await _connect_with_retry(adapter)
     LOG.info("IBKR connected")
 
+    patched_subs = await _resolve_or_pin_es(manifest, adapter, redis_client)
+
     daemon = IBKRFeedDaemon(adapter=adapter, redis_client=redis_client, wal_dir=wal_dir)
 
     stop = asyncio.Event()
@@ -192,7 +405,24 @@ async def _main() -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
-    return await _run_subscriptions(daemon, adapter, manifest.subscriptions, stop)
+    # Start the daily pre-open re-qualify only when there are ES bars
+    # subscriptions - it is a no-op for breadth-only deployments.
+    es_sub_count = sum(
+        1
+        for s in manifest.subscriptions
+        if s.kind == "bars"
+        and s.contract is not None
+        and s.contract.get("symbol") == "ES"
+        and s.contract.get("exchange") == "CME"
+    )
+    if es_sub_count >= 1:
+        asyncio.create_task(
+            _pre_open_requalify_loop(adapter, redis_client),
+            name="pre-open-requalify",
+        )
+        LOG.info("daily pre-open re-qualify task started")
+
+    return await _run_subscriptions(daemon, adapter, patched_subs, stop)
 
 
 def main() -> int:

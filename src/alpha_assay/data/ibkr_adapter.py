@@ -49,11 +49,16 @@ import pandas as pd
 
 # ib_insync is a hard runtime dependency of this module; import at top level
 # so mis-installation is a loud failure rather than a subtle attribute error.
-from ib_insync import IB, Contract, Future, Index, Stock
+from ib_insync import IB, ContFuture, Contract, Future, Index, Stock
 
 from alpha_assay.observability import metrics as M
 
 _SUPPORTED_SEC_TYPES = ("FUT", "IND", "STK")
+
+# Timeout for ContFuture qualifyContractsAsync. IB Gateway can accept the
+# TCP connection but never respond (mid-IBC-cycle, wedged request queue, etc.).
+# Without a timeout the daemon hangs forever in the qualify call.
+FRONT_MONTH_QUALIFY_TIMEOUT_SECONDS = 30.0
 
 
 class IBKRAdapterError(RuntimeError):
@@ -242,6 +247,42 @@ class IBKRAdapter:
     @property
     def is_connected(self) -> bool:
         return bool(self._ib.isConnected())
+
+    # --- contract resolution --------------------------------------------
+
+    async def resolve_front_month_future(
+        self,
+        symbol: str,
+        exchange: str,
+        currency: str = "USD",
+    ) -> Future:
+        """Resolve the current front-month futures contract via ContFuture.
+
+        IBKR maintains the front-month definition; we ask IBKR what it is
+        rather than baking a date into config. Returns a Future qualified
+        with lastTradeDateOrContractMonth, localSymbol, and conId populated.
+
+        Raises IBKRAdapterError if qualifyContractsAsync returns no
+        contracts (network blip, contract not found, IBKR misconfig) or
+        if the call times out (IB Gateway unresponsive).
+        """
+        cf = ContFuture(symbol=symbol, exchange=exchange, currency=currency)
+        try:
+            qualified = await asyncio.wait_for(
+                self._ib.qualifyContractsAsync(cf),
+                timeout=FRONT_MONTH_QUALIFY_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            raise IBKRAdapterError(
+                f"ContFuture qualify timed out after "
+                f"{FRONT_MONTH_QUALIFY_TIMEOUT_SECONDS}s for {symbol}@{exchange} ({currency}); "
+                f"IB Gateway may be unresponsive"
+            ) from None
+        if not qualified:
+            raise IBKRAdapterError(
+                f"no qualified front-month for {symbol}@{exchange} ({currency}); " f"ContFuture returned empty list"
+            )
+        return qualified[0]
 
     # --- subscriptions --------------------------------------------------
 
