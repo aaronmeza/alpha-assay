@@ -280,8 +280,7 @@ class IBKRAdapter:
             ) from None
         if not qualified:
             raise IBKRAdapterError(
-                f"no qualified front-month for {symbol}@{exchange} ({currency}); "
-                f"ContFuture returned empty list"
+                f"no qualified front-month for {symbol}@{exchange} ({currency}); " f"ContFuture returned empty list"
             )
         return qualified[0]
 

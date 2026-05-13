@@ -37,16 +37,12 @@ def validate_yyyymmdd(s: str, *, source: str = "value") -> str:
     knows WHERE the bad value came from (env override, IBKR, Redis read).
     """
     if not isinstance(s, str) or not _YYYYMMDD_RE.match(s):
-        raise InvalidExpiryError(
-            f"invalid expiry {s!r} from {source}: expected 8 digits (YYYYMMDD)"
-        )
+        raise InvalidExpiryError(f"invalid expiry {s!r} from {source}: expected 8 digits (YYYYMMDD)")
     try:
         # Real-date check: ensures e.g. "20260230" (Feb 30) is rejected.
         datetime.strptime(s, "%Y%m%d")
     except ValueError as e:
-        raise InvalidExpiryError(
-            f"invalid expiry {s!r} from {source}: {e}"
-        ) from e
+        raise InvalidExpiryError(f"invalid expiry {s!r} from {source}: {e}") from e
     return s
 
 

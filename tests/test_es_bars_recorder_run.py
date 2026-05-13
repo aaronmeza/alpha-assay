@@ -40,9 +40,7 @@ def test_resolve_expiry_raises_when_neither_present(fake_redis, monkeypatch):
     monkeypatch.delenv("ES_EXPIRY", raising=False)
     # Use tiny timeouts so the test completes quickly.
     with pytest.raises(FrontMonthMissingError):
-        _resolve_es_expiry_with_wait(
-            fake_redis, max_wait_seconds=0.01, poll_interval_seconds=0.005
-        )
+        _resolve_es_expiry_with_wait(fake_redis, max_wait_seconds=0.01, poll_interval_seconds=0.005)
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +61,6 @@ def test_resolve_expiry_waits_for_redis_publication(fake_redis, monkeypatch):
 
     threading.Thread(target=_publish_after_delay, daemon=True).start()
 
-    expiry, source = _resolve_es_expiry_with_wait(
-        fake_redis, max_wait_seconds=2.0, poll_interval_seconds=0.01
-    )
+    expiry, source = _resolve_es_expiry_with_wait(fake_redis, max_wait_seconds=2.0, poll_interval_seconds=0.01)
     assert expiry == "20260619"
     assert source == "Redis metadata key"

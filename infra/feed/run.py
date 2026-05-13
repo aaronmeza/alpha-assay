@@ -329,9 +329,7 @@ async def _resolve_or_pin_es(
         fut = await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
         # Validate IBKR's response before trusting it. IBKR can return
         # malformed or partial data on a bad qualify; reject at the gate.
-        resolved_expiry = validate_yyyymmdd(
-            fut.lastTradeDateOrContractMonth, source="IBKR ContFuture qualify"
-        )
+        resolved_expiry = validate_yyyymmdd(fut.lastTradeDateOrContractMonth, source="IBKR ContFuture qualify")
         LOG.info(
             "ContFuture resolved ES@CME -> %s (%s)",
             resolved_expiry,

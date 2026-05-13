@@ -489,9 +489,7 @@ def test_resolve_front_month_future_raises_on_timeout():
     adapter = _make_adapter(ib=mock_ib)
 
     async def _run():
-        return await adapter.resolve_front_month_future(
-            symbol="ES", exchange="CME", currency="USD"
-        )
+        return await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
 
     # Temporarily lower the timeout so the test completes in <1s.
     with patch("alpha_assay.data.ibkr_adapter.FRONT_MONTH_QUALIFY_TIMEOUT_SECONDS", 0.1):
