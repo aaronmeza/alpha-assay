@@ -61,14 +61,15 @@ Environment
                              ``/app/runs/paper-live``. Set to a temp
                              path in tests/CI. Empty string disables
                              trade logging.
-``ES_EXPIRY``                Front-month contract code, ``YYYYMMDD``.
-                             Hardcoded fallback ``20260618`` (ESM6,
-                             E-mini S&P June 2026; verified via
-                             ContFuture qualify on 2026-04-28). The
-                             short YYYYMM form is rejected by IBKR with
-                             "No security definition has been found".
-                             Update on each quarterly roll; this is a
-                             documented staleness risk.
+``ES_EXPIRY``                Emergency override for the front-month
+                             contract code, ``YYYYMMDD``. When set,
+                             this value is used directly and Redis is
+                             not consulted. When unset (normal
+                             operation), the resolved expiry is read
+                             from the Redis metadata key written by
+                             ibkr-feed at startup. If neither is
+                             available at runtime the process fails
+                             closed with ``FrontMonthMissingError``.
 
 The script is invoked directly by the the deployment host ``paper-trader`` compose
 service. No CLI parser; everything is env-driven so the compose file
@@ -78,6 +79,7 @@ stays the canonical config surface.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import signal
@@ -86,13 +88,17 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import redis as redis_pkg
 
 import pandas as pd
 from prometheus_client import start_http_server
 
 from alpha_assay.bus.consumer import Consumer
 from alpha_assay.bus.streams import stream_name_for_bars, stream_name_for_ticks
+from alpha_assay.data.front_month import FrontMonthMissingError, read_front_month
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.exec.ibkr import ExecMode, IBKRExecAdapter
 from alpha_assay.exec.trade_log import TradeLog, TradeRecord
@@ -100,7 +106,6 @@ from alpha_assay.observability import metrics as M
 
 HEARTBEAT_INTERVAL_SECONDS = 30
 DRAIN_TIMEOUT_SECONDS = 20
-DEFAULT_ES_EXPIRY = "20260618"  # ESM6 (June 2026 E-mini S&P); documented staleness risk on roll.
 
 # Default runs directory inside the container. Override via RUNS_DIR env var.
 # Outside container (local dev / CI) set RUNS_DIR to a temp path.
@@ -122,7 +127,9 @@ class DryrunConfig:
     ibkr_client_id: int
     ibkr_account: str
     metrics_port: int
-    es_expiry: str
+    # None when ES_EXPIRY env var is unset; resolved to a concrete expiry
+    # via _resolve_es_expiry() after the Redis client is available.
+    es_expiry: str | None
     duration_seconds: int
     # Bus-consumer mode: if set, reads bars/ticks from the Redis bus
     # instead of subscribing directly to IBKR. Format: redis://host:port/db
@@ -136,19 +143,52 @@ class DryrunConfig:
 def load_config_from_env() -> DryrunConfig:
     """Resolve all dry-run configuration from environment variables.
 
+    ``es_expiry`` is set to the ``ES_EXPIRY`` env var when present (emergency
+    override), or ``None`` when unset. The ``None`` case means the caller must
+    call ``_resolve_es_expiry(redis_client)`` after a Redis connection is
+    available to populate the field via ``dataclasses.replace``.
+
     See module docstring for the per-variable defaults and meaning.
     """
+    env_expiry = os.environ.get("ES_EXPIRY", "").strip() or None
     return DryrunConfig(
         ibkr_host=os.environ.get("IBKR_HOST", "127.0.0.1"),
         ibkr_port=int(os.environ.get("IBKR_PORT", "4002")),
         ibkr_client_id=int(os.environ.get("IBKR_CLIENT_ID", "1")),
         ibkr_account=os.environ.get("IBKR_ACCOUNT", ""),
         metrics_port=int(os.environ.get("METRICS_PORT", "8000")),
-        es_expiry=os.environ.get("ES_EXPIRY", DEFAULT_ES_EXPIRY),
+        es_expiry=env_expiry,
         duration_seconds=int(os.environ.get("DRYRUN_DURATION_SECONDS", "0")),
         bus_redis_url=os.environ.get("BUS_REDIS_URL", ""),
         runs_dir=os.environ.get("RUNS_DIR", DEFAULT_RUNS_DIR),
     )
+
+
+def _resolve_es_expiry(
+    redis_client: redis_pkg.Redis | None,
+) -> tuple[str, str]:
+    """Resolve the ES expiry for this session.
+
+    Returns:
+        Tuple of (expiry_value, source_label). The source label is
+        either "ES_EXPIRY env" or "Redis metadata key" - log it for
+        operator traceability.
+
+    Order: ES_EXPIRY env var (emergency override) > Redis metadata key.
+    Raises FrontMonthMissingError if neither is available.
+    """
+    override = os.environ.get("ES_EXPIRY", "").strip()
+    if override:
+        return override, "ES_EXPIRY env"
+    if redis_client is None:
+        raise FrontMonthMissingError(
+            "ES_EXPIRY env var is unset and no Redis client (BUS_REDIS_URL) - "
+            "cannot resolve ES front-month. Set ES_EXPIRY to a YYYYMMDD value, "
+            "or set BUS_REDIS_URL and ensure ibkr-feed has published the "
+            "front-month metadata key."
+        )
+    value = read_front_month(redis_client, symbol="ES", exchange="CME")
+    return value, "Redis metadata key"
 
 
 def es_contract_spec(cfg: DryrunConfig) -> dict[str, Any]:
@@ -579,21 +619,14 @@ def run(cfg: DryrunConfig) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     _LOG.info(
-        "paper-dryrun starting: ibkr=%s:%d client_id=%d metrics_port=%d es_expiry=%s "
-        "duration_seconds=%d bus_mode=%s",
+        "paper-dryrun starting: ibkr=%s:%d client_id=%d metrics_port=%d " "duration_seconds=%d bus_mode=%s",
         cfg.ibkr_host,
         cfg.ibkr_port,
         cfg.ibkr_client_id,
         cfg.metrics_port,
-        cfg.es_expiry,
         cfg.duration_seconds,
         "yes" if cfg.bus_redis_url else "no",
     )
-    if cfg.es_expiry == DEFAULT_ES_EXPIRY:
-        _LOG.warning(
-            "ES_EXPIRY not set; using hardcoded fallback %s. Update on quarterly roll.",
-            DEFAULT_ES_EXPIRY,
-        )
 
     # Start metrics endpoint BEFORE attempting the IBKR connect so
     # health probes succeed even if IBKR is unreachable.
@@ -613,6 +646,10 @@ def run(cfg: DryrunConfig) -> int:
         import redis as redis_pkg
 
         redis_client = redis_pkg.from_url(cfg.bus_redis_url)
+        # Resolve the front-month expiry now that we have a Redis client.
+        expiry, source = _resolve_es_expiry(redis_client)
+        cfg = dataclasses.replace(cfg, es_expiry=expiry)
+        _LOG.info("resolved ES expiry from %s: %s", source, expiry)
         # Build a stub exec adapter (never used in always-flat, but satisfies the
         # constructor contract so the compose stack remains uniform).
         exec_adapter_stub = object()
@@ -626,6 +663,11 @@ def run(cfg: DryrunConfig) -> int:
         return asyncio.run(_async_main(cfg, None, strategy, stop_event, bus_consumers=bus_consumers))
 
     # Direct-IBKR mode (backward-compatible default).
+    # ES_EXPIRY env var must be set when running without a bus Redis connection;
+    # _resolve_es_expiry raises FrontMonthMissingError (fails closed) if neither is available.
+    expiry, source = _resolve_es_expiry(None)
+    cfg = dataclasses.replace(cfg, es_expiry=expiry)
+    _LOG.info("resolved ES expiry from %s: %s", source, expiry)
     adapter, exec_adapter = build_adapters(cfg)
     strategy = AlwaysFlatStrategy(exec_adapter=exec_adapter, trade_log=trade_log)
 

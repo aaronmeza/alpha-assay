@@ -196,8 +196,8 @@ def test_dryrun_defaults_when_env_unset(monkeypatch):
     assert cfg.ibkr_client_id == 1
     assert cfg.ibkr_account == ""
     assert cfg.metrics_port == 8000
-    # Documented hardcoded fallback for ES front-month (June 2026 on 2026-04-27).
-    assert cfg.es_expiry == "20260618"
+    # ES_EXPIRY unset -> None; resolved via _resolve_es_expiry() after Redis connects.
+    assert cfg.es_expiry is None
     assert cfg.duration_seconds == 0
 
 
