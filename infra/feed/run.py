@@ -45,7 +45,11 @@ from zoneinfo import ZoneInfo
 import redis
 from prometheus_client import start_http_server
 
-from alpha_assay.data.front_month import read_front_month, write_front_month
+from alpha_assay.data.front_month import (
+    read_front_month,
+    validate_yyyymmdd,
+    write_front_month,
+)
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.observability import metrics as M
 from infra.feed.feed import FeedManifest, IBKRFeedDaemon, Subscription
@@ -225,7 +229,13 @@ async def _pre_open_requalify_loop(
         # --- Resolve via IBKR ---
         try:
             fut = await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
-            new_expiry = fut.lastTradeDateOrContractMonth
+            # Validate IBKR's response before using. InvalidExpiryError is a
+            # subclass of ValueError and is caught by the broad except below,
+            # so a malformed IBKR response logs a warning and skips this
+            # iteration rather than killing the loop.
+            new_expiry = validate_yyyymmdd(
+                fut.lastTradeDateOrContractMonth, source="IBKR ContFuture qualify (requalify)"
+            )
         except Exception as exc:  # noqa: BLE001 - single-iteration failure must not kill the loop
             LOG.warning("pre-open re-qualify: IBKR resolve failed (%s); retrying tomorrow", exc)
             continue
@@ -252,6 +262,8 @@ async def _pre_open_requalify_loop(
             fut.localSymbol,
         )
         try:
+            # validate_yyyymmdd already ran above; write_front_month validates
+            # again internally (defense-in-depth). Gauge int cast is safe.
             write_front_month(redis_client, symbol="ES", exchange="CME", expiry=new_expiry)
             M.front_month_expiry.labels(symbol="ES", exchange="CME").set(int(new_expiry))
         except Exception as exc:  # noqa: BLE001 - best-effort write; log and continue
@@ -307,13 +319,19 @@ async def _resolve_or_pin_es(
     es_expiry_override = os.environ.get("ES_EXPIRY", "").strip()
     if es_expiry_override:
         # Emergency override: pin to the operator-specified contract.
-        LOG.info("ES_EXPIRY override set to %s; skipping ContFuture", es_expiry_override)
-        resolved_expiry = es_expiry_override
+        # Validate before using - bad env value must fail loudly, not persist
+        # to Redis or crash later on int(...) cast.
+        resolved_expiry = validate_yyyymmdd(es_expiry_override, source="ES_EXPIRY env override")
+        LOG.info("ES_EXPIRY override set to %s; skipping ContFuture", resolved_expiry)
     else:
         # Auto-resolve via ContFuture. Exception propagates and exits the
         # daemon (watchdog restarts the container) - no error swallowing.
         fut = await adapter.resolve_front_month_future(symbol="ES", exchange="CME", currency="USD")
-        resolved_expiry = fut.lastTradeDateOrContractMonth
+        # Validate IBKR's response before trusting it. IBKR can return
+        # malformed or partial data on a bad qualify; reject at the gate.
+        resolved_expiry = validate_yyyymmdd(
+            fut.lastTradeDateOrContractMonth, source="IBKR ContFuture qualify"
+        )
         LOG.info(
             "ContFuture resolved ES@CME -> %s (%s)",
             resolved_expiry,
@@ -342,10 +360,11 @@ async def _resolve_or_pin_es(
         else:
             patched_subs.append(sub)
 
-    # Publish to Redis so consumers learn which stream is live.
+    # Validate-then-write ordering: validated above, write now, then set gauge.
+    # write_front_month also validates internally (defense-in-depth).
     write_front_month(redis_client, symbol="ES", exchange="CME", expiry=resolved_expiry)
 
-    # Expose as a Prometheus label for observability.
+    # Safe int cast: resolved_expiry is guaranteed 8 digits by validate_yyyymmdd.
     M.front_month_expiry.labels(symbol="ES", exchange="CME").set(int(resolved_expiry))
 
     return patched_subs

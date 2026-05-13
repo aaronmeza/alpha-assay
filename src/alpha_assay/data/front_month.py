@@ -11,12 +11,43 @@ per-contract stream to subscribe to.
 
 from __future__ import annotations
 
+import re
+from datetime import datetime
+
 import redis as redis_pkg
+
+_YYYYMMDD_RE = re.compile(r"^\d{8}$")
 
 
 class FrontMonthMissingError(RuntimeError):
     """Raised when a consumer reads the front-month key before
     the producer has written it (cold-start race) or after Redis loss."""
+
+
+class InvalidExpiryError(ValueError):
+    """Raised when an expiry string is not a well-formed YYYYMMDD."""
+
+
+def validate_yyyymmdd(s: str, *, source: str = "value") -> str:
+    """Validate `s` is YYYYMMDD (8 digits, parseable as a date).
+
+    Returns s unchanged on success. Raises InvalidExpiryError otherwise.
+
+    The `source` arg is included in the error message so the operator
+    knows WHERE the bad value came from (env override, IBKR, Redis read).
+    """
+    if not isinstance(s, str) or not _YYYYMMDD_RE.match(s):
+        raise InvalidExpiryError(
+            f"invalid expiry {s!r} from {source}: expected 8 digits (YYYYMMDD)"
+        )
+    try:
+        # Real-date check: ensures e.g. "20260230" (Feb 30) is rejected.
+        datetime.strptime(s, "%Y%m%d")
+    except ValueError as e:
+        raise InvalidExpiryError(
+            f"invalid expiry {s!r} from {source}: {e}"
+        ) from e
+    return s
 
 
 def front_month_redis_key(symbol: str, exchange: str) -> str:
@@ -32,6 +63,7 @@ def write_front_month(
     expiry: str,
 ) -> None:
     """Producer-side: publish the resolved front-month expiry."""
+    validate_yyyymmdd(expiry, source="write")
     r.set(front_month_redis_key(symbol, exchange), expiry)
 
 
@@ -49,4 +81,6 @@ def read_front_month(
             f"no front-month set for {symbol}@{exchange} (key {key!r}); "
             f"the producer (ibkr-feed) may not have started yet"
         )
-    return val.decode() if isinstance(val, bytes) else str(val)
+    raw = val.decode() if isinstance(val, bytes) else str(val)
+    validate_yyyymmdd(raw, source="redis read")
+    return raw

@@ -55,6 +55,11 @@ from alpha_assay.observability import metrics as M
 
 _SUPPORTED_SEC_TYPES = ("FUT", "IND", "STK")
 
+# Timeout for ContFuture qualifyContractsAsync. IB Gateway can accept the
+# TCP connection but never respond (mid-IBC-cycle, wedged request queue, etc.).
+# Without a timeout the daemon hangs forever in the qualify call.
+FRONT_MONTH_QUALIFY_TIMEOUT_SECONDS = 30.0
+
 
 class IBKRAdapterError(RuntimeError):
     """Raised by IBKRAdapter on invalid usage or state."""
@@ -258,10 +263,21 @@ class IBKRAdapter:
         with lastTradeDateOrContractMonth, localSymbol, and conId populated.
 
         Raises IBKRAdapterError if qualifyContractsAsync returns no
-        contracts (network blip, contract not found, IBKR misconfig).
+        contracts (network blip, contract not found, IBKR misconfig) or
+        if the call times out (IB Gateway unresponsive).
         """
         cf = ContFuture(symbol=symbol, exchange=exchange, currency=currency)
-        qualified = await self._ib.qualifyContractsAsync(cf)
+        try:
+            qualified = await asyncio.wait_for(
+                self._ib.qualifyContractsAsync(cf),
+                timeout=FRONT_MONTH_QUALIFY_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            raise IBKRAdapterError(
+                f"ContFuture qualify timed out after "
+                f"{FRONT_MONTH_QUALIFY_TIMEOUT_SECONDS}s for {symbol}@{exchange} ({currency}); "
+                f"IB Gateway may be unresponsive"
+            ) from None
         if not qualified:
             raise IBKRAdapterError(
                 f"no qualified front-month for {symbol}@{exchange} ({currency}); "

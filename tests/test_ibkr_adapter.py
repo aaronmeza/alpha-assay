@@ -473,6 +473,32 @@ def test_resolve_front_month_future_raises_on_empty_qualify():
         asyncio.run(_run())
 
 
+def test_resolve_front_month_future_raises_on_timeout():
+    """If qualifyContractsAsync hangs, we time out and raise IBKRAdapterError."""
+    from unittest.mock import patch
+
+    from alpha_assay.data.ibkr_adapter import IBKRAdapterError
+
+    mock_ib = MagicMock(name="IB")
+
+    async def _hang(*args, **kwargs):
+        await asyncio.sleep(60)  # would hang forever without timeout
+
+    mock_ib.qualifyContractsAsync = AsyncMock(side_effect=_hang)
+
+    adapter = _make_adapter(ib=mock_ib)
+
+    async def _run():
+        return await adapter.resolve_front_month_future(
+            symbol="ES", exchange="CME", currency="USD"
+        )
+
+    # Temporarily lower the timeout so the test completes in <1s.
+    with patch("alpha_assay.data.ibkr_adapter.FRONT_MONTH_QUALIFY_TIMEOUT_SECONDS", 0.1):
+        with pytest.raises(IBKRAdapterError, match="timed out"):
+            asyncio.run(_run())
+
+
 # --- / boundary ---------------------------------------
 
 

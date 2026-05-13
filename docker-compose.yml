@@ -57,6 +57,11 @@ services:
     env_file:
       - path: .env.secrets
         required: false
+    depends_on:
+      redis:
+        condition: service_healthy
+      ibkr-feed:
+        condition: service_healthy
     ports:
       # host -> container. 127.0.0.1 only - operator's access layer
       # decides what reaches it.
@@ -142,6 +147,11 @@ services:
     env_file:
       - path: .env.secrets
         required: false
+    depends_on:
+      redis:
+        condition: service_healthy
+      ibkr-feed:
+        condition: service_healthy
     command: ["python", "-u", "/app/infra/recorders/ibkr_es_bars/run.py"]
     ports:
       - "127.0.0.1:18002:8002"

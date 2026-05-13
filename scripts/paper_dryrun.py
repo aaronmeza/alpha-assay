@@ -98,7 +98,11 @@ from prometheus_client import start_http_server
 
 from alpha_assay.bus.consumer import Consumer
 from alpha_assay.bus.streams import stream_name_for_bars, stream_name_for_ticks
-from alpha_assay.data.front_month import FrontMonthMissingError, read_front_month
+from alpha_assay.data.front_month import (
+    FrontMonthMissingError,
+    read_front_month,
+    validate_yyyymmdd,
+)
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.exec.ibkr import ExecMode, IBKRExecAdapter
 from alpha_assay.exec.trade_log import TradeLog, TradeRecord
@@ -164,22 +168,35 @@ def load_config_from_env() -> DryrunConfig:
     )
 
 
-def _resolve_es_expiry(
+def _resolve_es_expiry_with_wait(
     redis_client: redis_pkg.Redis | None,
+    *,
+    max_wait_seconds: float = 60.0,
+    poll_interval_seconds: float = 5.0,
 ) -> tuple[str, str]:
-    """Resolve the ES expiry for this session.
+    """Resolve ES expiry, polling Redis for up to max_wait_seconds.
+
+    Env-override path is checked first (instant, validated). If env is
+    unset and Redis is provided, poll the key for up to max_wait_seconds
+    before giving up. Handles the cold-start race where the consumer boots
+    before ibkr-feed has written the metadata key.
 
     Returns:
-        Tuple of (expiry_value, source_label). The source label is
-        either "ES_EXPIRY env" or "Redis metadata key" - log it for
-        operator traceability.
+        Tuple of (expiry_value, source_label). Log source for operator
+        traceability.
 
-    Order: ES_EXPIRY env var (emergency override) > Redis metadata key.
-    Raises FrontMonthMissingError if neither is available.
+    Raises:
+        InvalidExpiryError: env override is set but not a valid YYYYMMDD.
+        FrontMonthMissingError: neither env nor Redis key available after
+            max_wait_seconds.
     """
+    import time
+
     override = os.environ.get("ES_EXPIRY", "").strip()
     if override:
-        return override, "ES_EXPIRY env"
+        # Validate before using - bad env value must fail loudly.
+        validated = validate_yyyymmdd(override, source="ES_EXPIRY env")
+        return validated, "ES_EXPIRY env"
     if redis_client is None:
         raise FrontMonthMissingError(
             "ES_EXPIRY env var is unset and no Redis client (BUS_REDIS_URL) - "
@@ -187,8 +204,31 @@ def _resolve_es_expiry(
             "or set BUS_REDIS_URL and ensure ibkr-feed has published the "
             "front-month metadata key."
         )
-    value = read_front_month(redis_client, symbol="ES", exchange="CME")
-    return value, "Redis metadata key"
+    deadline = time.monotonic() + max_wait_seconds
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            # read_front_month validates the stored value internally (Fix A).
+            value = read_front_month(redis_client, symbol="ES", exchange="CME")
+            return value, "Redis metadata key"
+        except FrontMonthMissingError as e:
+            last_err = e
+            time.sleep(poll_interval_seconds)
+    raise FrontMonthMissingError(
+        f"ES front-month not in Redis after {max_wait_seconds:.0f}s wait; "
+        f"ibkr-feed may not have started or failed to resolve. Last error: {last_err}"
+    )
+
+
+def _resolve_es_expiry(
+    redis_client: redis_pkg.Redis | None,
+) -> tuple[str, str]:
+    """Resolve the ES expiry for this session.
+
+    Delegates to _resolve_es_expiry_with_wait with default timeouts.
+    Kept for backward-compat with callers that use this name directly.
+    """
+    return _resolve_es_expiry_with_wait(redis_client)
 
 
 def es_contract_spec(cfg: DryrunConfig) -> dict[str, Any]:
