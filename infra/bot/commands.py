@@ -17,7 +17,6 @@ class BotContext:
     docker_client: Any
     healthcheck_script: str
     prom_url: str
-    feed_pause_redis: Any
     restartable_services: list[str]
 
 
@@ -85,15 +84,3 @@ def cmd_restart(cmd: Command, ctx: BotContext) -> str:
         return f"container not found: {name} ({e})"
     container.restart()
     return f"{name} restarted"
-
-
-def cmd_feed(cmd: Command, ctx: BotContext) -> str:
-    """Pause / resume the producer via a Redis flag the feed checks."""
-    if not cmd.args or cmd.args[0] not in ("pause", "resume"):
-        return "usage: /feed pause | /feed resume"
-    if cmd.args[0] == "pause":
-        ctx.feed_pause_redis.set("alpha_assay:feed_paused", "1")
-        return "feed paused - ibkr-feed will drop new events until resumed"
-    else:
-        ctx.feed_pause_redis.delete("alpha_assay:feed_paused")
-        return "feed resumed"
