@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 from infra.bot.commands import (
     BotContext,
-    cmd_feed,
     cmd_health,
     cmd_logs,
     cmd_restart,
@@ -20,7 +19,6 @@ def _ctx(**overrides):
         "docker_client": MagicMock(),
         "healthcheck_script": "/bin/true",
         "prom_url": "http://prometheus:9090",
-        "feed_pause_redis": MagicMock(),
         "restartable_services": ["es-bars-recorder", "ibkr-feed"],
     }
     base.update(overrides)
@@ -92,18 +90,3 @@ def test_restart_calls_docker_for_allowlisted():
     assert "restarted" in out.lower()
 
 
-def test_feed_pause_sets_redis_flag():
-    redis_mock = MagicMock()
-    cmd_feed(Command(name="feed", args=["pause"]), _ctx(feed_pause_redis=redis_mock))
-    redis_mock.set.assert_called_with("alpha_assay:feed_paused", "1")
-
-
-def test_feed_resume_clears_redis_flag():
-    redis_mock = MagicMock()
-    cmd_feed(Command(name="feed", args=["resume"]), _ctx(feed_pause_redis=redis_mock))
-    redis_mock.delete.assert_called_with("alpha_assay:feed_paused")
-
-
-def test_feed_unknown_subcommand():
-    out = cmd_feed(Command(name="feed", args=["explode"]), _ctx())
-    assert "usage" in out.lower()

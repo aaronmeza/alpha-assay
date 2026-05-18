@@ -18,11 +18,9 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import docker as docker_pkg
-import redis as redis_pkg
 
 from infra.bot.commands import (
     BotContext,
-    cmd_feed,
     cmd_health,
     cmd_logs,
     cmd_restart,
@@ -85,19 +83,16 @@ def main() -> int:
     allowed = {int(x) for x in os.environ["ALLOWED_CHAT_IDS"].split(",") if x.strip()}
     restartable = [s.strip() for s in os.environ.get("RESTARTABLE_SERVICES", "").split(",") if s.strip()]
     healthcheck_script = os.environ["HEALTHCHECK_SCRIPT"]
-    redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")
     prom_url = os.environ.get("PROM_URL", "http://prometheus:9090")
     offset_path = Path(os.environ.get("OFFSET_PATH", "/var/lib/alphaassay/bot/offset"))
     offset_path.parent.mkdir(parents=True, exist_ok=True)
 
     docker_client = docker_pkg.from_env()
-    feed_redis = redis_pkg.from_url(redis_url)
 
     ctx = BotContext(
         docker_client=docker_client,
         healthcheck_script=healthcheck_script,
         prom_url=prom_url,
-        feed_pause_redis=feed_redis,
         restartable_services=restartable,
     )
 
@@ -106,7 +101,6 @@ def main() -> int:
     registry.register("status", cmd_status)
     registry.register("logs", cmd_logs)
     registry.register("restart", cmd_restart, destructive=True)
-    registry.register("feed", cmd_feed, destructive=True)
 
     pending: dict[int, _PendingConfirm] = {}
 
