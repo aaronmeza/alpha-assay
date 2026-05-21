@@ -23,8 +23,18 @@ data/recorder/
 # local-only operator notes / agent instructions
 CLAUDE.md
 CLAUDE.local.md
+.claude/
+AGENTS.md
 
 # secrets files loaded by docker-compose env_file directives
 .env.secrets
 .env.alerts
 .env.*
+
+# Beads / Dolt runtime state (bd config under .beads/ stays tracked; runtime ignored)
+.dolt/
+.beads-credential-key
+.beads/issues.jsonl
+.beads/interactions.jsonl
+.beads/metadata.json
+.beads/migration-state.json
