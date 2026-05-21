@@ -341,18 +341,12 @@ def test_subscribe_breadth_yields_tick_events():
     _ = fake_contract  # kept for readability
 
 
-def test_subscribe_breadth_uses_bid_ask_midpoint_when_last_is_nan():
-    """Regression test for the AD-NYSE field-precedence bug.
+def _run_breadth_tick(symbol: str, tick_kwargs: dict) -> dict | None:
+    """Drive one ``subscribe_breadth`` tick and return the yielded event.
 
-    AD-NYSE never populates ``.last`` (it is not a tradeable instrument);
-    its live integer value comes through ``.bid`` and ``.ask`` as a
-    tight quote pair. Falling through to ``.close`` returns the
-    previous-session close (stale), which silently broke any breadth-aware strategy's
-    bias filter on first real-Gateway deployment 2026-04-28. This test
-    pins the bid/ask midpoint behavior so the regression cannot return.
+    Returns ``None`` if the adapter emitted no event (the tick was
+    skipped) within the timeout.
     """
-    import math
-
     ib = MagicMock(name="IB")
     ib.pendingTickersEvent = _FakeEvent()
     created = {}
@@ -365,32 +359,76 @@ def test_subscribe_breadth_uses_bid_ask_midpoint_when_last_is_nan():
     adapter = IBKRAdapter(ib=ib)
 
     async def _run():
-        gen = adapter.subscribe_breadth(symbol="AD-NYSE")
+        gen = adapter.subscribe_breadth(symbol=symbol)
         task = asyncio.ensure_future(gen.__anext__())
         await asyncio.sleep(0)
-
-        # Real-IBKR shape for AD-NYSE: last is NaN, close is stale, bid/ask
-        # carry the live value. Live AD = (1259 + 1264) / 2 = 1261.5.
-        tick = SimpleNamespace(
-            contract=created["contract"],
-            last=math.nan,
-            close=209.0,  # previous-session close, must NOT be picked
-            bid=1259.0,
-            ask=1264.0,
-            time=pd.Timestamp("2026-04-28T19:30:00", tz="UTC"),
-        )
-        ib.pendingTickersEvent.fire([tick])
-
-        ev = await asyncio.wait_for(task, timeout=1.0)
+        ib.pendingTickersEvent.fire([SimpleNamespace(contract=created["contract"], **tick_kwargs)])
+        try:
+            ev = await asyncio.wait_for(task, timeout=0.25)
+        except TimeoutError:
+            ev = None
         await gen.aclose()
         return ev
 
-    event = asyncio.run(_run())
-    assert event["symbol"] == "AD-NYSE"
-    assert event["value"] == 1261.5, (
-        f"expected bid/ask midpoint 1261.5, got {event['value']} "
-        "(if 209.0 the recorder regressed to stale-close fallback)"
+    return asyncio.run(_run())
+
+
+def test_subscribe_breadth_ad_nyse_is_advances_minus_declines():
+    """AD-NYSE value is advancers - decliners = bid - ask.
+
+    IBKR's AD-NYSE index has ``.last == NaN`` (not tradeable). It packs
+    the advancing-issue count in ``.bid`` and the declining-issue count in
+    ``.ask`` - these are two *separate counts*, not a tight quote pair, so
+    the breadth value ``$ADD`` is their difference (bid - ask), NOT their
+    midpoint. Real-Gateway snapshot (2026-05-21 close): bid=1378 advancing,
+    ask=1084 declining, net +294.
+
+    Regression guard for the 2026-05-21 Phase-R finding: the prior code
+    took ``(bid + ask) / 2``, recording half the total issues traded
+    (~1050-1416, always positive, monotonic climb) instead of the net,
+    which made the ``$ADD > +1100`` bias gate carry zero information.
+    """
+    event = _run_breadth_tick(
+        "AD-NYSE",
+        dict(
+            last=float("nan"),
+            close=2459.0,  # IBKR AD-NYSE close = advancers + decliners total; must NOT be picked
+            bid=1378.0,
+            ask=1084.0,
+            time=pd.Timestamp("2026-05-21T19:30:00", tz="UTC"),
+        ),
     )
+    assert event is not None and event["symbol"] == "AD-NYSE"
+    assert event["value"] == 294.0, (
+        f"expected net advance-decline 294.0 (bid 1378 - ask 1084), got {event['value']} "
+        "(1771.0 = the old midpoint bug; 2459.0 = stale close-total fallback)"
+    )
+
+
+def test_subscribe_breadth_ad_nyse_goes_negative_on_weak_breadth():
+    """Net advance-decline goes negative when decliners outnumber advancers."""
+    event = _run_breadth_tick(
+        "AD-NYSE",
+        dict(
+            last=float("nan"), close=2459.0, bid=900.0, ask=1500.0, time=pd.Timestamp("2026-05-21T19:30:00", tz="UTC")
+        ),
+    )
+    assert event is not None
+    assert event["value"] == -600.0, f"expected -600.0 (bid 900 - ask 1500), got {event['value']}"
+
+
+def test_subscribe_breadth_ad_nyse_skips_when_no_live_quote():
+    """When the market is closed IBKR sends bid=ask=-1 (no quote).
+
+    The adapter must skip the tick rather than emit a bogus 0.0 (or fall
+    back to the stale close-total). Confirmed shape: post-close AD-NYSE
+    returns bid=-1.0, ask=-1.0.
+    """
+    event = _run_breadth_tick(
+        "AD-NYSE",
+        dict(last=float("nan"), close=2459.0, bid=-1.0, ask=-1.0, time=pd.Timestamp("2026-05-21T23:30:00", tz="UTC")),
+    )
+    assert event is None, f"expected no event when bid/ask are the -1 no-quote sentinel, got {event}"
 
 
 # --- observability -----------------------------------------------------
