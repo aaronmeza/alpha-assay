@@ -55,6 +55,50 @@ from alpha_assay.observability import metrics as M
 
 _SUPPORTED_SEC_TYPES = ("FUT", "IND", "STK")
 
+# Advance/decline breadth indices. IBKR delivers these with ``.last == NaN``
+# (not tradeable) and packs the advancing-issue count in ``.bid`` and the
+# declining-issue count in ``.ask``. The net advance-decline value ($ADD) is
+# advancers - decliners = bid - ask. (.close is advancers + decliners, the
+# issues *total*, not the net - never use it for these symbols.)
+_ADVANCE_DECLINE_SYMBOLS = frozenset({"AD-NYSE", "AD-NASD"})
+
+# IBKR sends bid == ask == -1.0 for an index with no live quote (pre/post
+# market). Advancing/declining counts are non-negative, so any value below
+# this floor is the no-quote sentinel and the tick is skipped.
+_MIN_VALID_COUNT = 0.0
+
+
+def _extract_breadth_value(ticker: Any, symbol: str) -> float | None:
+    """Extract the breadth value for an IBKR index ticker, or None to skip.
+
+    Two distinct extraction rules, by instrument:
+
+    * Advance/decline indices (``AD-NYSE``): ``.bid`` and ``.ask`` carry the
+      advancing and declining issue counts respectively; the value is their
+      difference (advancers - decliners). ``.last``/``.close`` are NaN / the
+      issues-total and must never be used. Returns None when no live quote is
+      present (IBKR sends bid == ask == -1.0 outside market hours).
+    * TICK-style indices (``TICK-NYSE``): the value streams as a trade tick on
+      ``.last``, with the previous-session ``.close`` as a last-resort fallback.
+    """
+    if symbol in _ADVANCE_DECLINE_SYMBOLS:
+        bid = getattr(ticker, "bid", None)
+        ask = getattr(ticker, "ask", None)
+        if bid is None or ask is None or pd.isna(bid) or pd.isna(ask):
+            return None
+        # Negative counts are IBKR's no-live-quote sentinel (-1), not real data.
+        if bid < _MIN_VALID_COUNT or ask < _MIN_VALID_COUNT:
+            return None
+        return float(bid) - float(ask)
+
+    last = getattr(ticker, "last", None)
+    if last is None or pd.isna(last):
+        last = getattr(ticker, "close", None)
+    if last is None or pd.isna(last):
+        return None
+    return float(last)
+
+
 # Timeout for ContFuture qualifyContractsAsync. IB Gateway can accept the
 # TCP connection but never respond (mid-IBC-cycle, wedged request queue, etc.).
 # Without a timeout the daemon hangs forever in the qualify call.
@@ -447,26 +491,13 @@ class IBKRAdapter:
             for t in tickers:
                 if getattr(t, "contract", None) is not contract:
                     continue
-                # Field-precedence for IBKR breadth indices:
-                #   TICK-NYSE streams updates via ``.last`` (treated as a
-                #   trade tick).
-                #   AD-NYSE has ``.last == NaN`` (not a tradeable). Its
-                #   live value comes through ``.bid`` and ``.ask`` as a
-                #   tight quote pair around the current advance-decline
-                #   integer. We use the bid/ask midpoint when ``.last``
-                #   is unavailable.
-                #   ``.close`` is the previous-session close (stale)
-                #   and only a last-resort fallback so we don't write
-                #   stale-stuck values to parquet shards.
-                last = getattr(t, "last", None)
-                if last is None or pd.isna(last):
-                    bid = getattr(t, "bid", None)
-                    ask = getattr(t, "ask", None)
-                    if bid is not None and ask is not None and not pd.isna(bid) and not pd.isna(ask):
-                        last = (float(bid) + float(ask)) / 2.0
-                if last is None or pd.isna(last):
-                    last = getattr(t, "close", None)
-                if last is None or pd.isna(last):
+                # Value extraction differs by instrument (see
+                # _extract_breadth_value): TICK-style indices use ``.last``;
+                # advance/decline indices use ``.bid`` - ``.ask`` (advancers
+                # minus decliners). Returns None to skip ticks with no usable
+                # value (e.g. AD-NYSE's bid == ask == -1 no-quote sentinel).
+                value = _extract_breadth_value(t, symbol)
+                if value is None:
                     continue
                 ts = getattr(t, "time", None) or pd.Timestamp.utcnow()
                 queue.put_nowait(
@@ -476,7 +507,7 @@ class IBKRAdapter:
                             if pd.Timestamp(ts).tzinfo is not None
                             else pd.Timestamp(ts, tz="UTC")
                         ),
-                        "value": float(last),
+                        "value": value,
                         "symbol": symbol,
                     }
                 )
