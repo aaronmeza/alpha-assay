@@ -906,6 +906,29 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "type": "stat",
+      "id": 35,
+      "title": "Front-month expiry (resolved)",
+      "description": "alpha_assay_front_month_expiry: the ES front-month contract expiry (YYYYMMDD) the feed resolved via ContFuture. Re-resolves daily; watch it roll at each quarterly boundary.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 95
+      },
+      "targets": [
+        {
+          "expr": "alpha_assay_front_month_expiry",
+          "legendFormat": "{{symbol}} @ {{exchange}}",
+          "refId": "A"
+        }
+      ]
     }
   ]
 }

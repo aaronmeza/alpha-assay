@@ -88,5 +88,3 @@ def test_restart_calls_docker_for_allowlisted():
     out = cmd_restart(Command(name="restart", args=["es-bars-recorder"]), _ctx(docker_client=docker_client))
     container.restart.assert_called_once()
     assert "restarted" in out.lower()
-
-
