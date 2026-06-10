@@ -87,6 +87,10 @@ trades_total = Counter(
 
 equity_points = Gauge(f"{_PREFIX}equity_points", "Current equity in instrument points.")
 session_pnl_points = Gauge(f"{_PREFIX}session_pnl_points", "Session PnL in points.")
+realized_pnl_dollars = Gauge(
+    f"{_PREFIX}realized_pnl_dollars",
+    "Cumulative realized P&L in account-currency dollars since process start.",
+)
 drawdown_points = Gauge(
     f"{_PREFIX}drawdown_points",
     "Current drawdown from session high, in points.",

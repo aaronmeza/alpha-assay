@@ -477,6 +477,28 @@
       ]
     },
     {
+      "type": "timeseries",
+      "id": 36,
+      "title": "Realized PnL (USD, cumulative since process start)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 60
+      },
+      "targets": [
+        {
+          "expr": "alpha_assay_realized_pnl_dollars",
+          "legendFormat": "realized_pnl_usd",
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "type": "row",
       "id": 104,
       "title": "Health and session state",

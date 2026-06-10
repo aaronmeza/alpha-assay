@@ -162,3 +162,74 @@ def test_strategy_on_bar_increments_counter_in_bus_mode(tmp_path: Path):
     }
     strategy.on_bar(bar, feed_label="es")
     assert strategy.bars_seen == 1
+
+
+# --- strategy-mode env plumbing (back-compat default: always-flat) -------
+
+
+def test_load_config_paper_strategy_defaults_empty(monkeypatch):
+    """Without PAPER_STRATEGY the config selects the always-flat path."""
+    module = _load_script_module()
+
+    for key in ("PAPER_STRATEGY", "PAPER_STRATEGY_CONFIG", "PAPER_STARTING_BALANCE"):
+        monkeypatch.delenv(key, raising=False)
+
+    cfg = module.load_config_from_env()
+    assert cfg.paper_strategy == ""
+    assert cfg.paper_strategy_config == ""
+    assert cfg.paper_starting_balance == 100_000.0
+
+
+def test_load_config_paper_strategy_from_env(monkeypatch):
+    module = _load_script_module()
+
+    monkeypatch.setenv("PAPER_STRATEGY", "my_pkg.strategies:MyStrategy")
+    monkeypatch.setenv("PAPER_STRATEGY_CONFIG", "/etc/strategy/config.yaml")
+    monkeypatch.setenv("PAPER_STARTING_BALANCE", "250000")
+
+    cfg = module.load_config_from_env()
+    assert cfg.paper_strategy == "my_pkg.strategies:MyStrategy"
+    assert cfg.paper_strategy_config == "/etc/strategy/config.yaml"
+    assert cfg.paper_starting_balance == 250_000.0
+
+
+def test_paper_strategy_requires_bus_mode():
+    """Strategy mode without BUS_REDIS_URL must fail closed, before any
+    side effects (no metrics port bound, no IBKR connection attempted)."""
+    import pytest
+
+    module = _load_script_module()
+
+    cfg = module.DryrunConfig(
+        ibkr_host="127.0.0.1",
+        ibkr_port=4002,
+        ibkr_client_id=1,
+        ibkr_account="",
+        metrics_port=8000,
+        es_expiry="20260618",
+        duration_seconds=0,
+        bus_redis_url="",
+        paper_strategy="my_pkg.strategies:MyStrategy",
+        paper_strategy_config="/etc/strategy/config.yaml",
+    )
+    with pytest.raises(RuntimeError, match="BUS_REDIS_URL"):
+        module.run(cfg)
+
+
+def test_build_ad_consumer_points_at_ad_stream():
+    module = _load_script_module()
+    redis_client = fakeredis.FakeRedis()
+
+    cfg = module.DryrunConfig(
+        ibkr_host="127.0.0.1",
+        ibkr_port=4002,
+        ibkr_client_id=1,
+        ibkr_account="",
+        metrics_port=8000,
+        es_expiry="20260618",
+        duration_seconds=0,
+        bus_redis_url="redis://localhost:6379/0",
+    )
+    ad_c = module._build_ad_consumer(cfg, redis_client)
+    assert ad_c._stream == "ticks.ad-nyse"
+    assert ad_c._cursor == "$"
