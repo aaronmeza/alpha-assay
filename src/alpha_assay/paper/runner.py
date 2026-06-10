@@ -196,6 +196,18 @@ class PaperStrategyRunner:
         self._position: _OpenPosition | None = None
         # RLock: a synchronous exec fake may invoke handle_fill from
         # within place_bracket_order, which runs under this lock.
+        #
+        # Threading contract for the live paper path: bus-consumer
+        # worker threads drive on_bar/on_breadth_tick, which take this
+        # lock and may block on exec calls marshaled onto the IB loop
+        # thread (exec/loop_marshal.IBLoopThread). handle_fill arrives
+        # on the exec adapter's FillDispatcher thread - NEVER the IB
+        # loop thread - so taking this lock here can never wedge the
+        # loop that serves those marshaled calls (lock-inversion
+        # deadlock). Invariant: handle_fill must stay free of exec-
+        # adapter calls; if one is ever added it only blocks the
+        # dispatcher thread (safe), but it delays subsequent fills -
+        # prefer deferring broker actions to the bar-driven paths.
         self._lock = threading.RLock()
 
         # Heartbeat counters (same contract as the always-flat strategy).

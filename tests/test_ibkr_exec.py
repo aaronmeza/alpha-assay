@@ -626,3 +626,161 @@ def test_live_check_cli_8_case_matrix(
         assert (
             named == expected_missing
         ), f"case {case_name}: missing-locks line names {named}, expected {expected_missing}"
+
+
+# ---------------------------------------------------------------------
+# Loop-affinity marshaling (loop_owner): every ib_insync interaction
+# must execute on the connection-owning loop thread, regardless of the
+# calling thread. See alpha_assay.exec.loop_marshal for the model.
+# ---------------------------------------------------------------------
+
+
+@pytest.fixture()
+def ib_loop():
+    from alpha_assay.exec.loop_marshal import IBLoopThread
+
+    lt = IBLoopThread(name="exec-test-ib-loop")
+    lt.start()
+    yield lt
+    lt.stop()
+
+
+def _make_loop_affine_ib(call_threads: dict):
+    """MagicMock IB that records the thread of every loop-affine call."""
+    import threading
+    from types import SimpleNamespace
+
+    ib = MagicMock(name="IB")
+    ib.isConnected.return_value = True
+    ib.client = MagicMock()
+    ib.client.getReqId.side_effect = list(range(700, 800))
+
+    def _record(name):
+        def _side_effect(*args, **kwargs):
+            call_threads.setdefault(name, []).append(threading.current_thread())
+            if name == "placeOrder":
+                # No filledEvent attr -> handler wiring is skipped.
+                return SimpleNamespace(order=args[1] if len(args) > 1 else kwargs.get("order"))
+            return []
+
+        return _side_effect
+
+    ib.placeOrder.side_effect = _record("placeOrder")
+    ib.cancelOrder.side_effect = _record("cancelOrder")
+    ib.positions.side_effect = _record("positions")
+    ib.openTrades.side_effect = _record("openTrades")
+    ib.disconnect.side_effect = _record("disconnect")
+    return ib
+
+
+def test_exec_calls_from_worker_thread_run_on_loop_owner(ib_loop):
+    """place_bracket_order / place_market_order / cancel_order /
+    position_quantity / cancel_open_orders called from a NON-owner
+    worker thread (the bus-consumer shape) must all execute their
+    ib_insync interactions on the owning loop thread."""
+    import threading
+
+    call_threads: dict = {}
+    ib = _make_loop_affine_ib(call_threads)
+    read_adapter = IBKRAdapter(ib=ib, read_only=False)
+    exec_adapter = IBKRExecAdapter(adapter=read_adapter, loop_owner=ib_loop)
+
+    errors: list = []
+
+    def worker():
+        try:
+            plan = exec_adapter.place_bracket_order(
+                contract_spec=_SPEC,
+                side="BUY",
+                quantity=1,
+                entry_type="LIMIT",
+                stop_points=4.0,
+                target_points=8.0,
+                limit_price=5000.0,
+            )
+            assert plan.parent_id == 700
+            order_id = exec_adapter.place_market_order(contract_spec=_SPEC, side="SELL", quantity=1)
+            exec_adapter.cancel_order(order_id)
+            assert exec_adapter.position_quantity(_SPEC) == 0.0
+            assert exec_adapter.cancel_open_orders(_SPEC) == 0
+        except Exception as exc:  # pragma: no cover - failure detail
+            errors.append(exc)
+
+    t = threading.Thread(target=worker, name="bus-worker")
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), "exec call from worker thread hung"
+    assert errors == []
+
+    loop_thread_name = "exec-test-ib-loop"
+    assert len(call_threads["placeOrder"]) == 4  # 3 bracket children + 1 market
+    for name in ("placeOrder", "cancelOrder", "positions", "openTrades"):
+        threads = {th.name for th in call_threads[name]}
+        assert threads == {loop_thread_name}, f"{name} ran on {threads}, expected the IB loop thread"
+
+
+def test_exec_calls_without_loop_owner_stay_inline():
+    """Regression guard for the legacy path: no loop_owner -> calls
+    execute on the calling thread (tests with fakes rely on this)."""
+    import threading
+
+    call_threads: dict = {}
+    ib = _make_loop_affine_ib(call_threads)
+    read_adapter = IBKRAdapter(ib=ib, read_only=False)
+    exec_adapter = IBKRExecAdapter(adapter=read_adapter)
+
+    assert exec_adapter.position_quantity(_SPEC) == 0.0
+    assert call_threads["positions"] == [threading.current_thread()]
+
+
+def test_connect_marshals_and_fills_deliver_on_dispatcher_thread(ib_loop):
+    """connect() must run the connect coroutine ON the owned loop (the
+    transport binds to the loop current at connect time), and fill
+    callbacks must be delivered on the dispatcher thread - never the IB
+    loop thread - so a callback taking the runner lock cannot wedge the
+    loop (lock-inversion deadlock; see loop_marshal docstring)."""
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    call_threads: dict = {}
+    ib = _make_loop_affine_ib(call_threads)
+    ib.isConnected.return_value = False
+    connect_loops: list = []
+
+    async def _connect_async(**kwargs):
+        connect_loops.append(asyncio.get_running_loop())
+
+    ib.connectAsync = AsyncMock(side_effect=_connect_async)
+
+    read_adapter = IBKRAdapter(ib=ib, read_only=False)
+    exec_adapter = IBKRExecAdapter(adapter=read_adapter, loop_owner=ib_loop)
+
+    exec_adapter.connect()
+    assert connect_loops == [ib_loop.loop]
+
+    fill_threads: list = []
+    delivered = threading.Event()
+
+    def on_fill(evt):
+        fill_threads.append(threading.current_thread())
+        delivered.set()
+
+    exec_adapter.on_fill(on_fill)
+    handler = exec_adapter._make_fill_handler()
+    fake_trade = SimpleNamespace(order=SimpleNamespace(orderId=1, orderType="MKT"))
+    fake_fill = SimpleNamespace(
+        execution=SimpleNamespace(execId="E-9", time=None, shares=1.0, price=5000.0, side="BOT")
+    )
+    # Fire from the loop thread, exactly where ib_insync fires filledEvent.
+    ib_loop.call(handler, fake_trade, fake_fill)
+
+    assert delivered.wait(timeout=5), "fill callback never delivered"
+    assert fill_threads[0] is not ib_loop._thread, "fill delivered inline on the IB loop thread"
+    assert fill_threads[0] is not threading.current_thread()
+
+    ib.isConnected.return_value = True
+    exec_adapter.disconnect()
+    assert {th.name for th in call_threads["disconnect"]} == {"exec-test-ib-loop"}
+    assert exec_adapter._fill_dispatcher is None

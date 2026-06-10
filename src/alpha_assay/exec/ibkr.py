@@ -58,6 +58,12 @@ from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
+from alpha_assay.exec.loop_marshal import (
+    CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_CALL_TIMEOUT_SECONDS,
+    FillDispatcher,
+    IBLoopThread,
+)
 from alpha_assay.observability import metrics as M
 
 if TYPE_CHECKING:
@@ -204,6 +210,21 @@ class IBKRExecAdapter:
         real ids allocated from the client but skips the
         ``placeOrder`` calls. Useful for unit tests and 's
         paper-dryrun deploy sanity check.
+    loop_owner:
+        Optional :class:`~alpha_assay.exec.loop_marshal.IBLoopThread`.
+        When provided, EVERY ib_insync interaction (connect, orders,
+        cancels, position/open-order reads) is marshaled onto that
+        dedicated loop thread - ib_insync's IB/Client are not
+        thread-safe and are loop-affine (``util.getLoop()`` resolves
+        the thread-current loop; the transport and throttle timers bind
+        to it). Callers block on the marshaled result with a hard
+        timeout and fail loudly on expiry. Fill events, which ib_insync
+        fires on the loop thread, are handed to a dedicated dispatcher
+        thread so a fill callback can never wedge the IB loop (see
+        ``loop_marshal.FillDispatcher``). When None (default), calls
+        execute inline on the calling thread - correct only when the
+        caller already owns the connection's loop (tests with fakes,
+        dry-run paths that never touch ib_insync).
     """
 
     def __init__(
@@ -212,13 +233,25 @@ class IBKRExecAdapter:
         adapter: IBKRAdapter,
         mode: ExecMode = ExecMode.PAPER,
         dry_run: bool = False,
+        loop_owner: IBLoopThread | None = None,
     ) -> None:
         self._adapter = adapter
         self._ib = adapter._ib  # reuse the same client; see docstring
         self.mode = mode
         self.dry_run = dry_run
+        self._loop_owner = loop_owner
+        self._fill_dispatcher: FillDispatcher | None = None
         self._fill_callbacks: list[Callable[[dict[str, Any]], None]] = []
         _update_exec_mode_gauge(mode)
+
+    # --- marshaling -------------------------------------------------------
+
+    def _execute(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        """Run ``fn`` on the connection-owning loop thread when one is
+        configured; inline otherwise. Blocks for the result."""
+        if self._loop_owner is None:
+            return fn(*args, **kwargs)
+        return self._loop_owner.call(fn, *args, timeout=DEFAULT_CALL_TIMEOUT_SECONDS, **kwargs)
 
     # --- lifecycle ------------------------------------------------------
 
@@ -228,14 +261,38 @@ class IBKRExecAdapter:
         Logs the active mode at WARNING so it is visible even in quiet
         log configurations. Paper still submits orders; the IBKR paper
         account handles execution.
+
+        With a ``loop_owner``, the connect coroutine runs ON the owned
+        loop thread so ib_insync binds the transport to that loop (the
+        loop runs forever, so order-status and fill messages are
+        actually delivered). The fill dispatcher is started here too.
         """
         _LOG.warning("IBKRExecAdapter connect: mode=%s", self.mode.value.upper())
+        if self._loop_owner is not None:
+            if self._fill_dispatcher is None:
+                self._fill_dispatcher = FillDispatcher(self._dispatch_fill)
+                self._fill_dispatcher.start()
+            if not self._adapter.is_connected:
+                self._loop_owner.run_coro(
+                    self._adapter.connect_async(),
+                    timeout=CONNECT_TIMEOUT_SECONDS,
+                    label="IBKRAdapter.connect_async",
+                )
+            return
         if not self._adapter.is_connected:
             # Re-use the read adapter's connection path so connection
             # counters and the ibkr_connected gauge stay single-source.
             self._adapter.connect()
 
     def disconnect(self) -> None:
+        if self._loop_owner is not None:
+            try:
+                self._execute(self._adapter.disconnect)
+            finally:
+                if self._fill_dispatcher is not None:
+                    self._fill_dispatcher.stop()
+                    self._fill_dispatcher = None
+            return
         self._adapter.disconnect()
 
     # --- orders ---------------------------------------------------------
@@ -261,7 +318,33 @@ class IBKRExecAdapter:
         Returns the ``OrderPlan`` with the computed prices and the
         three order ids. If ``self.dry_run`` is True, the plan is
         built but ``placeOrder`` is never called.
+
+        Safe to call from any thread when a ``loop_owner`` is
+        configured: the body executes on the connection-owning loop
+        thread and this method blocks for the result.
         """
+        return self._execute(
+            self._place_bracket_order_on_loop,
+            contract_spec=contract_spec,
+            side=side,
+            quantity=quantity,
+            entry_type=entry_type,
+            stop_points=stop_points,
+            target_points=target_points,
+            limit_price=limit_price,
+        )
+
+    def _place_bracket_order_on_loop(
+        self,
+        *,
+        contract_spec: dict[str, Any],
+        side: str,
+        quantity: int,
+        entry_type: str,
+        stop_points: float,
+        target_points: float,
+        limit_price: float | None = None,
+    ) -> OrderPlan:
         if side not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
         if entry_type not in ("MARKET", "LIMIT"):
@@ -377,6 +460,9 @@ class IBKRExecAdapter:
         ib_insync's ``cancelOrder`` takes an Order object rather than
         an id; we construct a minimal Order with the id set.
         """
+        self._execute(self._cancel_order_on_loop, order_id)
+
+    def _cancel_order_on_loop(self, order_id: int) -> None:
         from ib_insync import Order
 
         self._ib.cancelOrder(Order(orderId=order_id))
@@ -395,7 +481,24 @@ class IBKRExecAdapter:
         delivered through the same ``on_fill`` callbacks as bracket
         children. When ``dry_run`` is True the id is allocated but
         ``placeOrder`` is skipped.
+
+        Safe to call from any thread when a ``loop_owner`` is
+        configured (see ``place_bracket_order``).
         """
+        return self._execute(
+            self._place_market_order_on_loop,
+            contract_spec=contract_spec,
+            side=side,
+            quantity=quantity,
+        )
+
+    def _place_market_order_on_loop(
+        self,
+        *,
+        contract_spec: dict[str, Any],
+        side: str,
+        quantity: int,
+    ) -> int:
         if side not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
         if quantity <= 0:
@@ -427,7 +530,14 @@ class IBKRExecAdapter:
         Sums across expiries deliberately: a stale position on last
         quarter's contract is still exposure the runner must not trade
         on top of.
+
+        Marshaled when a ``loop_owner`` is configured: ``IB.positions()``
+        reads client state the loop thread mutates, so even reads must
+        be loop-affine.
         """
+        return self._execute(self._position_quantity_on_loop, contract_spec)
+
+    def _position_quantity_on_loop(self, contract_spec: dict[str, Any]) -> float:
         from alpha_assay.data.ibkr_adapter import _build_contract
 
         contract = _build_contract(contract_spec)
@@ -443,7 +553,13 @@ class IBKRExecAdapter:
     def cancel_open_orders(self, contract_spec: dict[str, Any]) -> int:
         """Cancel every resting order matching the spec's symbol +
         security type. Returns the number of cancels requested.
+
+        Marshaled when a ``loop_owner`` is configured (reads
+        ``openTrades`` and submits cancels - both loop-affine).
         """
+        return self._execute(self._cancel_open_orders_on_loop, contract_spec)
+
+    def _cancel_open_orders_on_loop(self, contract_spec: dict[str, Any]) -> int:
         from alpha_assay.data.ibkr_adapter import _build_contract
 
         contract = _build_contract(contract_spec)
@@ -478,12 +594,31 @@ class IBKRExecAdapter:
         self._fill_callbacks.append(callback)
 
     def _make_fill_handler(self) -> Callable[[Any, Any], None]:
+        """Build the ib_insync ``filledEvent`` handler.
+
+        ib_insync fires the event on the connection-owning loop thread.
+        With a fill dispatcher (loop_owner configured + connected), the
+        handler only ENQUEUES - delivery happens on the dispatcher
+        thread so a callback that takes the strategy runner's lock can
+        never block the IB loop (which may be needed to serve a
+        marshaled exec call holding that same lock - lock-inversion
+        deadlock otherwise). Without a dispatcher the callbacks run
+        inline (legacy/test path with fake adapters).
+        """
+
         def _handle(trade: Any, fill: Any) -> None:
             evt = _fill_to_canonical(trade, fill)
-            for cb in list(self._fill_callbacks):
-                cb(evt)
+            dispatcher = self._fill_dispatcher
+            if dispatcher is not None:
+                dispatcher.submit(evt)
+            else:
+                self._dispatch_fill(evt)
 
         return _handle
+
+    def _dispatch_fill(self, evt: dict[str, Any]) -> None:
+        for cb in list(self._fill_callbacks):
+            cb(evt)
 
 
 def _fill_to_canonical(trade: Any, fill: Any) -> dict[str, Any]:
@@ -516,6 +651,7 @@ def build_exec_adapter(
     cli_live: bool = False,
     checklist_path: Path | None = None,
     dry_run: bool = False,
+    loop_owner: IBLoopThread | None = None,
 ) -> IBKRExecAdapter:
     """Construct an ``IBKRExecAdapter`` with the three-lock guard.
 
@@ -524,6 +660,10 @@ def build_exec_adapter(
     - All three locks engaged -> ``ExecMode.LIVE``
     - Any lock missing -> ``ExecMode.PAPER`` and a WARN log names
       every missing lock
+
+    ``loop_owner`` is forwarded to the adapter; pass a started
+    ``IBLoopThread`` whenever exec methods will be called from threads
+    other than the one that owns the IB connection's event loop.
     """
     locks = check_locks(env=env, cli_flag=cli_live, checklist_path=checklist_path)
     if locks.all_engaged():
@@ -534,7 +674,7 @@ def build_exec_adapter(
             "Live mode NOT engaged -- falling back to PAPER. Missing locks: %s",
             ", ".join(locks.missing()),
         )
-    return IBKRExecAdapter(adapter=adapter, mode=mode, dry_run=dry_run)
+    return IBKRExecAdapter(adapter=adapter, mode=mode, dry_run=dry_run, loop_owner=loop_owner)
 
 
 __all__ = [

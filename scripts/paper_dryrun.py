@@ -129,6 +129,7 @@ from alpha_assay.data.front_month import (
 )
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.exec.ibkr import ExecMode, IBKRExecAdapter, build_exec_adapter
+from alpha_assay.exec.loop_marshal import IBLoopThread
 from alpha_assay.exec.trade_log import TradeLog, TradeRecord
 from alpha_assay.observability import metrics as M
 from alpha_assay.paper.runner import PaperStrategyRunner, load_paper_strategy
@@ -807,7 +808,18 @@ def run(cfg: DryrunConfig) -> int:
             account=cfg.ibkr_account or None,
             read_only=False,
         )
-        exec_adapter = build_exec_adapter(adapter=adapter, dry_run=False)
+        # The IB connection lives on a dedicated event-loop thread.
+        # ib_insync's IB/Client are not thread-safe and are loop-affine,
+        # and the order path is driven from bus-consumer worker threads
+        # (run_in_executor) plus this main thread (connect + reconcile,
+        # both BEFORE asyncio.run creates its own loop). IBLoopThread
+        # owns the connection's loop and runs it forever so order-status
+        # and fill messages are delivered; every exec call below
+        # marshals onto it and blocks with a hard timeout (see
+        # alpha_assay.exec.loop_marshal).
+        ib_loop = IBLoopThread(name="ib-exec-loop")
+        ib_loop.start()
+        exec_adapter = build_exec_adapter(adapter=adapter, dry_run=False, loop_owner=ib_loop)
         runner = PaperStrategyRunner(
             strategy=loaded.strategy,
             config=loaded.config,
@@ -842,9 +854,13 @@ def run(cfg: DryrunConfig) -> int:
             )
         finally:
             try:
-                adapter.disconnect()
+                # Marshaled onto the IB loop thread; also drains and
+                # stops the fill dispatcher. Must precede ib_loop.stop()
+                # so the disconnect executes on a still-running loop.
+                exec_adapter.disconnect()
             except Exception:
                 _LOG.exception("error during ibkr disconnect; ignoring")
+            ib_loop.stop()
 
     # Direct-IBKR mode (backward-compatible default).
     # ES_EXPIRY env var must be set when running without a bus Redis connection;
