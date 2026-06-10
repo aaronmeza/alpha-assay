@@ -381,6 +381,82 @@ class IBKRExecAdapter:
 
         self._ib.cancelOrder(Order(orderId=order_id))
 
+    def place_market_order(
+        self,
+        *,
+        contract_spec: dict[str, Any],
+        side: str,
+        quantity: int,
+    ) -> int:
+        """Submit a plain market order (no children) and return its id.
+
+        Used for flattening: closing a position at the session buffer,
+        on a time-stop, or during startup reconciliation. Fills are
+        delivered through the same ``on_fill`` callbacks as bracket
+        children. When ``dry_run`` is True the id is allocated but
+        ``placeOrder`` is skipped.
+        """
+        if side not in ("BUY", "SELL"):
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+
+        # Deferred import: see place_bracket_order.
+        from ib_insync import MarketOrder
+
+        from alpha_assay.data.ibkr_adapter import _build_contract
+
+        contract = _build_contract(contract_spec)
+        order_id = self._ib.client.getReqId()
+        order = MarketOrder(side, quantity, orderId=order_id, transmit=True)
+
+        if self.dry_run:
+            _LOG.info("dry_run=True: skipping placeOrder for market %s %d (id=%d)", side, quantity, order_id)
+            return order_id
+
+        trade = self._ib.placeOrder(contract, order)
+        M.orders_submitted_total.labels(type="flatten").inc()
+        fe = getattr(trade, "filledEvent", None)
+        if fe is not None:
+            fe += self._make_fill_handler()
+        return order_id
+
+    def position_quantity(self, contract_spec: dict[str, Any]) -> float:
+        """Net signed position for the spec's symbol + security type.
+
+        Sums across expiries deliberately: a stale position on last
+        quarter's contract is still exposure the runner must not trade
+        on top of.
+        """
+        from alpha_assay.data.ibkr_adapter import _build_contract
+
+        contract = _build_contract(contract_spec)
+        total = 0.0
+        for pos in self._ib.positions():
+            held = getattr(pos, "contract", None)
+            if held is None:
+                continue
+            if held.symbol == contract.symbol and held.secType == contract.secType:
+                total += float(pos.position)
+        return total
+
+    def cancel_open_orders(self, contract_spec: dict[str, Any]) -> int:
+        """Cancel every resting order matching the spec's symbol +
+        security type. Returns the number of cancels requested.
+        """
+        from alpha_assay.data.ibkr_adapter import _build_contract
+
+        contract = _build_contract(contract_spec)
+        cancelled = 0
+        for trade in self._ib.openTrades():
+            held = getattr(trade, "contract", None)
+            if held is None:
+                continue
+            if held.symbol == contract.symbol and held.secType == contract.secType:
+                self._ib.cancelOrder(trade.order)
+                cancelled += 1
+        return cancelled
+
     # --- fills ----------------------------------------------------------
 
     def on_fill(self, callback: Callable[[dict[str, Any]], None]) -> None:

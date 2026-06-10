@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Aaron Meza
-"""always-flat IBKR paper dry-run entrypoint.
+"""IBKR paper-trader entrypoint (always-flat by default).
 
 This script supersedes the ``scripts/paper_trader_stub.py``
 heartbeat-only placeholder once IBKR creds are wired up. It:
@@ -24,10 +24,23 @@ heartbeat-only placeholder once IBKR creds are wired up. It:
 
 The script is the always-flat paper dry-run; it replaces
 ``paper_trader_stub.py`` heartbeat-only stub when IBKR creds are
-wired up. It NEVER submits orders. Unit invariants live in
+wired up. By default it NEVER submits orders. Unit invariants live in
 ``tests/test_paper_dryrun_unit.py``; deployment-host verification
 lives in ``tests/integration/test_e2e_paper_dryrun.py`` (opt-in via
 ``RUN_LIVE_E2E=1``).
+
+Strategy mode (opt-in)
+----------------------
+
+When ``PAPER_STRATEGY`` is set (bus-consumer mode only), the script
+hosts a real `BaseStrategy` subclass via
+``alpha_assay.paper.PaperStrategyRunner``: the joined ES + breadth
+minute frame is built incrementally from the bus, signals are executed
+as PAPER bracket orders through ``IBKRExecAdapter``, and realized P&L
+is written to the trade log on every round-trip exit. Live mode stays
+triple-gated behind the three-lock interlock regardless; this flag only
+enables *paper* submission. When ``PAPER_STRATEGY`` is unset the
+behavior is exactly the always-flat dry-run described above.
 
 Environment
 -----------
@@ -70,6 +83,17 @@ Environment
                              ibkr-feed at startup. If neither is
                              available at runtime the process fails
                              closed with ``FrontMonthMissingError``.
+``PAPER_STRATEGY``           Optional. ``package.module:ClassName`` of a
+                             ``BaseStrategy`` subclass to host. Unset =
+                             always-flat dry-run. Requires
+                             ``BUS_REDIS_URL`` (the joined frame needs
+                             both breadth streams, which only the bus
+                             carries).
+``PAPER_STRATEGY_CONFIG``    Path to the strategy's YAML config
+                             (``alpha_assay.config.loader`` schema).
+                             Required when ``PAPER_STRATEGY`` is set.
+``PAPER_STARTING_BALANCE``   Reference balance for risk-based sizing in
+                             strategy mode. Default ``100000``.
 
 The script is invoked directly by the the deployment host ``paper-trader`` compose
 service. No CLI parser; everything is env-driven so the compose file
@@ -104,9 +128,10 @@ from alpha_assay.data.front_month import (
     validate_yyyymmdd,
 )
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
-from alpha_assay.exec.ibkr import ExecMode, IBKRExecAdapter
+from alpha_assay.exec.ibkr import ExecMode, IBKRExecAdapter, build_exec_adapter
 from alpha_assay.exec.trade_log import TradeLog, TradeRecord
 from alpha_assay.observability import metrics as M
+from alpha_assay.paper.runner import PaperStrategyRunner, load_paper_strategy
 
 HEARTBEAT_INTERVAL_SECONDS = 30
 DRAIN_TIMEOUT_SECONDS = 20
@@ -142,6 +167,13 @@ class DryrunConfig:
     # Root directory for trade-record output. Set to a temp path in tests.
     # Empty string disables trade logging (no parquet written).
     runs_dir: str = DEFAULT_RUNS_DIR
+    # Strategy mode: "package.module:ClassName" of a BaseStrategy subclass.
+    # Empty string = always-flat dry-run (backward-compatible default).
+    paper_strategy: str = ""
+    # YAML config path for the strategy (required when paper_strategy set).
+    paper_strategy_config: str = ""
+    # Reference balance for risk-based sizing in strategy mode.
+    paper_starting_balance: float = 100_000.0
 
 
 def load_config_from_env() -> DryrunConfig:
@@ -165,6 +197,9 @@ def load_config_from_env() -> DryrunConfig:
         duration_seconds=int(os.environ.get("DRYRUN_DURATION_SECONDS", "0")),
         bus_redis_url=os.environ.get("BUS_REDIS_URL", ""),
         runs_dir=os.environ.get("RUNS_DIR", DEFAULT_RUNS_DIR),
+        paper_strategy=os.environ.get("PAPER_STRATEGY", "").strip(),
+        paper_strategy_config=os.environ.get("PAPER_STRATEGY_CONFIG", "").strip(),
+        paper_starting_balance=float(os.environ.get("PAPER_STARTING_BALANCE", "100000")),
     )
 
 
@@ -416,9 +451,24 @@ def _build_bus_consumers(
     return bars_consumer, breadth_consumer
 
 
+def _build_ad_consumer(cfg: DryrunConfig, redis_client: Any) -> Consumer:
+    """Build the AD-NYSE breadth consumer (strategy mode only).
+
+    The always-flat dry-run consumes TICK-NYSE alone (heartbeat parity
+    with the original direct-IBKR subscription set); a hosted strategy
+    needs the ADD column too, so strategy mode adds this stream.
+    """
+    return Consumer(
+        redis_client=redis_client,
+        stream=stream_name_for_ticks("AD-NYSE"),
+        consumer_id="paper-trader-breadth-ad",
+        start_id="$",
+    )
+
+
 def _consume_bars_from_bus_sync(
     consumer: Consumer,
-    strategy: AlwaysFlatStrategy,
+    strategy: AlwaysFlatStrategy | PaperStrategyRunner,
     stop_event: threading.Event,
 ) -> None:
     """Synchronous bus-consumer loop for ES bars.
@@ -445,11 +495,12 @@ def _consume_bars_from_bus_sync(
 
 def _consume_breadth_from_bus_sync(
     consumer: Consumer,
-    strategy: AlwaysFlatStrategy,
+    strategy: AlwaysFlatStrategy | PaperStrategyRunner,
     stop_event: threading.Event,
+    feed_label: str = "tick_nyse",
+    default_symbol: str = "TICK-NYSE",
 ) -> None:
-    """Synchronous bus-consumer loop for TICK-NYSE breadth."""
-    feed_label = "tick_nyse"
+    """Synchronous bus-consumer loop for one breadth tick stream."""
     while not stop_event.is_set():
         for msg in consumer.iter_messages(block_ms=1000):
             if stop_event.is_set():
@@ -457,7 +508,7 @@ def _consume_breadth_from_bus_sync(
             tick = {
                 "timestamp": pd.Timestamp(msg.ts_event_ns, unit="ns", tz="UTC"),
                 "value": msg.payload["value"],
-                "symbol": msg.payload.get("symbol", "TICK-NYSE"),
+                "symbol": msg.payload.get("symbol", default_symbol),
             }
             strategy.on_breadth_tick(tick, feed_label=feed_label)
 
@@ -477,7 +528,7 @@ def _install_signal_handlers(stop_event: threading.Event) -> None:
 async def _consume_bars(
     adapter: IBKRAdapter,
     spec: dict[str, Any],
-    strategy: AlwaysFlatStrategy,
+    strategy: AlwaysFlatStrategy | PaperStrategyRunner,
     stop_event: asyncio.Event,
 ) -> None:
     """Async-iterate ES bars and feed them to the strategy until the
@@ -500,7 +551,7 @@ async def _consume_bars(
 async def _consume_breadth(
     adapter: IBKRAdapter,
     symbol: str,
-    strategy: AlwaysFlatStrategy,
+    strategy: AlwaysFlatStrategy | PaperStrategyRunner,
     stop_event: asyncio.Event,
 ) -> None:
     feed_label = "tick_nyse"
@@ -519,7 +570,7 @@ async def _consume_breadth(
 
 
 async def _heartbeat_loop(
-    strategy: AlwaysFlatStrategy,
+    strategy: AlwaysFlatStrategy | PaperStrategyRunner,
     adapter: IBKRAdapter | None,
     stop_event: asyncio.Event,
 ) -> None:
@@ -547,15 +598,18 @@ async def _heartbeat_loop(
 async def _async_main(
     cfg: DryrunConfig,
     adapter: IBKRAdapter | None,
-    strategy: AlwaysFlatStrategy,
+    strategy: AlwaysFlatStrategy | PaperStrategyRunner,
     stop_event_thread: threading.Event,
     bus_consumers: tuple[Consumer, Consumer] | None = None,
+    ad_breadth_consumer: Consumer | None = None,
 ) -> int:
     """Async portion of the dry-run loop.
 
     If ``bus_consumers`` is provided the bar + breadth streams are read
     from the bus (executor threads). Otherwise the direct-IBKR path is
     used (``adapter`` must not be None in that case).
+    ``ad_breadth_consumer`` adds the AD-NYSE stream in strategy mode;
+    None preserves the always-flat consumer set exactly.
     """
     spec = es_contract_spec(cfg)
     stop_event = asyncio.Event()
@@ -594,11 +648,27 @@ async def _async_main(
                 stop_event_thread,
             )
         )
-        # Heartbeat loop needs a mock adapter-like object for connectivity reporting.
-        # In bus mode, IBKR connectivity is not directly observable - use None sentinel.
-        heartbeat_task = asyncio.create_task(_heartbeat_loop(strategy, None, stop_event))
+        ad_task: asyncio.Future[None] | None = None
+        if ad_breadth_consumer is not None:
+            ad_task = asyncio.ensure_future(
+                loop.run_in_executor(
+                    None,
+                    _consume_breadth_from_bus_sync,
+                    ad_breadth_consumer,
+                    strategy,
+                    stop_event_thread,
+                    "ad_nyse",
+                    "AD-NYSE",
+                )
+            )
+        # Heartbeat connectivity: in always-flat bus mode there is no IBKR
+        # connection at all (adapter is None -> "n/a(bus)"); in strategy
+        # mode the exec-side adapter is passed through so the heartbeat
+        # reports real order-path connectivity.
+        heartbeat_task = asyncio.create_task(_heartbeat_loop(strategy, adapter, stop_event))
     else:
         assert adapter is not None, "adapter required for direct-IBKR mode"
+        ad_task = None
         bars_task = asyncio.create_task(_consume_bars(adapter, spec, strategy, stop_event))
         breadth_task = asyncio.create_task(_consume_breadth(adapter, "TICK-NYSE", strategy, stop_event))
         heartbeat_task = asyncio.create_task(_heartbeat_loop(strategy, adapter, stop_event))
@@ -620,10 +690,14 @@ async def _async_main(
     finally:
         for t in (bars_task, breadth_task, heartbeat_task, bridge_task):
             t.cancel()
+        if ad_task is not None:
+            ad_task.cancel()
         if deadline_task is not None:
             deadline_task.cancel()
         # Drain with a hard deadline so SIGTERM honors DRAIN_TIMEOUT_SECONDS.
         pending = [bars_task, breadth_task, heartbeat_task, bridge_task]
+        if ad_task is not None:
+            pending.append(ad_task)
         if deadline_task is not None:
             pending.append(deadline_task)
         try:
@@ -654,6 +728,15 @@ def run(cfg: DryrunConfig) -> int:
     Bus-consumer mode is active when ``cfg.bus_redis_url`` is set.
     Direct-IBKR mode is used otherwise (backward-compatible default).
     """
+    if cfg.paper_strategy and not cfg.bus_redis_url:
+        # Fail closed before any side effects: the joined frame needs the
+        # AD-NYSE stream, which only the bus carries. Silently downgrading
+        # an intended strategy run to always-flat would mask an operator
+        # config error.
+        raise RuntimeError(
+            "PAPER_STRATEGY requires bus-consumer mode (set BUS_REDIS_URL); "
+            "direct-IBKR mode only supports the always-flat dry-run"
+        )
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -682,7 +765,7 @@ def run(cfg: DryrunConfig) -> int:
         _LOG.info("trade log enabled at %s/trades.parquet", cfg.runs_dir)
 
     if cfg.bus_redis_url:
-        # Bus-consumer mode: no IBKR connection needed.
+        # Bus-consumer mode: market data comes from Redis Streams.
         import redis as redis_pkg
 
         redis_client = redis_pkg.from_url(cfg.bus_redis_url)
@@ -690,17 +773,78 @@ def run(cfg: DryrunConfig) -> int:
         expiry, source = _resolve_es_expiry(redis_client)
         cfg = dataclasses.replace(cfg, es_expiry=expiry)
         _LOG.info("resolved ES expiry from %s: %s", source, expiry)
-        # Build a stub exec adapter (never used in always-flat, but satisfies the
-        # constructor contract so the compose stack remains uniform).
-        exec_adapter_stub = object()
-        strategy = AlwaysFlatStrategy(exec_adapter=exec_adapter_stub, trade_log=trade_log)
         bus_consumers = _build_bus_consumers(cfg, redis_client)
         _LOG.info(
             "bus-consumer mode active; bars stream=%s breadth stream=%s",
             bus_consumers[0]._stream,
             bus_consumers[1]._stream,
         )
-        return asyncio.run(_async_main(cfg, None, strategy, stop_event, bus_consumers=bus_consumers))
+
+        loaded = load_paper_strategy(dict(os.environ))
+        if loaded is None:
+            # Always-flat dry-run (backward-compatible default): no IBKR
+            # connection at all. Build a stub exec adapter (never used in
+            # always-flat, but satisfies the constructor contract so the
+            # compose stack remains uniform).
+            exec_adapter_stub = object()
+            strategy = AlwaysFlatStrategy(exec_adapter=exec_adapter_stub, trade_log=trade_log)
+            return asyncio.run(_async_main(cfg, None, strategy, stop_event, bus_consumers=bus_consumers))
+
+        # Strategy mode: market data still comes from the bus, but an IBKR
+        # connection is required for the ORDER path (paper submission +
+        # fills + startup reconciliation). read_only=False because the
+        # exec adapter submits paper orders; live stays triple-gated
+        # behind build_exec_adapter's three-lock check.
+        _LOG.warning(
+            "strategy mode: hosting %s with config %s (PAPER order submission enabled)",
+            cfg.paper_strategy,
+            cfg.paper_strategy_config,
+        )
+        adapter = IBKRAdapter(
+            host=cfg.ibkr_host,
+            port=cfg.ibkr_port,
+            client_id=cfg.ibkr_client_id,
+            account=cfg.ibkr_account or None,
+            read_only=False,
+        )
+        exec_adapter = build_exec_adapter(adapter=adapter, dry_run=False)
+        runner = PaperStrategyRunner(
+            strategy=loaded.strategy,
+            config=loaded.config,
+            exec_adapter=exec_adapter,
+            contract_spec=es_contract_spec(cfg),
+            trade_log=trade_log,
+            starting_balance=cfg.paper_starting_balance,
+        )
+        exec_adapter.on_fill(runner.handle_fill)
+        try:
+            exec_adapter.connect()
+        except Exception:
+            _LOG.exception("initial ibkr connect failed; orders will fail until the gateway returns")
+            runner.on_disconnect()
+        if adapter.is_connected:
+            qty, cancelled = runner.startup_reconcile()
+            _LOG.info("startup reconcile done: position_qty=%g orders_cancelled=%d", qty, cancelled)
+        else:
+            _LOG.error("skipping startup reconcile: IBKR not connected; broker state is UNVERIFIED")
+        ad_consumer = _build_ad_consumer(cfg, redis_client)
+        _LOG.info("strategy mode adds breadth stream=%s", ad_consumer._stream)
+        try:
+            return asyncio.run(
+                _async_main(
+                    cfg,
+                    adapter,
+                    runner,
+                    stop_event,
+                    bus_consumers=bus_consumers,
+                    ad_breadth_consumer=ad_consumer,
+                )
+            )
+        finally:
+            try:
+                adapter.disconnect()
+            except Exception:
+                _LOG.exception("error during ibkr disconnect; ignoring")
 
     # Direct-IBKR mode (backward-compatible default).
     # ES_EXPIRY env var must be set when running without a bus Redis connection;

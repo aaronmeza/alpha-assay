@@ -51,43 +51,14 @@ from alpha_assay.engine.logging import LOGGING_CONFIG
 from alpha_assay.filters.session_mask import session_mask
 from alpha_assay.observability import metrics as M
 from alpha_assay.risk.caps import RiskCaps
+
+# Re-exported for backward compatibility: PositionSizer lived here before
+# the paper runner needed it without the nautilus dependency.
+from alpha_assay.risk.sizing import PositionSizer
 from alpha_assay.strategy.base import BaseStrategy, Signal
 
 _VENUE = Venue("SIM")
 _CLIENT_ID = ClientId("BREADTH")
-
-
-@dataclass(frozen=True)
-class PositionSizer:
-    """Risk-based contract sizing.
-
-    Contracts = clamp(floor(account_balance * risk_per_trade_pct /
-    stop_dollar), 1, max_contracts) when risk_per_trade_pct is set.
-    Falls back to 1 when risk_per_trade_pct is None or 0 (legacy
-    behavior - single contract per signal).
-
-    Uses a fixed account_balance reference (not live equity) so risk
-    budget stays stable across drawdowns. Anti-martingale scaling can
-    be added later if desired.
-    """
-
-    account_balance: float
-    instrument_multiplier: float
-    risk_per_trade_pct: float | None = None
-    max_contracts: int = 1
-
-    def compute_contracts(self, stop_points: float) -> int:
-        if self.risk_per_trade_pct is None or self.risk_per_trade_pct <= 0:
-            return 1
-        if stop_points <= 0:
-            # Defensive: zero stop would divide by zero. Fall back to 1 -
-            # the risk-cap layer should have rejected this already, but
-            # the engine must not crash.
-            return 1
-        risk_dollar = self.account_balance * self.risk_per_trade_pct
-        stop_dollar = stop_points * self.instrument_multiplier
-        contracts = int(risk_dollar // stop_dollar)
-        return max(1, min(self.max_contracts, contracts))
 
 
 @dataclass
