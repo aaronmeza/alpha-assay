@@ -166,6 +166,65 @@ services:
       retries: 5
       start_period: 10s
 
+  nq-bars-recorder:
+    # NQ front-month 1-min bar recorder: a second instance of the
+    # es-bars-recorder image with BARS_SYMBOL=NQ. Shard layout, metric
+    # names, and bus-consumer behaviour are identical to ES (series are
+    # distinguished by the `feed` label and the scrape job). Gated under
+    # its own `recorder-nq` profile so existing `--profile recorder`
+    # deployments do not pick it up until the operator opts in - the
+    # ibkr-feed manifest must also include the NQ bars subscription
+    # (see configs/feed-manifest-extended.yaml) for this consumer to
+    # have a stream to read.
+    profiles:
+      - recorder-nq
+    image: alphaassay/es-bars-recorder:0.1.0
+    build:
+      context: .
+      dockerfile: infra/recorders/ibkr_es_bars/Dockerfile
+    container_name: alphaassay-nq-bars-recorder
+    restart: on-failure:3
+    environment:
+      METRICS_PORT: "8004"
+      OUT_DIR: /data/nq_bars
+      ALPHA_ASSAY_ENV: paper-dryrun
+      TZ: America/Chicago
+      BARS_SYMBOL: NQ
+      BARS_EXCHANGE: CME
+      BARS_CURRENCY: USD
+      # Distinct client id (only used in legacy direct-IBKR mode; the
+      # bus-consumer path never opens its own IBKR connection).
+      IBKR_HOST: ${IBKR_HOST:-127.0.0.1}
+      IBKR_PORT: ${IBKR_PORT:-4002}
+      IBKR_CLIENT_ID: ${NQ_BARS_IBKR_CLIENT_ID:-24}
+      IBKR_ACCOUNT: ${IBKR_ACCOUNT:-}
+      # BARS_EXPIRY left intentionally unset - ibkr-feed resolves the NQ
+      # front-month via ContFuture and publishes it to Redis. Set
+      # BARS_EXPIRY here ONLY as an emergency override. (The stack-wide
+      # ES_EXPIRY emergency pin is deliberately ignored by this instance.)
+      BARS_EXPIRY: ${NQ_EXPIRY:-}
+    env_file:
+      - path: .env.secrets
+        required: false
+    depends_on:
+      redis:
+        condition: service_healthy
+      ibkr-feed:
+        condition: service_healthy
+    command: ["python", "-u", "/app/infra/recorders/ibkr_es_bars/run.py"]
+    ports:
+      - "127.0.0.1:18004:8004"
+    networks:
+      - alphaassay_observability
+    volumes:
+      - nq_bars_parquet:/data/nq_bars
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8004/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   dashboard:
     # Streamlit results browser. Profile-gated so `docker compose up`
     # without --profile dashboard skips it. Bind-mounts RUNS_DIR from
@@ -430,6 +489,8 @@ volumes:
     name: alphaassay_breadth_parquet
   es_bars_parquet:
     name: alphaassay_es_bars_parquet
+  nq_bars_parquet:
+    name: alphaassay_nq_bars_parquet
   redis_data:
     name: alphaassay_redis_data
   feed_wal:

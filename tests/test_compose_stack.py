@@ -179,3 +179,26 @@ def test_paper_trader_stub_heartbeat_increments() -> None:
     module.heartbeat_once()
     after = M.bars_processed_total.labels(feed="stub")._value.get()
     assert after == before + 1, f"heartbeat should increment counter by 1 (before={before}, after={after})"
+
+
+def test_nq_bars_recorder_is_opt_in() -> None:
+    """The NQ recorder reuses the es-bars-recorder image but must stay
+    gated behind its own profile so existing `--profile recorder`
+    deployments do not pick it up until the operator opts in."""
+    data = _load_yaml(COMPOSE_PATH)
+    svc = data["services"]["nq-bars-recorder"]
+    assert svc.get("profiles") == ["recorder-nq"]
+    env = svc.get("environment", {})
+    if isinstance(env, list):
+        env = dict(item.split("=", 1) for item in env)
+    assert env.get("BARS_SYMBOL") == "NQ"
+    assert env.get("OUT_DIR") == "/data/nq_bars"
+    assert svc.get("image") == data["services"]["es-bars-recorder"].get("image")
+
+
+def test_prometheus_scrapes_nq_bars_recorder() -> None:
+    data = _load_yaml(PROMETHEUS_PATH)
+    jobs = {j["job_name"]: j for j in data.get("scrape_configs", [])}
+    assert "nq-bars-recorder" in jobs
+    targets = jobs["nq-bars-recorder"]["static_configs"][0]["targets"]
+    assert "host.docker.internal:8004" in targets

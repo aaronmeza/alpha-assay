@@ -73,13 +73,16 @@ def _extract_breadth_value(ticker: Any, symbol: str) -> float | None:
 
     Two distinct extraction rules, by instrument:
 
-    * Advance/decline indices (``AD-NYSE``): ``.bid`` and ``.ask`` carry the
-      advancing and declining issue counts respectively; the value is their
-      difference (advancers - decliners). ``.last``/``.close`` are NaN / the
-      issues-total and must never be used. Returns None when no live quote is
-      present (IBKR sends bid == ask == -1.0 outside market hours).
-    * TICK-style indices (``TICK-NYSE``): the value streams as a trade tick on
-      ``.last``, with the previous-session ``.close`` as a last-resort fallback.
+    * Advance/decline indices (``AD-NYSE``, ``AD-NASD``): ``.bid`` and ``.ask``
+      carry the advancing and declining issue counts respectively; the value is
+      their difference (advancers - decliners). ``.last``/``.close`` are NaN /
+      the issues-total and must never be used. Returns None when no live quote
+      is present (IBKR sends bid == ask == -1.0 outside market hours). Never
+      take a midpoint here - ``(bid + ask) / 2`` records half the issues
+      *total*, not the net (the Phase-R 2026-05-21 bug).
+    * Everything else (``TICK-NYSE``, ``TICK-NASD``, plain value indices such
+      as ``VIX``): the value streams as a trade tick on ``.last``, with the
+      previous-session ``.close`` as a last-resort fallback.
     """
     if symbol in _ADVANCE_DECLINE_SYMBOLS:
         bid = getattr(ticker, "bid", None)
@@ -463,13 +466,28 @@ class IBKRAdapter:
 
         return [_normalize_bar(raw, feed) for raw in (bars or [])]
 
-    async def subscribe_breadth(self, symbol: str = "TICK-NYSE") -> AsyncIterator[dict[str, Any]]:
-        """Async-iterate over NYSE breadth index ticks.
+    async def subscribe_breadth(
+        self,
+        symbol: str = "TICK-NYSE",
+        exchange: str = "NYSE",
+        currency: str = "USD",
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Async-iterate over breadth / index ticks.
 
         ``symbol`` is an IBKR Index symbol such as ``TICK-NYSE`` or
-        ``AD-NYSE``; contract is routed via ``IND/NYSE``. Yields one
-        event per pendingTicker update. Aggregation to 1-min bars is
-        the recorder's job - this adapter is the raw tap.
+        ``AD-NYSE``; the contract is routed via ``IND`` on ``exchange``
+        (default ``NYSE`` for back-compat). Nasdaq internals
+        (``TICK-NASD``, ``AD-NASD``) route via ``NASDAQ``; CBOE indices
+        (``VIX``) route via ``CBOE``. Yields one event per pendingTicker
+        update. Aggregation to 1-min bars is the recorder's job - this
+        adapter is the raw tap.
+
+        Note on entitlements: ``reqMktData`` registers the subscription
+        and returns immediately - a missing market-data entitlement
+        surfaces as an IBKR error event plus a silent ticker, NOT as an
+        exception here. The symptom is the per-feed
+        ``ibkr_feed_freshness_seconds`` gauge climbing (or never
+        appearing); downstream healthchecks key off that.
 
         Unlike :meth:`subscribe_bars`, this method is safe to invoke
         from inside a running asyncio loop without any ``*Async``
@@ -478,7 +496,7 @@ class IBKRAdapter:
         (see ib_insync source). It never calls ``run_until_complete``,
         so the sync API does not crash inside an event loop.
         """
-        contract = Index(symbol=symbol, exchange="NYSE", currency="USD")
+        contract = Index(symbol=symbol, exchange=exchange, currency=currency)
         # Fire the subscription; returned Ticker object is unused here - we read
         # values off the pendingTickersEvent payload instead. Dropping the
         # assignment makes intent explicit and satisfies F841.

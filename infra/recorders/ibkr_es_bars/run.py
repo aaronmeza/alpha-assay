@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Aaron Meza
-"""ES-bars recorder entrypoint.
+"""Futures-bars recorder entrypoint (ES by default; any futures root via env).
 
 Reads connection + output configuration from environment variables:
 
@@ -11,17 +11,28 @@ Reads connection + output configuration from environment variables:
     IBKR_PORT            TWS paper 7497, IB Gateway paper 4002 (default 4002)
     IBKR_CLIENT_ID       Unique per-connection client id (default: 22)
     IBKR_ACCOUNT         Optional account code; empty -> default account
-    ES_SYMBOL            Futures root (default: ES)
-    ES_EXCHANGE          Futures exchange (default: CME)
-    ES_CURRENCY          Quote currency (default: USD)
-    ES_EXPIRY            Emergency override for the front-month contract code,
+    BARS_SYMBOL          Futures root (default: ES). Generic alias; takes
+                         precedence over the legacy ES_SYMBOL.
+    BARS_EXCHANGE        Futures exchange (default: CME); alias of ES_EXCHANGE.
+    BARS_CURRENCY        Quote currency (default: USD); alias of ES_CURRENCY.
+    BARS_EXPIRY          Emergency override for the front-month contract code,
                          ``YYYYMMDD``. When set, this value is used directly and
                          Redis is not consulted. When unset (normal operation),
-                         the resolved expiry is read from the Redis metadata key
-                         written by ibkr-feed at startup. If neither is available
-                         at runtime the process fails closed with
-                         ``FrontMonthMissingError``.
+                         the resolved expiry is read from the per-root Redis
+                         metadata key written by ibkr-feed at startup. If
+                         neither is available at runtime the process fails
+                         closed with ``FrontMonthMissingError``.
+    ES_SYMBOL            Legacy aliases of the BARS_* vars above, honoured for
+    ES_EXCHANGE          back-compat with existing deployments. ES_EXPIRY is
+    ES_CURRENCY          honoured ONLY when the resolved symbol is ES, so a
+    ES_EXPIRY            stack-wide ES emergency pin cannot mis-pin a second
+                         recorder instance covering another root (e.g. NQ).
     LOG_LEVEL            Python logging level name (default: INFO)
+
+A second instance of this recorder with ``BARS_SYMBOL=NQ`` and
+``OUT_DIR=/data/nq_bars`` records NQ front-month bars; the parquet shard
+layout and metric names are identical (series are distinguished by the
+``feed`` label and the scrape job).
 
 Starts the Prometheus exporter, constructs the IBKR adapter + recorder,
 and runs until SIGTERM/SIGINT. No CLI framework; invoked directly by the Docker image.
@@ -51,18 +62,59 @@ from infra.recorders.ibkr_es_bars.recorder import ESBarsRecorder
 _DEFAULT_CLIENT_ID = 22
 
 
+def _env_first(*names: str, default: str) -> str:
+    """Return the first non-empty environment variable among ``names``."""
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return default
+
+
+def _configured_root() -> tuple[str, str, str]:
+    """Resolve the (symbol, exchange, currency) futures root from env.
+
+    Generic ``BARS_*`` vars take precedence; legacy ``ES_*`` vars are
+    honoured for back-compat with existing deployments.
+    """
+    symbol = _env_first("BARS_SYMBOL", "ES_SYMBOL", default="ES")
+    exchange = _env_first("BARS_EXCHANGE", "ES_EXCHANGE", default="CME")
+    currency = _env_first("BARS_CURRENCY", "ES_CURRENCY", default="USD")
+    return symbol, exchange, currency
+
+
+def _expiry_override(symbol: str) -> tuple[str, str]:
+    """Return ``(value, env_var_name)`` for the operator expiry pin, or ("", "").
+
+    ``BARS_EXPIRY`` always applies (it is set per-service). The legacy
+    ``ES_EXPIRY`` applies ONLY when the configured root is ES - it is
+    commonly set stack-wide as an emergency pin and must never leak into
+    a recorder instance covering a different root.
+    """
+    override = os.environ.get("BARS_EXPIRY", "").strip()
+    if override:
+        return override, "BARS_EXPIRY"
+    if symbol == "ES":
+        override = os.environ.get("ES_EXPIRY", "").strip()
+        if override:
+            return override, "ES_EXPIRY"
+    return "", ""
+
+
 def _resolve_es_expiry_with_wait(
     redis_client: redis_pkg.Redis | None,
     *,
+    symbol: str = "ES",
+    exchange: str = "CME",
     max_wait_seconds: float = 60.0,
     poll_interval_seconds: float = 5.0,
 ) -> tuple[str, str]:
-    """Resolve ES expiry, polling Redis for up to max_wait_seconds.
+    """Resolve the front-month expiry, polling Redis for up to max_wait_seconds.
 
     Env-override path is checked first (instant, validated). If env is
-    unset and Redis is provided, poll the key for up to max_wait_seconds
-    before giving up. Handles the cold-start race where the consumer boots
-    before ibkr-feed has written the metadata key.
+    unset and Redis is provided, poll the per-root key for up to
+    max_wait_seconds before giving up. Handles the cold-start race where
+    the consumer boots before ibkr-feed has written the metadata key.
 
     Returns:
         Tuple of (expiry_value, source_label). Log source for operator
@@ -75,50 +127,55 @@ def _resolve_es_expiry_with_wait(
     """
     import time
 
-    override = os.environ.get("ES_EXPIRY", "").strip()
+    override, override_var = _expiry_override(symbol)
     if override:
         # Validate before using - bad env value must fail loudly.
-        validated = validate_yyyymmdd(override, source="ES_EXPIRY env")
-        return validated, "ES_EXPIRY env"
+        validated = validate_yyyymmdd(override, source=f"{override_var} env")
+        return validated, f"{override_var} env"
     if redis_client is None:
         raise FrontMonthMissingError(
-            "ES_EXPIRY env var is unset and no Redis client - cannot resolve "
-            "ES front-month. Set ES_EXPIRY to YYYYMMDD or ensure BUS_REDIS_URL "
-            "is set and ibkr-feed has published the front-month metadata key."
+            f"no expiry env override is set and no Redis client - cannot resolve "
+            f"the {symbol} front-month. Set BARS_EXPIRY (or ES_EXPIRY for ES) to "
+            f"YYYYMMDD or ensure BUS_REDIS_URL is set and ibkr-feed has published "
+            f"the front-month metadata key."
         )
     deadline = time.monotonic() + max_wait_seconds
     last_err: Exception | None = None
     while time.monotonic() < deadline:
         try:
             # read_front_month validates the stored value internally (Fix A).
-            value = read_front_month(redis_client, symbol="ES", exchange="CME")
+            value = read_front_month(redis_client, symbol=symbol, exchange=exchange)
             return value, "Redis metadata key"
         except FrontMonthMissingError as e:
             last_err = e
             time.sleep(poll_interval_seconds)
     raise FrontMonthMissingError(
-        f"ES front-month not in Redis after {max_wait_seconds:.0f}s wait; "
+        f"{symbol} front-month not in Redis after {max_wait_seconds:.0f}s wait; "
         f"ibkr-feed may not have started or failed to resolve. Last error: {last_err}"
     )
 
 
 def _resolve_es_expiry(
     redis_client: redis_pkg.Redis | None,
+    *,
+    symbol: str = "ES",
+    exchange: str = "CME",
 ) -> tuple[str, str]:
-    """Resolve the ES expiry for this recorder run.
+    """Resolve the front-month expiry for this recorder run.
 
     Delegates to _resolve_es_expiry_with_wait with default timeouts.
     Kept for backward-compat with callers that use this name directly.
     """
-    return _resolve_es_expiry_with_wait(redis_client)
+    return _resolve_es_expiry_with_wait(redis_client, symbol=symbol, exchange=exchange)
 
 
 def _build_contract_spec(expiry: str) -> dict[str, Any]:
+    symbol, exchange, currency = _configured_root()
     return {
-        "symbol": os.environ.get("ES_SYMBOL", "ES"),
+        "symbol": symbol,
         "sec_type": "FUT",
-        "exchange": os.environ.get("ES_EXCHANGE", "CME"),
-        "currency": os.environ.get("ES_CURRENCY", "USD"),
+        "exchange": exchange,
+        "currency": currency,
         "expiry": expiry,
     }
 
@@ -133,6 +190,7 @@ def main() -> None:
     out_dir = Path(os.environ.get("OUT_DIR", "/data/es_bars"))
     metrics_port = int(os.environ.get("METRICS_PORT", "8002"))
     bus_redis_url = os.environ.get("BUS_REDIS_URL", "")
+    symbol, exchange, _currency = _configured_root()
 
     # Start Prometheus HTTP exporter before the recorder loop so scrapes
     # succeed immediately.
@@ -142,11 +200,11 @@ def main() -> None:
         # Bus-consumer mode: read bars from Redis Stream produced by the ibkr-feed daemon.
         # Resolve the front-month expiry now that we have a Redis connection available.
         bus_redis = redis_pkg.from_url(bus_redis_url)
-        expiry, source = _resolve_es_expiry(bus_redis)
-        log.info("resolved ES expiry from %s: %s", source, expiry)
+        expiry, source = _resolve_es_expiry(bus_redis, symbol=symbol, exchange=exchange)
+        log.info("resolved %s expiry from %s: %s", symbol, source, expiry)
         contract_spec = _build_contract_spec(expiry)
         log.info(
-            "es-bars-recorder starting in bus-consumer mode (out_dir=%s metrics_port=%d bus=%s contract=%s)",
+            "bars-recorder starting in bus-consumer mode (out_dir=%s metrics_port=%d bus=%s contract=%s)",
             out_dir,
             metrics_port,
             bus_redis_url,
@@ -156,14 +214,14 @@ def main() -> None:
             out_dir=out_dir,
             contract_spec=contract_spec,
             bus_redis=bus_redis,
-            bus_consumer_id=os.environ.get("BUS_CONSUMER_ID", "es-bars-recorder"),
+            bus_consumer_id=os.environ.get("BUS_CONSUMER_ID", f"{symbol.lower()}-bars-recorder"),
         )
     else:
         # Direct-IBKR mode (legacy): recorder subscribes directly to IB Gateway.
-        # ES_EXPIRY env var must be set when running without a bus Redis connection;
+        # An expiry env override must be set when running without a bus Redis connection;
         # _resolve_es_expiry raises FrontMonthMissingError (fails closed) if neither is available.
-        expiry, source = _resolve_es_expiry(None)
-        log.info("resolved ES expiry from %s: %s", source, expiry)
+        expiry, source = _resolve_es_expiry(None, symbol=symbol, exchange=exchange)
+        log.info("resolved %s expiry from %s: %s", symbol, source, expiry)
         contract_spec = _build_contract_spec(expiry)
         ibkr_host = os.environ.get("IBKR_HOST", "127.0.0.1")
         ibkr_port = int(os.environ.get("IBKR_PORT", "4002"))

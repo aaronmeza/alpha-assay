@@ -547,3 +547,132 @@ def test_adapter_has_no_place_order_attribute():
     assert hasattr(adapter, "place_order") is False
     assert hasattr(adapter, "submit_order") is False
     assert hasattr(adapter, "send_order") is False
+
+
+# --- multi-venue breadth / index subscriptions --------------------------
+
+
+def _run_breadth_tick_on_exchange(symbol: str, exchange: str, tick_kwargs: dict) -> tuple[dict | None, object]:
+    """Like ``_run_breadth_tick`` but routes via ``exchange`` and also
+    returns the Index contract handed to ``reqMktData`` so tests can
+    assert the routing."""
+    ib = MagicMock(name="IB")
+    ib.pendingTickersEvent = _FakeEvent()
+    created = {}
+
+    def _req_mkt_data(contract, *args, **kwargs):
+        created["contract"] = contract
+        return SimpleNamespace(contract=contract)
+
+    ib.reqMktData.side_effect = _req_mkt_data
+    adapter = IBKRAdapter(ib=ib)
+
+    async def _run():
+        gen = adapter.subscribe_breadth(symbol=symbol, exchange=exchange)
+        task = asyncio.ensure_future(gen.__anext__())
+        await asyncio.sleep(0)
+        ib.pendingTickersEvent.fire([SimpleNamespace(contract=created["contract"], **tick_kwargs)])
+        try:
+            ev = await asyncio.wait_for(task, timeout=0.25)
+        except TimeoutError:
+            ev = None
+        await gen.aclose()
+        return ev
+
+    return asyncio.run(_run()), created["contract"]
+
+
+def test_subscribe_breadth_default_exchange_is_nyse():
+    """Back-compat: omitting ``exchange`` keeps the historical IND/NYSE routing."""
+    event, contract = None, None
+    ib = MagicMock(name="IB")
+    ib.pendingTickersEvent = _FakeEvent()
+    created = {}
+
+    def _req_mkt_data(c, *args, **kwargs):
+        created["contract"] = c
+        return SimpleNamespace(contract=c)
+
+    ib.reqMktData.side_effect = _req_mkt_data
+    adapter = IBKRAdapter(ib=ib)
+
+    async def _run():
+        gen = adapter.subscribe_breadth(symbol="TICK-NYSE")
+        task = asyncio.ensure_future(gen.__anext__())
+        await asyncio.sleep(0)
+        ib.pendingTickersEvent.fire(
+            [
+                SimpleNamespace(
+                    contract=created["contract"],
+                    last=250.0,
+                    close=240.0,
+                    time=pd.Timestamp("2026-06-10T14:30:00", tz="UTC"),
+                )
+            ]
+        )
+        ev = await asyncio.wait_for(task, timeout=1.0)
+        await gen.aclose()
+        return ev
+
+    event = asyncio.run(_run())
+    contract = created["contract"]
+    assert event["value"] == 250.0
+    assert contract.exchange == "NYSE"
+    assert contract.symbol == "TICK-NYSE"
+
+
+def test_subscribe_breadth_tick_nasd_routes_nasdaq_and_uses_last():
+    """TICK-NASD streams its value on .last (like TICK-NYSE), routed via NASDAQ."""
+    event, contract = _run_breadth_tick_on_exchange(
+        "TICK-NASD",
+        "NASDAQ",
+        dict(last=412.0, close=100.0, time=pd.Timestamp("2026-06-10T14:30:00", tz="UTC")),
+    )
+    assert contract.exchange == "NASDAQ"
+    assert event is not None and event["symbol"] == "TICK-NASD"
+    assert event["value"] == 412.0
+
+
+def test_subscribe_breadth_ad_nasd_is_advances_minus_declines():
+    """AD-NASD uses the same bid-ask (advancers - decliners) extraction as
+    AD-NYSE. Reusing the shared path is the regression guard against
+    reintroducing the midpoint bug on the Nasdaq variant."""
+    event, contract = _run_breadth_tick_on_exchange(
+        "AD-NASD",
+        "NASDAQ",
+        dict(
+            last=float("nan"),
+            close=3300.0,  # issues total; must NOT be picked
+            bid=2100.0,
+            ask=1200.0,
+            time=pd.Timestamp("2026-06-10T14:30:00", tz="UTC"),
+        ),
+    )
+    assert contract.exchange == "NASDAQ"
+    assert event is not None and event["symbol"] == "AD-NASD"
+    assert event["value"] == 900.0, (
+        f"expected net advance-decline 900.0 (bid 2100 - ask 1200), got {event['value']} "
+        "(1650.0 = midpoint bug; 3300.0 = stale close-total fallback)"
+    )
+
+
+def test_subscribe_breadth_ad_nasd_skips_no_quote_sentinel():
+    """Outside RTH IBKR sends bid == ask == -1 for AD-NASD, same as AD-NYSE."""
+    event, _contract = _run_breadth_tick_on_exchange(
+        "AD-NASD",
+        "NASDAQ",
+        dict(last=float("nan"), close=3300.0, bid=-1.0, ask=-1.0, time=pd.Timestamp("2026-06-10T23:30:00", tz="UTC")),
+    )
+    assert event is None, f"expected no event on the -1 no-quote sentinel, got {event}"
+
+
+def test_subscribe_breadth_vix_routes_cboe_and_uses_last():
+    """VIX is a CBOE index whose value streams on .last."""
+    event, contract = _run_breadth_tick_on_exchange(
+        "VIX",
+        "CBOE",
+        dict(last=14.52, close=15.10, time=pd.Timestamp("2026-06-10T14:30:00", tz="UTC")),
+    )
+    assert contract.exchange == "CBOE"
+    assert event is not None and event["symbol"] == "VIX"
+    assert event["value"] == 14.52

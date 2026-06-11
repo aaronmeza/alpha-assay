@@ -64,3 +64,51 @@ def test_resolve_expiry_waits_for_redis_publication(fake_redis, monkeypatch):
     expiry, source = _resolve_es_expiry_with_wait(fake_redis, max_wait_seconds=2.0, poll_interval_seconds=0.01)
     assert expiry == "20260619"
     assert source == "Redis metadata key"
+
+
+# ---------------------------------------------------------------------------
+# Generic-root (BARS_*) configuration: a second instance covers NQ
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_expiry_nq_reads_its_own_key(fake_redis, monkeypatch):
+    """With BARS_SYMBOL=NQ the recorder reads alpha_assay:front_month:nq.cme."""
+    monkeypatch.delenv("ES_EXPIRY", raising=False)
+    monkeypatch.delenv("BARS_EXPIRY", raising=False)
+    write_front_month(fake_redis, symbol="NQ", exchange="CME", expiry="20261218")
+    assert _resolve_es_expiry(fake_redis, symbol="NQ", exchange="CME") == ("20261218", "Redis metadata key")
+
+
+def test_es_expiry_pin_does_not_leak_to_other_roots(fake_redis, monkeypatch):
+    """A stack-wide ES_EXPIRY emergency pin must not mis-pin an NQ instance."""
+    monkeypatch.setenv("ES_EXPIRY", "20260919")
+    monkeypatch.delenv("BARS_EXPIRY", raising=False)
+    write_front_month(fake_redis, symbol="NQ", exchange="CME", expiry="20261218")
+    assert _resolve_es_expiry(fake_redis, symbol="NQ", exchange="CME") == ("20261218", "Redis metadata key")
+
+
+def test_bars_expiry_override_applies_per_service(fake_redis, monkeypatch):
+    """BARS_EXPIRY (set per-service) pins any root without touching Redis."""
+    monkeypatch.setenv("BARS_EXPIRY", "20270319")
+    assert _resolve_es_expiry(fake_redis, symbol="NQ", exchange="CME") == ("20270319", "BARS_EXPIRY env")
+
+
+def test_build_contract_spec_honours_bars_symbol(monkeypatch):
+    from infra.recorders.ibkr_es_bars.run import _build_contract_spec
+
+    monkeypatch.setenv("BARS_SYMBOL", "NQ")
+    monkeypatch.delenv("ES_SYMBOL", raising=False)
+    spec = _build_contract_spec("20261218")
+    assert spec["symbol"] == "NQ"
+    assert spec["exchange"] == "CME"
+    assert spec["expiry"] == "20261218"
+
+
+def test_build_contract_spec_default_remains_es(monkeypatch):
+    from infra.recorders.ibkr_es_bars.run import _build_contract_spec
+
+    for var in ("BARS_SYMBOL", "ES_SYMBOL", "BARS_EXCHANGE", "ES_EXCHANGE"):
+        monkeypatch.delenv(var, raising=False)
+    spec = _build_contract_spec("20260618")
+    assert spec["symbol"] == "ES"
+    assert spec["exchange"] == "CME"

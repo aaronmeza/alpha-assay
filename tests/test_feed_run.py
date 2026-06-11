@@ -21,7 +21,7 @@ from infra.feed.feed import FeedManifest, IBKRFeedDaemon, Subscription
 from infra.feed.run import (
     _connect_with_retry,
     _pre_open_requalify_loop,
-    _resolve_or_pin_es,
+    _resolve_front_months,
     _run_subscriptions,
     _seconds_until_next_pre_open,
     _watch_connection,
@@ -204,7 +204,7 @@ def test_connect_with_retry_raises_after_exhausting_attempts():
     assert calls["n"] == 3
 
 
-# --- _resolve_or_pin_es --------------------------------------------------
+# --- _resolve_front_months --------------------------------------------------
 
 
 def _es_bars_manifest() -> FeedManifest:
@@ -230,7 +230,7 @@ def _breadth_only_manifest() -> FeedManifest:
     )
 
 
-def test_resolve_or_pin_es_override_path(monkeypatch):
+def test_resolve_front_months_override_path(monkeypatch):
     """ES_EXPIRY set: adapter.resolve_front_month_future NOT called,
     manifest ES sub patched with override value, Redis write + gauge set."""
     monkeypatch.setenv("ES_EXPIRY", "20251219")
@@ -254,7 +254,7 @@ def test_resolve_or_pin_es_override_path(monkeypatch):
             return original_write(*args, **kwargs)
 
         monkeypatch.setattr(run_mod, "write_front_month", capturing_write)
-        result = await _resolve_or_pin_es(manifest, adapter, redis_client)
+        result, _roots = await _resolve_front_months(manifest, adapter, redis_client)
         return result, calls
 
     result, write_calls = asyncio.run(_run())
@@ -272,7 +272,7 @@ def test_resolve_or_pin_es_override_path(monkeypatch):
     assert write_calls[0][1].get("expiry") == "20251219" or write_calls[0][0][2] == "20251219"
 
 
-def test_resolve_or_pin_es_auto_resolve_path(monkeypatch):
+def test_resolve_front_months_auto_resolve_path(monkeypatch):
     """ES_EXPIRY unset: adapter.resolve_front_month_future called once,
     resolved expiry flows into the patched sub, Redis write + gauge set."""
     monkeypatch.delenv("ES_EXPIRY", raising=False)
@@ -298,7 +298,7 @@ def test_resolve_or_pin_es_auto_resolve_path(monkeypatch):
             return original_write(*args, **kwargs)
 
         monkeypatch.setattr(run_mod, "write_front_month", capturing_write)
-        result = await _resolve_or_pin_es(manifest, adapter, redis_client)
+        result, _roots = await _resolve_front_months(manifest, adapter, redis_client)
         return result, write_calls
 
     result, write_calls = asyncio.run(_run())
@@ -316,7 +316,7 @@ def test_resolve_or_pin_es_auto_resolve_path(monkeypatch):
     assert write_calls[0][1].get("expiry") == resolved_expiry or write_calls[0][0][2] == resolved_expiry
 
 
-def test_resolve_or_pin_es_skip_when_no_es_bars(monkeypatch):
+def test_resolve_front_months_skip_when_no_es_bars(monkeypatch):
     """Manifest has no ES bars subscriptions: resolve NOT called,
     write_front_month NOT called, subscriptions returned unchanged."""
     monkeypatch.delenv("ES_EXPIRY", raising=False)
@@ -338,7 +338,7 @@ def test_resolve_or_pin_es_skip_when_no_es_bars(monkeypatch):
             return original_write(*args, **kwargs)
 
         monkeypatch.setattr(run_mod, "write_front_month", capturing_write)
-        result = await _resolve_or_pin_es(manifest, adapter, redis_client)
+        result, _roots = await _resolve_front_months(manifest, adapter, redis_client)
         return result, write_calls
 
     result, write_calls = asyncio.run(_run())
@@ -516,3 +516,205 @@ def test_requalify_loop_continues_on_ibkr_error(monkeypatch):
     assert call_count["n"] > 1
     # Redis key must remain unchanged (no write on failure).
     assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260620"
+
+
+# --- _resolve_front_months: multi-root (ES + NQ) ---------------------------
+
+
+def _es_nq_manifest(*, nq_required: bool = False) -> FeedManifest:
+    """ES (required) + NQ bars plus one breadth ticks subscription."""
+    return FeedManifest(
+        subscriptions=[
+            Subscription(
+                kind="bars",
+                contract={"symbol": "ES", "sec_type": "FUT", "exchange": "CME", "expiry": "20250919"},
+            ),
+            Subscription(
+                kind="bars",
+                contract={"symbol": "NQ", "sec_type": "FUT", "exchange": "CME"},
+                required=nq_required,
+            ),
+            Subscription(kind="ticks", symbol="TICK-NYSE"),
+        ]
+    )
+
+
+def _resolver_for(expiries: dict[str, str]):
+    """AsyncMock-style resolver returning a per-symbol fake Future."""
+
+    async def _resolve(symbol: str, exchange: str, currency: str = "USD"):
+        expiry = expiries[symbol]
+        fut = MagicMock()
+        fut.lastTradeDateOrContractMonth = expiry
+        fut.localSymbol = f"{symbol}-{expiry}"
+        return fut
+
+    return _resolve
+
+
+def test_resolve_front_months_resolves_each_root(monkeypatch):
+    """ES and NQ each get their own ContFuture resolve, Redis key, and
+    re-qualify root entry; every bars sub carries its root's expiry."""
+    import fakeredis
+
+    from alpha_assay.data.front_month import read_front_month
+
+    monkeypatch.delenv("ES_EXPIRY", raising=False)
+    monkeypatch.delenv("NQ_EXPIRY", raising=False)
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = _resolver_for({"ES": "20260918", "NQ": "20261218"})
+
+    redis_client = fakeredis.FakeRedis()
+    manifest = _es_nq_manifest()
+
+    result, roots = asyncio.run(_resolve_front_months(manifest, adapter, redis_client))
+
+    by_symbol = {s.contract["symbol"]: s for s in result if s.kind == "bars"}
+    assert by_symbol["ES"].contract["expiry"] == "20260918"
+    assert by_symbol["NQ"].contract["expiry"] == "20261218"
+    # NQ keeps its optional flag through the patch.
+    assert by_symbol["NQ"].required is False
+
+    # Each root has its own Redis metadata key.
+    assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260918"
+    assert read_front_month(redis_client, symbol="NQ", exchange="CME") == "20261218"
+
+    assert roots == [("ES", "CME", "USD"), ("NQ", "CME", "USD")]
+
+
+def test_resolve_front_months_nq_env_override(monkeypatch):
+    """NQ_EXPIRY pins NQ without an IBKR call for NQ; ES still auto-resolves."""
+    import fakeredis
+
+    monkeypatch.delenv("ES_EXPIRY", raising=False)
+    monkeypatch.setenv("NQ_EXPIRY", "20270319")
+
+    calls: list[str] = []
+
+    async def _resolve(symbol: str, exchange: str, currency: str = "USD"):
+        calls.append(symbol)
+        fut = MagicMock()
+        fut.lastTradeDateOrContractMonth = "20260918"
+        fut.localSymbol = f"{symbol}U6"
+        return fut
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = _resolve
+
+    result, _roots = asyncio.run(_resolve_front_months(_es_nq_manifest(), adapter, fakeredis.FakeRedis()))
+
+    assert calls == ["ES"], f"only ES should hit ContFuture; got {calls}"
+    nq = next(s for s in result if s.kind == "bars" and s.contract["symbol"] == "NQ")
+    assert nq.contract["expiry"] == "20270319"
+
+
+def test_resolve_front_months_optional_root_failure_drops_subs(monkeypatch):
+    """A resolve failure on an all-optional root drops its subs and keeps going."""
+    import fakeredis
+
+    from alpha_assay.data.front_month import read_front_month
+
+    monkeypatch.delenv("ES_EXPIRY", raising=False)
+    monkeypatch.delenv("NQ_EXPIRY", raising=False)
+
+    async def _resolve(symbol: str, exchange: str, currency: str = "USD"):
+        if symbol == "NQ":
+            raise RuntimeError("no NQ entitlement")
+        fut = MagicMock()
+        fut.lastTradeDateOrContractMonth = "20260918"
+        fut.localSymbol = "ESU6"
+        return fut
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = _resolve
+
+    redis_client = fakeredis.FakeRedis()
+    result, roots = asyncio.run(_resolve_front_months(_es_nq_manifest(nq_required=False), adapter, redis_client))
+
+    symbols = [s.contract["symbol"] for s in result if s.kind == "bars"]
+    assert symbols == ["ES"], f"NQ subs must be dropped on optional-root failure; got {symbols}"
+    # The ticks subscription is untouched.
+    assert any(s.kind == "ticks" for s in result)
+    assert roots == [("ES", "CME", "USD")]
+    assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260918"
+
+
+def test_resolve_front_months_required_root_failure_raises(monkeypatch):
+    """A resolve failure on a root with any required sub propagates (daemon exits)."""
+    import fakeredis
+
+    monkeypatch.delenv("ES_EXPIRY", raising=False)
+    monkeypatch.delenv("NQ_EXPIRY", raising=False)
+
+    async def _resolve(symbol: str, exchange: str, currency: str = "USD"):
+        raise RuntimeError("IBKR down")
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = _resolve
+
+    with pytest.raises(RuntimeError, match="IBKR down"):
+        asyncio.run(_resolve_front_months(_es_bars_manifest(), adapter, fakeredis.FakeRedis()))
+
+
+# --- optional-subscription failure isolation -------------------------------
+
+
+def test_run_subscriptions_survives_optional_subscription_failure(redis_client, tmp_path):
+    """An optional (required: false) subscription that explodes must NOT
+    exit the daemon: the required feed keeps running and the daemon only
+    stops on the requested stop event (rc == 0)."""
+    from alpha_assay.observability import metrics as M
+
+    adapter = _adapter_with_blocking_bars()
+
+    def _failing_breadth(symbol=None, exchange="NYSE", currency="USD", **kw):
+        raise RuntimeError("market data entitlement missing")
+
+    adapter.subscribe_breadth = _failing_breadth
+
+    optional_ticks = Subscription(kind="ticks", symbol="VIX", exchange="CBOE", required=False)
+    daemon = IBKRFeedDaemon(adapter=adapter, redis_client=redis_client, wal_dir=tmp_path / "wal")
+    stop = asyncio.Event()
+
+    async def _run():
+        async def _stop_later():
+            await asyncio.sleep(0.3)
+            stop.set()
+
+        asyncio.create_task(_stop_later())
+        return await asyncio.wait_for(
+            _run_subscriptions(daemon, adapter, [_bars_sub(), optional_ticks], stop, watchdog_poll=0.02),
+            timeout=3.0,
+        )
+
+    rc = asyncio.run(_run())
+    assert rc == 0, "optional-subscription failure must not exit the daemon"
+    # The gauge reflects the dead optional feed.
+    assert M.feed_subscription_up.labels(stream="ticks.vix")._value.get() == 0.0
+    # The required feed's gauge is still up.
+    assert M.feed_subscription_up.labels(stream="bars.es.cme.20260618")._value.get() == 1.0
+
+
+def test_run_subscriptions_required_ticks_failure_still_exits(redis_client, tmp_path):
+    """The same failure on a required subscription keeps the historical
+    exit-and-restart behaviour."""
+    adapter = _adapter_with_blocking_bars()
+
+    def _failing_breadth(symbol=None, exchange="NYSE", currency="USD", **kw):
+        raise RuntimeError("market data entitlement missing")
+
+    adapter.subscribe_breadth = _failing_breadth
+
+    required_ticks = Subscription(kind="ticks", symbol="TICK-NYSE")
+    daemon = IBKRFeedDaemon(adapter=adapter, redis_client=redis_client, wal_dir=tmp_path / "wal")
+    stop = asyncio.Event()
+
+    async def _run():
+        return await asyncio.wait_for(
+            _run_subscriptions(daemon, adapter, [_bars_sub(), required_ticks], stop, watchdog_poll=0.02),
+            timeout=3.0,
+        )
+
+    rc = asyncio.run(_run())
+    assert rc != 0
