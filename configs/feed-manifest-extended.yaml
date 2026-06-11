@@ -1,0 +1,53 @@
+# Extended subscription set for ibkr-feed: the default ES/NYSE feeds plus
+# NQ front-month bars, Nasdaq internals (TICK-NASD / AD-NASD), and the VIX
+# index. Opt in by pointing MANIFEST_PATH at this file; the default
+# feed-manifest.yaml stays the conservative core set.
+#
+# Every entry produces one Redis Stream.
+#
+# Field notes:
+#   - FUT bars expiry is resolved per-root at startup via IBKR ContFuture
+#     (override with <SYMBOL>_EXPIRY env, e.g. ES_EXPIRY / NQ_EXPIRY). The
+#     hardcoded expiry below is a documentation placeholder only.
+#   - `exchange` on ticks entries routes the IBKR Index contract
+#     (default NYSE). Nasdaq internals route via NASDAQ; VIX via CBOE.
+#   - `required: false` marks a feed as optional: a failure (most likely a
+#     missing market-data entitlement - VIX needs a CBOE indices
+#     subscription on most accounts) is logged loudly and surfaces as
+#     alpha_assay_feed_subscription_up == 0 plus an absent/stale
+#     per-feed freshness gauge, without disturbing the required feeds.
+subscriptions:
+  - kind: bars
+    contract:
+      symbol: ES
+      sec_type: FUT
+      exchange: CME
+      currency: USD
+      expiry: "20260618"
+    bar_size: "1 min"
+    what_to_show: TRADES
+  - kind: bars
+    required: false
+    contract:
+      symbol: NQ
+      sec_type: FUT
+      exchange: CME
+      currency: USD
+    bar_size: "1 min"
+    what_to_show: TRADES
+  - kind: ticks
+    symbol: TICK-NYSE
+  - kind: ticks
+    symbol: AD-NYSE
+  - kind: ticks
+    symbol: TICK-NASD
+    exchange: NASDAQ
+    required: false
+  - kind: ticks
+    symbol: AD-NASD
+    exchange: NASDAQ
+    required: false
+  - kind: ticks
+    symbol: VIX
+    exchange: CBOE
+    required: false

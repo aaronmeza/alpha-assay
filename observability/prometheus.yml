@@ -50,6 +50,18 @@ scrape_configs:
           service: es-bars-recorder
           component: recorder
 
+  # Optional NQ instance of the bars recorder (compose profile
+  # `recorder-nq`). Until it is deployed Prometheus logs scrape errors
+  # for this job, which is fine - same pattern as the other recorders.
+  - job_name: nq-bars-recorder
+    honor_labels: true
+    static_configs:
+      - targets:
+          - host.docker.internal:8004
+        labels:
+          service: nq-bars-recorder
+          component: recorder
+
   - job_name: ibkr-feed
     honor_labels: true
     static_configs:

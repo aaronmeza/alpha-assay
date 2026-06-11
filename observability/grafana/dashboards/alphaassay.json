@@ -600,6 +600,29 @@
       ]
     },
     {
+      "type": "timeseries",
+      "id": 37,
+      "title": "Feed subscriptions up (per stream)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 77
+      },
+      "targets": [
+        {
+          "expr": "alpha_assay_feed_subscription_up",
+          "legendFormat": "{{stream}}",
+          "refId": "A"
+        }
+      ],
+      "description": "1 while ibkr-feed runs the subscription; 0 after an optional feed fails (e.g. missing market-data entitlement) or a front-month resolve drops it."
+    },
+    {
       "type": "stat",
       "id": 20,
       "title": "Kill-switch armed",

@@ -118,6 +118,14 @@ ibkr_feed_freshness_seconds = Gauge(
     "Seconds since last IBKR tick or bar per feed (adapter-level, pre-aggregation).",
     labelnames=("feed",),
 )
+feed_subscription_up = Gauge(
+    f"{_PREFIX}feed_subscription_up",
+    "1 while the ibkr-feed daemon is running this subscription; 0 once it has "
+    "failed or been dropped (e.g. missing market-data entitlement on an "
+    "optional feed). Labelled by Redis stream name; bars streams carry the "
+    "resolved expiry when front-month resolution succeeded.",
+    labelnames=("stream",),
+)
 kill_switch_armed = Gauge(f"{_PREFIX}kill_switch_armed", "1 if kill-switch is armed, else 0.")
 kill_switch_trips_total = Counter(
     f"{_PREFIX}kill_switch_trips_total",

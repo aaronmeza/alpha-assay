@@ -1,5 +1,9 @@
 # Default subscriptions for ibkr-feed. Edit + restart feed to change.
 # Every entry produces one Redis Stream.
+#
+# This is the conservative core set. For the extended set (NQ bars,
+# TICK-NASD / AD-NASD, VIX) point MANIFEST_PATH at
+# configs/feed-manifest-extended.yaml - field docs live there.
 subscriptions:
   - kind: bars
     contract:

@@ -31,13 +31,36 @@ class ManifestError(ValueError):
 
 @dataclass(frozen=True)
 class Subscription:
-    """One feed subscription decoded from the manifest."""
+    """One feed subscription decoded from the manifest.
+
+    ``required`` (default True) controls failure isolation: a required
+    subscription that errors exits the daemon (the historical behaviour -
+    the container restart policy reconnects everything), while an
+    optional (``required: false``) subscription that errors is logged
+    loudly and dropped without disturbing the other feeds. Mark feeds
+    that depend on a market-data entitlement the account may lack as
+    optional so a permissions error cannot take down the core streams.
+
+    ``exchange`` / ``currency`` apply to ticks subscriptions only and
+    route the IBKR Index contract (defaults NYSE/USD for back-compat
+    with manifests that predate multi-venue breadth).
+    """
 
     kind: str  # "bars" or "ticks"
     contract: dict[str, Any] | None = None  # for bars
     symbol: str | None = None  # for ticks
     bar_size: str = "1 min"
     what_to_show: str = "TRADES"
+    exchange: str = "NYSE"  # for ticks: IBKR Index routing exchange
+    currency: str = "USD"  # for ticks: IBKR Index currency
+    required: bool = True
+
+    @property
+    def stream(self) -> str:
+        """Deterministic Redis stream name for this subscription."""
+        if self.kind == "bars":
+            return stream_name_for_bars(self.contract or {})
+        return stream_name_for_ticks(self.symbol or "")
 
 
 @dataclass(frozen=True)
@@ -51,6 +74,7 @@ class FeedManifest:
         subs: list[Subscription] = []
         for s in subs_raw:
             kind = s.get("kind")
+            required = bool(s.get("required", True))
             if kind == "bars":
                 subs.append(
                     Subscription(
@@ -58,10 +82,19 @@ class FeedManifest:
                         contract=dict(s["contract"]),
                         bar_size=s.get("bar_size", "1 min"),
                         what_to_show=s.get("what_to_show", "TRADES"),
+                        required=required,
                     )
                 )
             elif kind == "ticks":
-                subs.append(Subscription(kind="ticks", symbol=str(s["symbol"])))
+                subs.append(
+                    Subscription(
+                        kind="ticks",
+                        symbol=str(s["symbol"]),
+                        exchange=str(s.get("exchange", "NYSE")),
+                        currency=str(s.get("currency", "USD")),
+                        required=required,
+                    )
+                )
             else:
                 raise ManifestError(f"unknown subscription kind: {kind!r}")
         return cls(subscriptions=subs)
@@ -101,7 +134,11 @@ class IBKRFeedDaemon:
         elif sub.kind == "ticks":
             stream = stream_name_for_ticks(sub.symbol or "")
             await self._connect_if_needed()
-            gen = self._adapter.subscribe_breadth(symbol=sub.symbol)
+            gen = self._adapter.subscribe_breadth(
+                symbol=sub.symbol,
+                exchange=sub.exchange,
+                currency=sub.currency,
+            )
         else:
             raise ValueError(f"unsupported subscription kind: {sub.kind!r}")
 
