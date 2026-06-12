@@ -596,6 +596,17 @@ async def _heartbeat_loop(
         )
 
 
+async def _watch_exec_connection(adapter: IBKRAdapter, poll_seconds: float = 5.0) -> None:
+    """Block until the exec-path IBKR connection is lost.
+
+    Polls ``adapter.is_connected`` every ``poll_seconds`` and returns as
+    soon as it reads False.  Mirrors the ibkr-feed watchdog so the same
+    Docker restart: unless-stopped pattern handles nightly IBC cycles.
+    """
+    while adapter.is_connected:
+        await asyncio.sleep(poll_seconds)
+
+
 async def _async_main(
     cfg: DryrunConfig,
     adapter: IBKRAdapter | None,
@@ -611,9 +622,14 @@ async def _async_main(
     used (``adapter`` must not be None in that case).
     ``ad_breadth_consumer`` adds the AD-NYSE stream in strategy mode;
     None preserves the always-flat consumer set exactly.
+
+    Returns 0 on a clean SIGTERM/SIGINT drain, 1 when the exec-path IBKR
+    connection is lost so Docker's restart: unless-stopped recycles the
+    container with a fresh connect.
     """
     spec = es_contract_spec(cfg)
     stop_event = asyncio.Event()
+    exec_disconnect = asyncio.Event()
 
     async def _bridge_stop() -> None:
         # Bridge the threading.Event (set by signal handlers in the
@@ -667,9 +683,25 @@ async def _async_main(
         # mode the exec-side adapter is passed through so the heartbeat
         # reports real order-path connectivity.
         heartbeat_task = asyncio.create_task(_heartbeat_loop(strategy, adapter, stop_event))
+
+        # Strategy mode: exec-path IBKR connection watchdog.
+        # When the nightly IBC restart (or any peer close) drops the exec
+        # connection, exit non-zero so Docker's restart: unless-stopped
+        # recycles the container with a fresh connect -- same pattern as
+        # the ibkr-feed watchdog in infra/feed/run.py.
+        exec_watchdog_task: asyncio.Task[None] | None = None
+        if adapter is not None:
+            async def _exec_watchdog() -> None:
+                await _watch_exec_connection(adapter)
+                _LOG.error("exec-path IBKR connection lost; exiting for container restart")
+                exec_disconnect.set()
+                stop_event.set()
+
+            exec_watchdog_task = asyncio.create_task(_exec_watchdog(), name="exec-watchdog")
     else:
         assert adapter is not None, "adapter required for direct-IBKR mode"
         ad_task = None
+        exec_watchdog_task = None
         bars_task = asyncio.create_task(_consume_bars(adapter, spec, strategy, stop_event))
         breadth_task = asyncio.create_task(_consume_breadth(adapter, "TICK-NYSE", strategy, stop_event))
         heartbeat_task = asyncio.create_task(_heartbeat_loop(strategy, adapter, stop_event))
@@ -693,12 +725,16 @@ async def _async_main(
             t.cancel()
         if ad_task is not None:
             ad_task.cancel()
+        if exec_watchdog_task is not None:
+            exec_watchdog_task.cancel()
         if deadline_task is not None:
             deadline_task.cancel()
         # Drain with a hard deadline so SIGTERM honors DRAIN_TIMEOUT_SECONDS.
         pending = [bars_task, breadth_task, heartbeat_task, bridge_task]
         if ad_task is not None:
             pending.append(ad_task)
+        if exec_watchdog_task is not None:
+            pending.append(exec_watchdog_task)
         if deadline_task is not None:
             pending.append(deadline_task)
         try:
@@ -717,14 +753,15 @@ async def _async_main(
             except Exception:
                 _LOG.exception("trade log flush failed on shutdown; records may be lost")
 
-    return 0
+    return 1 if exec_disconnect.is_set() else 0
 
 
 def run(cfg: DryrunConfig) -> int:
     """Synchronous entrypoint. Sets up logging, metrics, signals,
     constructs adapters, and runs the async loop.
 
-    Returns the process exit code (always 0 on clean drain).
+    Returns the process exit code: 0 on clean SIGTERM/SIGINT drain,
+    1 when the exec-path IBKR connection is lost (strategy mode only).
 
     Bus-consumer mode is active when ``cfg.bus_redis_url`` is set.
     Direct-IBKR mode is used otherwise (backward-compatible default).

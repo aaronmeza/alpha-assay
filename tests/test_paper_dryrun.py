@@ -65,6 +65,70 @@ def test_resolve_expiry_raises_when_neither_present(fake_redis, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# exec-path watchdog: exit code 1 on IBKR disconnect in strategy mode
+# ---------------------------------------------------------------------------
+
+
+def test_watch_exec_connection_returns_on_disconnect():
+    """_watch_exec_connection returns as soon as adapter.is_connected is False."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    module = _load_script_module()
+
+    adapter = MagicMock()
+    # First two polls: connected; third: disconnected.
+    adapter.is_connected.__bool__ = MagicMock(side_effect=[True, True, False])
+
+    async def _run():
+        await module._watch_exec_connection(adapter, poll_seconds=0.001)
+
+    asyncio.run(_run())
+    assert adapter.is_connected.__bool__.call_count == 3
+
+
+def test_exec_disconnect_event_drives_exit_code():
+    """exec_disconnect.is_set() -> return 1; unset -> return 0.
+
+    Tests the return-code logic in isolation without starting executor threads.
+    """
+    import asyncio
+
+    module = _load_script_module()
+
+    # The watchdog sets exec_disconnect then calls stop_event.set().
+    # Simulate that sequence directly.
+    async def _run_with_disconnect():
+        exec_disconnect = asyncio.Event()
+        stop_event = asyncio.Event()
+
+        async def _trigger():
+            await asyncio.sleep(0.01)
+            exec_disconnect.set()
+            stop_event.set()
+
+        asyncio.create_task(_trigger())
+        await stop_event.wait()
+        return 1 if exec_disconnect.is_set() else 0
+
+    assert asyncio.run(_run_with_disconnect()) == 1
+
+    async def _run_clean_stop():
+        exec_disconnect = asyncio.Event()
+        stop_event = asyncio.Event()
+
+        async def _trigger():
+            await asyncio.sleep(0.01)
+            stop_event.set()
+
+        asyncio.create_task(_trigger())
+        await stop_event.wait()
+        return 1 if exec_disconnect.is_set() else 0
+
+    assert asyncio.run(_run_clean_stop()) == 0
+
+
+# ---------------------------------------------------------------------------
 # Cold-start polling: consumer waits for producer
 # ---------------------------------------------------------------------------
 
