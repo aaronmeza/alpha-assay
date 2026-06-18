@@ -126,6 +126,14 @@ feed_subscription_up = Gauge(
     "resolved expiry when front-month resolution succeeded.",
     labelnames=("stream",),
 )
+feed_staleness_restarts_total = Counter(
+    f"{_PREFIX}feed_staleness_restarts_total",
+    "ibkr-feed daemon restarts triggered by the data-staleness watchdog: a "
+    "required feed published no event for longer than the staleness timeout "
+    "during RTH while the IBKR socket stayed connected (silent-socket stall, "
+    "as on 2026-06-17). Labelled by the Redis stream that went stale.",
+    labelnames=("stream",),
+)
 kill_switch_armed = Gauge(f"{_PREFIX}kill_switch_armed", "1 if kill-switch is armed, else 0.")
 kill_switch_trips_total = Counter(
     f"{_PREFIX}kill_switch_trips_total",

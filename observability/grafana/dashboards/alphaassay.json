@@ -623,6 +623,29 @@
       "description": "1 while ibkr-feed runs the subscription; 0 after an optional feed fails (e.g. missing market-data entitlement) or a front-month resolve drops it."
     },
     {
+      "type": "timeseries",
+      "id": 38,
+      "title": "Feed staleness restarts (silent-socket recovery)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 83
+      },
+      "targets": [
+        {
+          "expr": "increase(alpha_assay_feed_staleness_restarts_total[1h])",
+          "legendFormat": "{{stream}}",
+          "refId": "A"
+        }
+      ],
+      "description": "ibkr-feed daemon restarts triggered by the data-staleness watchdog: a required feed published no data for longer than the staleness timeout during RTH while the IBKR socket stayed connected (silent-socket stall, as on 2026-06-17). A nonzero value is the watchdog auto-recovering a stall the connection watchdog cannot see."
+    },
+    {
       "type": "stat",
       "id": 20,
       "title": "Kill-switch armed",
