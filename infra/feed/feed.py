@@ -100,6 +100,42 @@ class FeedManifest:
         return cls(subscriptions=subs)
 
 
+class FreshnessTracker:
+    """Monotonic last-publish time per stream, read by the staleness watchdog.
+
+    The connection watchdog only catches a dropped socket. A *silent* socket -
+    IBKR connected but pushing no bars/ticks - leaves the publish loop idle
+    with ``is_connected`` still True (the 2026-06-17 14:06-14:24 CT stall). This
+    tracker records, at the publish boundary, the monotonic time each stream
+    last landed an event in Redis, so the staleness watchdog can notice a feed
+    has gone quiet despite a live connection and restart the daemon for a fresh
+    subscription.
+
+    Uses a monotonic clock (not wall-clock) so a system-clock step never yields
+    a spurious age. ``clock`` is injectable for deterministic tests.
+    """
+
+    def __init__(self, *, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._last: dict[str, float] = {}
+
+    def seed(self, stream: str) -> None:
+        """Establish a baseline at subscription start so a feed that has not
+        yet produced its first event is not seen as infinitely stale."""
+        self._last[stream] = self._clock()
+
+    def mark(self, stream: str) -> None:
+        """Record that *stream* just published an event."""
+        self._last[stream] = self._clock()
+
+    def age(self, stream: str) -> float | None:
+        """Seconds since *stream* last published, or None if never seeded."""
+        last = self._last.get(stream)
+        if last is None:
+            return None
+        return max(0.0, self._clock() - last)
+
+
 class IBKRFeedDaemon:
     """Single producer for one or more IBKR subscriptions.
 
@@ -114,12 +150,17 @@ class IBKRFeedDaemon:
         redis_client: redis_pkg.Redis,
         wal_dir: Path,
         maxlen: int = 3600,
+        *,
+        freshness: FreshnessTracker | None = None,
     ) -> None:
         self._adapter = adapter
         self._redis = redis_client
         self._producer = Producer(redis_client=redis_client, maxlen=maxlen)
         self._wal_dir = Path(wal_dir)
         self._wal_dir.mkdir(parents=True, exist_ok=True)
+        # Shared with the staleness watchdog (None in unit tests that don't
+        # exercise it). Stamped at the publish boundary below.
+        self._freshness = freshness
 
     async def run_subscription(self, sub: Subscription) -> None:
         """Run one subscription end-to-end. Blocks until cancelled or stream ends."""
@@ -156,6 +197,12 @@ class IBKRFeedDaemon:
             raise
         BM.feed_lock_state.labels(contract=stream).set(1)
 
+        # Baseline the staleness clock at subscription start so a feed that has
+        # not yet produced its first event is not instantly "infinitely stale"
+        # (the watchdog's warmup guard gives it time to start flowing).
+        if self._freshness is not None:
+            self._freshness.seed(stream)
+
         # Drain any uncommitted WAL records first. Per-stream WAL subdirs
         # so concurrent subscriptions don't share state (otherwise each
         # task's drain would republish messages from other subscriptions
@@ -191,6 +238,9 @@ class IBKRFeedDaemon:
                 self._redis.xadd(stream, {"data": msg_bytes}, maxlen=3600, approximate=True)
                 BM.bus_publish_total.labels(stream=stream).inc()
                 wal.advance_committed(seq)
+                # Publish boundary: data is flowing for this stream.
+                if self._freshness is not None:
+                    self._freshness.mark(stream)
         finally:
             wal.close()
             BM.feed_lock_state.labels(contract=stream).set(0)

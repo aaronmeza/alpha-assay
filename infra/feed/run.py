@@ -44,6 +44,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from datetime import datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
@@ -58,8 +59,12 @@ from alpha_assay.data.front_month import (
     write_front_month,
 )
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
+
+# Single source for the RTH boundary, shared with the strategy session filter
+# and the freshness alerter (08:30-15:00 CT).
+from alpha_assay.filters.session_mask import CLOSE_CT_MINUTES, OPEN_CT_MINUTES
 from alpha_assay.observability import metrics as M
-from infra.feed.feed import FeedManifest, IBKRFeedDaemon, Subscription
+from infra.feed.feed import FeedManifest, FreshnessTracker, IBKRFeedDaemon, Subscription
 
 LOG = logging.getLogger("alpha_assay.ibkr_feed")
 logging.basicConfig(
@@ -94,6 +99,31 @@ def _seconds_until_next_pre_open(now: datetime) -> float:
     return (target - now).total_seconds()
 
 
+def _env_bool(name: str, *, default: bool) -> bool:
+    """Parse a boolean env var. Unset or empty -> *default*; ``0/false/no/off``
+    (any case) -> False; anything else -> True."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _in_rth(now_ct: datetime) -> bool:
+    """True during regular cash-session hours: 08:30-15:00 CT, weekdays.
+
+    Half-open ``[open, close)`` to match the freshness alerter. Outside this
+    window the breadth feeds legitimately go quiet (IBKR no-quote sentinel) and
+    futures bars stop (useRTH=True), so feed staleness must not be evaluated;
+    the ~22:40-23:25 CT IBC nightly restart window also falls outside RTH and is
+    covered for free. *now_ct* must be America/Chicago-aware. Holidays are not
+    handled here (a half-day or holiday simply alerts/restarts less usefully,
+    never destructively - the watchdog only ever forces a reconnect)."""
+    if now_ct.weekday() >= 5:  # Sat/Sun
+        return False
+    minute_of_day = now_ct.hour * 60 + now_ct.minute
+    return OPEN_CT_MINUTES <= minute_of_day < CLOSE_CT_MINUTES
+
+
 async def _watch_connection(adapter, poll_seconds: float = 5.0) -> None:
     """Block until the IBKR connection is lost.
 
@@ -103,6 +133,68 @@ async def _watch_connection(adapter, poll_seconds: float = 5.0) -> None:
     """
     while adapter.is_connected:
         await asyncio.sleep(poll_seconds)
+
+
+async def _watch_staleness(
+    freshness: FreshnessTracker,
+    streams: list[str],
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 15.0,
+    clock=time.monotonic,
+) -> str:
+    """Block until a monitored required feed goes stale during RTH; return it.
+
+    The connection watchdog only catches a dropped socket. This catches the
+    *silent socket*: the IBKR connection stays up (``is_connected`` True) but no
+    events publish, so the publish loop never advances (the 2026-06-17 stall).
+    The caller exits ``EXIT_RESTART`` on the returned stream so the container
+    restart policy re-subscribes with a fresh connection.
+
+    Only required-feed streams are passed in (an optional/unentitled feed going
+    quiet alone must never restart the daemon - the ``required: false``
+    degrade-only contract; a connection-level stall hits every required feed at
+    once anyway). Evaluation is gated to RTH and to a warmup window of
+    ``timeout_seconds`` since process start AND since the current RTH session
+    opened, so feeds have time to start flowing before they can trip it.
+
+    Clocks: wall-clock (``datetime.now``) is used ONLY for the RTH boundary;
+    every staleness age is measured with ``clock`` (``time.monotonic`` in prod,
+    injectable for tests) so an NTP step or DST change can neither fabricate nor
+    mask staleness. On each RTH entry the monitored feeds are re-baselined so an
+    age carried over the overnight gap can't trip a spurious restart.
+    """
+    start = clock()
+    rth_open_at: float | None = None
+    while True:
+        await asyncio.sleep(poll_seconds)
+        if not _in_rth(datetime.now(CHICAGO)):
+            rth_open_at = None  # reset; restart the open clock on next entry
+            continue
+        now = clock()
+        if rth_open_at is None:
+            # First poll of this RTH session: start the open-warmup clock and
+            # re-baseline every monitored feed, so an age held over from the
+            # prior session / overnight cannot count toward staleness.
+            rth_open_at = now
+            for stream in streams:
+                freshness.seed(stream)
+        # Warmup guards: give feeds time to start flowing after a cold start and
+        # after each RTH open before any silence counts as a fault.
+        if now - start < timeout_seconds or now - rth_open_at < timeout_seconds:
+            continue
+        for stream in streams:
+            age = freshness.age(stream)
+            if age is not None and age > timeout_seconds:
+                LOG.error(
+                    "staleness watchdog: required feed %s published nothing for "
+                    "%.1fs (> %.0fs threshold) while IBKR stayed connected; "
+                    "exiting so the container restart policy re-subscribes",
+                    stream,
+                    age,
+                    timeout_seconds,
+                )
+                return stream
 
 
 async def _connect_with_retry(
@@ -155,6 +247,22 @@ def _mark_disconnected(adapter) -> None:
         LOG.debug("adapter.disconnect() raised during teardown", exc_info=True)
 
 
+def _mark_stale_restart(adapter, stream: str) -> None:
+    """Record a staleness-triggered restart and tear down the (still-live)
+    connection so the next process reconnects fresh.
+
+    Distinct from :func:`_mark_disconnected`: the socket is NOT down here, so
+    this must NOT touch ``ibkr_connected`` or the disconnect event counter (that
+    would falsely report a connection loss). It bumps the staleness counter and
+    disconnects for a clean restart.
+    """
+    M.feed_staleness_restarts_total.labels(stream=stream).inc()
+    try:
+        adapter.disconnect()
+    except Exception:  # noqa: BLE001 - teardown is best-effort
+        LOG.debug("adapter.disconnect() raised during stale-restart teardown", exc_info=True)
+
+
 async def _run_optional_subscription(daemon: IBKRFeedDaemon, sub: Subscription) -> None:
     """Run one ``required: false`` subscription with failure isolation.
 
@@ -189,20 +297,28 @@ async def _run_subscriptions(
     stop_event: asyncio.Event,
     *,
     watchdog_poll: float = 5.0,
+    staleness_enabled: bool = True,
+    staleness_timeout: float = 180.0,
+    staleness_poll: float = 15.0,
+    freshness: FreshnessTracker | None = None,
 ) -> int:
-    """Run all subscriptions plus the connection watchdog until one ends.
+    """Run all subscriptions plus the watchdogs until one ends.
 
-    Required subscriptions, the watchdog, and the stop event race in
-    ``asyncio.wait(FIRST_COMPLETED)`` - the historical behaviour.
+    Required subscriptions, the connection watchdog, the data-staleness
+    watchdog, and the stop event race in ``asyncio.wait(FIRST_COMPLETED)``.
     Optional (``required: false``) subscriptions run outside that race,
     wrapped in :func:`_run_optional_subscription`, so their failure is
     logged + gauged but never exits the daemon.
 
+    The staleness watchdog spawns only when ``staleness_enabled`` and a
+    shared *freshness* tracker is supplied and at least one required feed
+    exists; it watches required-feed streams only (see :func:`_watch_staleness`).
+
     Returns ``EXIT_OK`` only on a requested stop (SIGTERM/SIGINT).
-    Returns ``EXIT_RESTART`` on connection loss, a required subscription
-    raising, or a required subscription stream ending unexpectedly - in
-    every one of those cases the right move is "exit and let the
-    supervisor bring us back".
+    Returns ``EXIT_RESTART`` on connection loss, data staleness, a required
+    subscription raising, or a required subscription stream ending
+    unexpectedly - in every one of those cases the right move is "exit and
+    let the supervisor bring us back".
     """
     for sub in subscriptions:
         M.feed_subscription_up.labels(stream=sub.stream).set(1)
@@ -220,7 +336,31 @@ async def _run_subscriptions(
     wd_task = asyncio.create_task(_watch_connection(adapter, poll_seconds=watchdog_poll), name="watchdog")
     stop_task = asyncio.create_task(stop_event.wait(), name="stop")
 
-    done, pending = await asyncio.wait([*required_tasks, wd_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
+    # Data-staleness watchdog: required feeds only (see _watch_staleness).
+    required_streams = [sub.stream for sub in subscriptions if sub.required]
+    stale_task = None
+    if staleness_enabled and freshness is not None and required_streams:
+        stale_task = asyncio.create_task(
+            _watch_staleness(
+                freshness,
+                required_streams,
+                timeout_seconds=staleness_timeout,
+                poll_seconds=staleness_poll,
+            ),
+            name="staleness-watchdog",
+        )
+        LOG.info(
+            "data-staleness watchdog armed: %d required feed(s), timeout=%.0fs poll=%.0fs",
+            len(required_streams),
+            staleness_timeout,
+            staleness_poll,
+        )
+
+    wait_set = [*required_tasks, wd_task, stop_task]
+    if stale_task is not None:
+        wait_set.append(stale_task)
+
+    done, pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
     for t in [*pending, *optional_tasks]:
         t.cancel()
     await asyncio.gather(*pending, *optional_tasks, return_exceptions=True)
@@ -234,9 +374,23 @@ async def _run_subscriptions(
         _mark_disconnected(adapter)
         return EXIT_RESTART
 
+    if stale_task is not None and stale_task in done:
+        try:
+            stale_stream = stale_task.result()
+            LOG.error(
+                "data-staleness watchdog tripped on %s (silent socket: connected but no data); "
+                "exiting so the container restart policy re-subscribes with a fresh connection",
+                stale_stream,
+            )
+        except Exception as exc:  # noqa: BLE001 - the watchdog's own failure must still restart cleanly
+            stale_stream = "unknown"
+            LOG.error("data-staleness watchdog errored (%s); exiting for a fresh re-subscribe", exc, exc_info=exc)
+        _mark_stale_restart(adapter, stale_stream)
+        return EXIT_RESTART
+
     # A required subscription task finished. Surface why, then exit for a restart.
     for t in done:
-        if t is stop_task or t is wd_task:
+        if t is stop_task or t is wd_task or t is stale_task:
             continue
         exc = t.exception()
         if exc is not None:
@@ -488,6 +642,11 @@ async def _main() -> int:
     ibkr_port = int(os.environ.get("IBKR_PORT", "4002"))
     client_id = int(os.environ.get("IBKR_CLIENT_ID", "30"))
     wal_dir = Path(os.environ.get("WAL_DIR", "/var/lib/alphaassay/wal"))
+    # Data-staleness watchdog (silent-socket recovery). Default ON; 180s sits
+    # above the 60s 1-min-bar cadence and below the alerter's ~6-min fire point.
+    staleness_enabled = _env_bool("FEED_STALENESS_ENABLED", default=True)
+    staleness_timeout = float(os.environ.get("FEED_STALENESS_TIMEOUT_SECONDS", "180"))
+    staleness_poll = float(os.environ.get("FEED_STALENESS_POLL_SECONDS", "15"))
 
     manifest = FeedManifest.from_yaml(manifest_path)
     LOG.info("loaded %d subscriptions from %s", len(manifest.subscriptions), manifest_path)
@@ -510,7 +669,10 @@ async def _main() -> int:
 
     patched_subs, resolved_roots = await _resolve_front_months(manifest, adapter, redis_client)
 
-    daemon = IBKRFeedDaemon(adapter=adapter, redis_client=redis_client, wal_dir=wal_dir)
+    # Shared between the daemon's publish loop (which marks it) and the
+    # staleness watchdog (which reads it).
+    freshness = FreshnessTracker()
+    daemon = IBKRFeedDaemon(adapter=adapter, redis_client=redis_client, wal_dir=wal_dir, freshness=freshness)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -526,7 +688,16 @@ async def _main() -> int:
         )
         LOG.info("daily pre-open re-qualify task started for %s@%s", symbol, exchange)
 
-    return await _run_subscriptions(daemon, adapter, patched_subs, stop)
+    return await _run_subscriptions(
+        daemon,
+        adapter,
+        patched_subs,
+        stop,
+        staleness_enabled=staleness_enabled,
+        staleness_timeout=staleness_timeout,
+        staleness_poll=staleness_poll,
+        freshness=freshness,
+    )
 
 
 def main() -> int:
