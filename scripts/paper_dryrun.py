@@ -122,12 +122,8 @@ import pandas as pd
 from prometheus_client import start_http_server
 
 from alpha_assay.bus.consumer import Consumer
-from alpha_assay.bus.streams import stream_name_for_bars, stream_name_for_ticks
-from alpha_assay.data.front_month import (
-    FrontMonthMissingError,
-    read_front_month,
-    validate_yyyymmdd,
-)
+from alpha_assay.bus.streams import bars_stream_name, stream_name_for_bars, stream_name_for_ticks
+from alpha_assay.data.front_month import FrontMonthWatcher, read_front_month_with_wait
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.exec.ibkr import ExecMode, IBKRExecAdapter, build_exec_adapter
 from alpha_assay.exec.loop_marshal import IBLoopThread
@@ -241,30 +237,14 @@ def _resolve_es_expiry_with_wait(
             max_wait_seconds.
     """
     override = os.environ.get("ES_EXPIRY", "").strip()
-    if override:
-        # Validate before using - bad env value must fail loudly.
-        validated = validate_yyyymmdd(override, source="ES_EXPIRY env")
-        return validated, "ES_EXPIRY env"
-    if redis_client is None:
-        raise FrontMonthMissingError(
-            "ES_EXPIRY env var is unset and no Redis client (BUS_REDIS_URL) - "
-            "cannot resolve ES front-month. Set ES_EXPIRY to a YYYYMMDD value, "
-            "or set BUS_REDIS_URL and ensure ibkr-feed has published the "
-            "front-month metadata key."
-        )
-    deadline = time.monotonic() + max_wait_seconds
-    last_err: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            # read_front_month validates the stored value internally (Fix A).
-            value = read_front_month(redis_client, symbol="ES", exchange="CME")
-            return value, "Redis metadata key"
-        except FrontMonthMissingError as e:
-            last_err = e
-            time.sleep(poll_interval_seconds)
-    raise FrontMonthMissingError(
-        f"ES front-month not in Redis after {max_wait_seconds:.0f}s wait; "
-        f"ibkr-feed may not have started or failed to resolve. Last error: {last_err}"
+    return read_front_month_with_wait(
+        redis_client,
+        symbol="ES",
+        exchange="CME",
+        env_override=override,
+        env_override_source="ES_EXPIRY env",
+        max_wait_seconds=max_wait_seconds,
+        poll_interval_seconds=poll_interval_seconds,
     )
 
 
@@ -475,6 +455,82 @@ def _connect_exec_with_retry(exec_adapter: IBKRExecAdapter, adapter: IBKRAdapter
 # ----------------------------------------------------------------------
 
 
+def _set_consumer_front_month_gauge(service: str, symbol: str, expiry: str) -> None:
+    """Reflect the expiry the paper-trader's bars subscription is bound to.
+
+    No-op on a malformed value so a bad read never crashes the consumer.
+    """
+    try:
+        M.consumer_front_month_expiry.labels(service=service, symbol=symbol.lower()).set(int(expiry))
+    except (TypeError, ValueError):
+        return
+
+
+class _BarsRebinder:
+    """Rebinds the paper-trader bars consumer across a front-month roll.
+
+    Polled between bar batches (drain-then-attach). On a detected roll it
+    builds a fresh single-expiry :class:`Consumer` with ``start_id="$"`` -
+    the strategy must NEVER replay buffered bars, so the rebind accepts a
+    clean one-bar gap rather than a mixed-contract overlap. It advances the
+    consumer-front-month gauge and keeps the runner's roll backstop fresh
+    (``update_front_month``) so a hosted strategy refuses to trade on a
+    rolled-off contract. With an operator expiry pin the watcher is frozen,
+    so this never rebinds.
+
+    Parameterized by ``(symbol, exchange)`` - no hard-coded root - so the
+    same mechanism would serve any instrument the paper-trader hosts.
+    """
+
+    def __init__(
+        self,
+        redis_client: Any,
+        watcher: FrontMonthWatcher,
+        strategy: AlwaysFlatStrategy | PaperStrategyRunner,
+        *,
+        symbol: str,
+        exchange: str,
+        consumer_id: str,
+        service: str = "paper-trader",
+    ) -> None:
+        self._redis = redis_client
+        self._watcher = watcher
+        self._strategy = strategy
+        self._symbol = symbol
+        self._exchange = exchange
+        self._consumer_id = consumer_id
+        self._service = service
+
+    def _refresh_runner(self, *, consumed: str | None = None, resolved: str | None = None) -> None:
+        update = getattr(self._strategy, "update_front_month", None)
+        if callable(update):
+            update(consumed_expiry=consumed, resolved_expiry=resolved)
+
+    def __call__(self, current: Consumer) -> Consumer | None:
+        new_expiry = self._watcher.poll()
+        # Keep the resolved view fresh even when nothing rolled, so the
+        # runner's divergence backstop tracks the producer's front month.
+        self._refresh_runner(resolved=self._watcher.resolved_expiry)
+        if new_expiry is None:
+            return None
+        stream = bars_stream_name(self._symbol, self._exchange, new_expiry)
+        new_consumer = Consumer(
+            redis_client=self._redis,
+            stream=stream,
+            consumer_id=self._consumer_id,
+            start_id="$",
+        )
+        self._watcher.mark_bound(new_expiry)
+        self._refresh_runner(consumed=new_expiry, resolved=new_expiry)
+        _set_consumer_front_month_gauge(self._service, self._symbol, new_expiry)
+        _LOG.warning(
+            "front-month roll detected: paper-trader rebinding bars stream to %s (expiry %s, start_id=$)",
+            stream,
+            new_expiry,
+        )
+        return new_consumer
+
+
 def _build_bus_consumers(
     cfg: DryrunConfig,
     redis_client: Any,
@@ -522,12 +578,17 @@ def _consume_bars_from_bus_sync(
     consumer: Consumer,
     strategy: AlwaysFlatStrategy | PaperStrategyRunner,
     stop_event: threading.Event,
+    rebind: _BarsRebinder | None = None,
 ) -> None:
     """Synchronous bus-consumer loop for ES bars.
 
     Runs in an executor thread. iter_messages returns on block timeout
     (no messages within block_ms), so wrap in an outer while loop that
     keeps re-entering iter_messages until stop_event is set.
+
+    ``rebind`` (when provided) is invoked AFTER each batch drains - the
+    drain-then-attach point - so a front-month roll re-points the
+    subscription to the new single-expiry stream with no process restart.
     """
     feed_label = "es"
     while not stop_event.is_set():
@@ -543,6 +604,13 @@ def _consume_bars_from_bus_sync(
                 "volume": msg.payload["volume"],
             }
             strategy.on_bar(bar, feed_label=feed_label)
+        # Current stream drained (block timed out). Safe point to rebind
+        # across a front-month roll: drain-then-attach keeps each stream
+        # strictly single-expiry so two contracts never interleave.
+        if rebind is not None:
+            new_consumer = rebind(consumer)
+            if new_consumer is not None:
+                consumer = new_consumer
 
 
 def _consume_breadth_from_bus_sync(
@@ -654,6 +722,7 @@ async def _async_main(
     stop_event_thread: threading.Event,
     bus_consumers: tuple[Consumer, Consumer] | None = None,
     ad_breadth_consumer: Consumer | None = None,
+    bars_rebind: _BarsRebinder | None = None,
 ) -> int:
     """Async portion of the dry-run loop.
 
@@ -662,6 +731,8 @@ async def _async_main(
     used (``adapter`` must not be None in that case).
     ``ad_breadth_consumer`` adds the AD-NYSE stream in strategy mode;
     None preserves the always-flat consumer set exactly.
+    ``bars_rebind`` re-points the bars subscription across a front-month
+    roll (None in direct-IBKR mode).
     """
     spec = es_contract_spec(cfg)
     stop_event = asyncio.Event()
@@ -689,6 +760,7 @@ async def _async_main(
                 bars_consumer,
                 strategy,
                 stop_event_thread,
+                bars_rebind,
             )
         )
         breadth_task = asyncio.ensure_future(
@@ -883,6 +955,19 @@ def run(cfg: DryrunConfig) -> int:
             bus_consumers[0]._stream,
             bus_consumers[1]._stream,
         )
+        # Publish the bound expiry so the consumer-front-month gauge exists
+        # from boot (divergence from alpha_assay_front_month_expiry is then
+        # visible immediately, not only after the first roll).
+        _set_consumer_front_month_gauge("paper-trader", "ES", expiry)
+        # An ES_EXPIRY operator pin freezes the roll watcher (manual control).
+        front_month_pinned = bool(os.environ.get("ES_EXPIRY", "").strip())
+        watcher = FrontMonthWatcher(
+            redis_client,
+            symbol="ES",
+            exchange="CME",
+            current_expiry=expiry,
+            pinned=front_month_pinned,
+        )
 
         loaded = load_paper_strategy(dict(os.environ))
         if loaded is None:
@@ -892,7 +977,17 @@ def run(cfg: DryrunConfig) -> int:
             # compose stack remains uniform).
             exec_adapter_stub = object()
             strategy = AlwaysFlatStrategy(exec_adapter=exec_adapter_stub, trade_log=trade_log)
-            return asyncio.run(_async_main(cfg, None, strategy, stop_event, bus_consumers=bus_consumers))
+            bars_rebind = _BarsRebinder(
+                redis_client,
+                watcher,
+                strategy,
+                symbol="ES",
+                exchange="CME",
+                consumer_id="paper-trader-bars",
+            )
+            return asyncio.run(
+                _async_main(cfg, None, strategy, stop_event, bus_consumers=bus_consumers, bars_rebind=bars_rebind)
+            )
 
         # Strategy mode: market data still comes from the bus, but an IBKR
         # connection is required for the ORDER path (paper submission +
@@ -945,6 +1040,14 @@ def run(cfg: DryrunConfig) -> int:
             _LOG.error("skipping startup reconcile: IBKR not connected; broker state is UNVERIFIED")
         ad_consumer = _build_ad_consumer(cfg, redis_client)
         _LOG.info("strategy mode adds breadth stream=%s", ad_consumer._stream)
+        bars_rebind = _BarsRebinder(
+            redis_client,
+            watcher,
+            runner,
+            symbol="ES",
+            exchange="CME",
+            consumer_id="paper-trader-bars",
+        )
         try:
             return asyncio.run(
                 _async_main(
@@ -954,6 +1057,7 @@ def run(cfg: DryrunConfig) -> int:
                     stop_event,
                     bus_consumers=bus_consumers,
                     ad_breadth_consumer=ad_consumer,
+                    bars_rebind=bars_rebind,
                 )
             )
         finally:

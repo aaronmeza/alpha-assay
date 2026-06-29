@@ -66,8 +66,10 @@ import pandas as pd
 import redis as redis_pkg
 
 from alpha_assay.bus.consumer import Consumer
-from alpha_assay.bus.streams import stream_name_for_bars
+from alpha_assay.bus.streams import bars_stream_name, stream_name_for_bars
+from alpha_assay.data.front_month import FrontMonthWatcher
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
+from alpha_assay.observability import metrics as M
 from infra.recorders.ibkr_es_bars import recorder_metrics as RM
 
 LOG = logging.getLogger(__name__)
@@ -165,6 +167,8 @@ class ESBarsRecorder:
         shutdown_timeout_seconds: int = 30,
         bus_redis: redis_pkg.Redis | None = None,
         bus_consumer_id: str = "es-bars-recorder",
+        front_month_pinned: bool = False,
+        service_label: str | None = None,
     ) -> None:
         self._adapter = adapter
         self._out_dir = Path(out_dir)
@@ -183,9 +187,18 @@ class ESBarsRecorder:
         self._flush_period_seconds = flush_period_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
 
+        # Root identity, derived from the contract spec (never a hard-coded
+        # 'es'): a second instance with an NQ spec rebinds on the NQ key.
+        self._symbol = str(self._contract_spec.get("symbol", ""))
+        self._exchange = str(self._contract_spec.get("exchange", ""))
+        # Prometheus `service` label for the consumer-front-month gauge:
+        # distinguishes the es-bars vs nq-bars instance of this same image.
+        self._service_label = service_label or bus_consumer_id
+
         # Bus-consumer mode: if bus_redis is provided, the recorder reads
         # from a Redis Stream instead of subscribing directly to IBKR.
         self._bus_redis = bus_redis
+        self._bus_consumer_id = bus_consumer_id
         self._stream = stream_name_for_bars(self._contract_spec)
         self._consumer: Consumer | None = (
             Consumer(
@@ -197,6 +210,25 @@ class ESBarsRecorder:
             if bus_redis is not None
             else None
         )
+
+        # Roll-rebind watcher: a long-lived bus consumer must rebind its
+        # subscription to the new per-contract stream when the producer
+        # rolls the front month, or it reads a dead stream forever. An
+        # operator expiry pin freezes the watcher (manual control).
+        self._watcher: FrontMonthWatcher | None = (
+            FrontMonthWatcher(
+                bus_redis,
+                symbol=self._symbol,
+                exchange=self._exchange,
+                current_expiry=str(self._contract_spec.get("expiry", "")),
+                pinned=front_month_pinned,
+            )
+            if bus_redis is not None
+            else None
+        )
+        # Publish the initial consumed-expiry so the gauge exists from boot
+        # (a never-rebound consumer is then visible as a flat, stale series).
+        self._set_consumer_front_month_gauge(str(self._contract_spec.get("expiry", "")))
 
         # Day buffer (single feed per recorder instance). Preserved across reconnects.
         self._day_buffer: _DayBuffer | None = None
@@ -340,17 +372,82 @@ class ESBarsRecorder:
 
     @staticmethod
     def _derive_feed_label(spec: dict[str, Any]) -> str:
-        """Build the Prometheus-friendly feed label from a contract spec.
+        """Build the *stable* Prometheus feed label from a contract spec.
 
-        Mirrors :func:`alpha_assay.data.ibkr_adapter._feed_label` so
-        recorder + adapter metrics carry identical feed values for
-        cross-series joins on the dashboards.
+        Deliberately drops the expiry: the label is ``ES-FUT`` / ``NQ-FUT``,
+        NOT ``ES-FUT-20260618``. Including the expiry split the
+        ``bars_*_total`` time series on every quarterly roll (a new label
+        value, counters reset to 0), which broke continuity and alerting
+        across the exact roll this fix targets. The per-contract expiry the
+        recorder is consuming is exposed separately on
+        ``alpha_assay_consumer_front_month_expiry`` instead.
         """
         parts = [str(spec.get("symbol", "")), str(spec.get("sec_type", ""))]
-        expiry = spec.get("expiry")
-        if expiry:
-            parts.append(str(expiry))
         return "-".join(p for p in parts if p)
+
+    def _set_consumer_front_month_gauge(self, expiry: str) -> None:
+        """Reflect the expiry this recorder is currently consuming.
+
+        No-op on a malformed value so a bad read never crashes the loop.
+        """
+        try:
+            M.consumer_front_month_expiry.labels(
+                service=self._service_label,
+                symbol=self._symbol.lower(),
+            ).set(int(expiry))
+        except (TypeError, ValueError):
+            return
+
+    def _check_and_rebind(self) -> str | None:
+        """Rebind the bus subscription if the front month has rolled.
+
+        Polls the watcher (a cheap Redis GET). On a changed expiry, rebuilds
+        the :class:`Consumer` onto the new single-expiry stream and advances
+        the consumed-expiry gauge. Returns the new expiry on rebind, else
+        ``None``. NO process restart: the running recorder simply re-points.
+
+        ``start_id="0"`` replays the new contract's stream from the start
+        (bounded by the producer MAXLEN). The stream is strictly
+        single-expiry, so this never interleaves two contracts' bars, and
+        the day-buffer dedup keeps the shard clean if any minute overlaps.
+        Draining-then-attaching is guaranteed by the call site: the consume
+        loop only reaches this check after ``iter_messages`` has drained the
+        old stream (block timeout with no remaining entries).
+        """
+        if self._watcher is None or self._bus_redis is None:
+            return None
+        new_expiry = self._watcher.poll()
+        if new_expiry is None:
+            return None
+        self._contract_spec = {**self._contract_spec, "expiry": new_expiry}
+        self._stream = bars_stream_name(self._symbol, self._exchange, new_expiry)
+        self._consumer = Consumer(
+            redis_client=self._bus_redis,
+            stream=self._stream,
+            consumer_id=self._bus_consumer_id,
+            start_id="0",
+        )
+        self._watcher.mark_bound(new_expiry)
+        self._set_consumer_front_month_gauge(new_expiry)
+        LOG.warning(
+            "front-month roll detected for %s@%s: rebinding %s recorder to stream %s (expiry %s); "
+            "feed label %s stays stable",
+            self._symbol,
+            self._exchange,
+            self._feed_label,
+            self._stream,
+            new_expiry,
+            self._feed_label,
+        )
+        return new_expiry
+
+    async def check_and_rebind_for_test(self) -> str | None:
+        """Test seam: run one rebind check without the consume loop.
+
+        Lets the roll-boundary test drive a roll on the *running* recorder
+        (no restart) deterministically, then resume consuming.
+        """
+        return self._check_and_rebind()
 
     def _request_shutdown(self) -> None:
         LOG.info("es-bars-recorder: shutdown requested")
@@ -524,6 +621,11 @@ class ESBarsRecorder:
                     "feed": self._feed_label,
                 }
                 self.ingest_bar(bar)
+            # The current stream is drained (block timed out with nothing
+            # new). Now is the safe point to rebind across a front-month
+            # roll: drain-then-attach, so two contracts' bars never
+            # interleave on one stream.
+            self._check_and_rebind()
 
     def _flush_one(self, buf: _DayBuffer) -> int:
         if not buf.rows:

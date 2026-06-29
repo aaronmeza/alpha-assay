@@ -64,6 +64,20 @@ def stream_name_for_bars(contract_spec: dict[str, Any]) -> str:
     return ".".join(p for p in parts if p)
 
 
+def bars_stream_name(symbol: str, venue: str, expiry: str | None = None) -> str:
+    """Build a bar stream name from explicit ``(symbol, venue, expiry)``.
+
+    Thin wrapper over :func:`stream_name_for_bars` for callers that hold
+    the parts directly rather than a contract-spec dict - notably the
+    roll-aware rebind path, which produces ``bars.<root>.<venue>.<E2>``
+    when the front month rolls. Parameterized by ``(symbol, venue)`` with
+    no hard-coded root, so a second instrument (e.g. NQ) shares the path.
+
+    Raises ValueError if ``symbol`` or ``venue`` is missing or empty.
+    """
+    return stream_name_for_bars({"symbol": symbol, "exchange": venue, "expiry": expiry})
+
+
 def stream_name_for_ticks(symbol: str) -> str:
     """Build a deterministic stream name for a tick feed.
 

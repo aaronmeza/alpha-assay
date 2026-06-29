@@ -1048,6 +1048,34 @@
       ]
     },
     {
+      "type": "timeseries",
+      "id": 36,
+      "title": "Front-month expiry: resolved vs consumed",
+      "description": "alpha_assay_consumer_front_month_expiry (per service) vs alpha_assay_front_month_expiry (resolved). In steady state the lines overlap; a persistent gap means a bus consumer is still reading a rolled-off per-contract stream (the silent roll-day stall - alphaassay-n7h). Watch the lines step together at each quarterly roll.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 107
+      },
+      "targets": [
+        {
+          "expr": "alpha_assay_consumer_front_month_expiry",
+          "legendFormat": "consumed: {{service}} ({{symbol}})",
+          "refId": "A"
+        },
+        {
+          "expr": "alpha_assay_front_month_expiry",
+          "legendFormat": "resolved: {{symbol}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
       "type": "stat",
       "id": 107,
       "title": "Scrape target up (per job)",

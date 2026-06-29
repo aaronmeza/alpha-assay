@@ -219,6 +219,15 @@ class PaperStrategyRunner:
         # generate_signals over the end-state frame.
         self.fired_signals: list[Signal] = []
 
+        # Front-month roll backstop: the expiry the bus subscription is
+        # bound to vs the producer's resolved front month. While they
+        # diverge (a roll the consumer has not yet rebound across) the
+        # runner REFUSES to submit orders - it must never trade on bars
+        # from a rolled-off contract. The paper-trader harness keeps these
+        # fresh from the front-month key on each consumer poll.
+        self._consumed_expiry: str | None = contract_spec.get("expiry")
+        self._resolved_expiry: str | None = contract_spec.get("expiry")
+
         M.position_contracts.set(0)
         M.realized_pnl_dollars.set(0.0)
 
@@ -236,6 +245,39 @@ class PaperStrategyRunner:
     @property
     def open_position(self) -> _OpenPosition | None:
         return self._position
+
+    @property
+    def front_month_diverged(self) -> bool:
+        """True while the consumed expiry differs from the resolved front month.
+
+        The runner refuses to open new positions while this holds (see
+        :meth:`_on_row`): trading on a rolled-off contract is exactly the
+        failure this fix prevents.
+        """
+        return (
+            self._consumed_expiry is not None
+            and self._resolved_expiry is not None
+            and self._consumed_expiry != self._resolved_expiry
+        )
+
+    def update_front_month(
+        self,
+        *,
+        consumed_expiry: str | None = None,
+        resolved_expiry: str | None = None,
+    ) -> None:
+        """Refresh the consumed / resolved front-month expiries.
+
+        Called by the paper-trader harness on each consumer poll:
+        ``resolved_expiry`` from the front-month key, ``consumed_expiry``
+        once the bus subscription has rebound to a new contract. A
+        divergence between the two halts new entries until the rebind
+        catches up.
+        """
+        if consumed_expiry is not None:
+            self._consumed_expiry = consumed_expiry
+        if resolved_expiry is not None:
+            self._resolved_expiry = resolved_expiry
 
     # --- bus event surface --------------------------------------------------
 
@@ -354,6 +396,17 @@ class PaperStrategyRunner:
         if direction == 0:
             return
         M.signals_generated_total.labels(strategy=self._strategy_name, direction=str(direction)).inc()
+        if self.front_month_diverged:
+            # Backstop: the bus subscription is on a rolled-off contract
+            # (the producer has moved to a new front month and the consumer
+            # has not yet rebound). Refuse to enter on stale-contract bars.
+            self._filtered("front_month_diverged", "stale_contract")
+            _LOG.error(
+                "front-month diverged (consuming %s, resolved %s); refusing to trade until rebind",
+                self._consumed_expiry,
+                self._resolved_expiry,
+            )
+            return
         if not self._in_session(ts):
             self._filtered("session_mask", "outside_window")
             return

@@ -49,11 +49,7 @@ from typing import Any
 import redis as redis_pkg
 from prometheus_client import start_http_server
 
-from alpha_assay.data.front_month import (
-    FrontMonthMissingError,
-    read_front_month,
-    validate_yyyymmdd,
-)
+from alpha_assay.data.front_month import read_front_month_with_wait
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from infra.recorders.ibkr_es_bars.recorder import ESBarsRecorder
 
@@ -111,10 +107,12 @@ def _resolve_es_expiry_with_wait(
 ) -> tuple[str, str]:
     """Resolve the front-month expiry, polling Redis for up to max_wait_seconds.
 
-    Env-override path is checked first (instant, validated). If env is
-    unset and Redis is provided, poll the per-root key for up to
-    max_wait_seconds before giving up. Handles the cold-start race where
-    the consumer boots before ibkr-feed has written the metadata key.
+    Thin wrapper over the shared
+    :func:`alpha_assay.data.front_month.read_front_month_with_wait`: this
+    function only owns the recorder's env-pin *policy* (``BARS_EXPIRY``
+    always, ``ES_EXPIRY`` ES-only via :func:`_expiry_override`) and hands
+    the resolved override plus the (symbol, exchange) to the shared
+    resolver. Keeps the historical name + signature for callers/tests.
 
     Returns:
         Tuple of (expiry_value, source_label). Log source for operator
@@ -125,33 +123,15 @@ def _resolve_es_expiry_with_wait(
         FrontMonthMissingError: neither env nor Redis key available after
             max_wait_seconds.
     """
-    import time
-
     override, override_var = _expiry_override(symbol)
-    if override:
-        # Validate before using - bad env value must fail loudly.
-        validated = validate_yyyymmdd(override, source=f"{override_var} env")
-        return validated, f"{override_var} env"
-    if redis_client is None:
-        raise FrontMonthMissingError(
-            f"no expiry env override is set and no Redis client - cannot resolve "
-            f"the {symbol} front-month. Set BARS_EXPIRY (or ES_EXPIRY for ES) to "
-            f"YYYYMMDD or ensure BUS_REDIS_URL is set and ibkr-feed has published "
-            f"the front-month metadata key."
-        )
-    deadline = time.monotonic() + max_wait_seconds
-    last_err: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            # read_front_month validates the stored value internally (Fix A).
-            value = read_front_month(redis_client, symbol=symbol, exchange=exchange)
-            return value, "Redis metadata key"
-        except FrontMonthMissingError as e:
-            last_err = e
-            time.sleep(poll_interval_seconds)
-    raise FrontMonthMissingError(
-        f"{symbol} front-month not in Redis after {max_wait_seconds:.0f}s wait; "
-        f"ibkr-feed may not have started or failed to resolve. Last error: {last_err}"
+    return read_front_month_with_wait(
+        redis_client,
+        symbol=symbol,
+        exchange=exchange,
+        env_override=override,
+        env_override_source=f"{override_var} env" if override_var else "env override",
+        max_wait_seconds=max_wait_seconds,
+        poll_interval_seconds=poll_interval_seconds,
     )
 
 
@@ -210,11 +190,18 @@ def main() -> None:
             bus_redis_url,
             contract_spec,
         )
+        # An operator expiry pin (BARS_EXPIRY / ES_EXPIRY) freezes the
+        # roll-rebind watcher: the operator has taken manual control of the
+        # contract, so the recorder must not auto-rebind out from under them.
+        override, _override_var = _expiry_override(symbol)
+        bus_consumer_id = os.environ.get("BUS_CONSUMER_ID", f"{symbol.lower()}-bars-recorder")
         recorder = ESBarsRecorder(
             out_dir=out_dir,
             contract_spec=contract_spec,
             bus_redis=bus_redis,
-            bus_consumer_id=os.environ.get("BUS_CONSUMER_ID", f"{symbol.lower()}-bars-recorder"),
+            bus_consumer_id=bus_consumer_id,
+            front_month_pinned=bool(override),
+            service_label=bus_consumer_id,
         )
     else:
         # Direct-IBKR mode (legacy): recorder subscribes directly to IB Gateway.

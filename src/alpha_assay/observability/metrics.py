@@ -162,6 +162,18 @@ front_month_expiry = Gauge(
     ["symbol", "exchange"],
 )
 
+consumer_front_month_expiry = Gauge(
+    f"{_PREFIX}consumer_front_month_expiry",
+    "Front-month expiry (YYYYMMDD int) the consumer's bus subscription is "
+    "currently bound to, per service. Compared against "
+    "alpha_assay_front_month_expiry to detect a consumer that is still "
+    "reading a rolled-off per-contract stream: a persistent gap means the "
+    "consumer never rebound across a quarterly roll (the silent roll-day "
+    "stall). Equal in steady state; differs only during the one-bar "
+    "roll-rebind gap.",
+    labelnames=("service", "symbol"),
+)
+
 # --- Session state ---
 
 in_session = Gauge(f"{_PREFIX}in_session", "1 if inside strategy session window, else 0.")

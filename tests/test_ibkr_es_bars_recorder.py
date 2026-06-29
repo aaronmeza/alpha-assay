@@ -252,7 +252,7 @@ def test_recorder_handles_day_rollover(tmp_path: Path) -> None:
 
 def test_recorder_increments_received_counter(tmp_path: Path) -> None:
     rec = ESBarsRecorder(adapter=_mk_adapter(), out_dir=tmp_path)
-    label = "ES-FUT-20260618"
+    label = "ES-FUT"
     before = _counter_value(recorder_mod.RM.bars_received_total, feed=label)
     rec.ingest_bar(_bar("2026-04-28T14:30:00Z"))
     rec.ingest_bar(_bar("2026-04-28T14:31:00Z"))
@@ -263,7 +263,7 @@ def test_recorder_increments_received_counter(tmp_path: Path) -> None:
 
 def test_recorder_increments_written_counter_on_flush(tmp_path: Path) -> None:
     rec = ESBarsRecorder(adapter=_mk_adapter(), out_dir=tmp_path)
-    label = "ES-FUT-20260618"
+    label = "ES-FUT"
     rec.ingest_bar(_bar("2026-04-28T14:30:00Z"))
     rec.ingest_bar(_bar("2026-04-28T14:31:00Z"))
     before = _counter_value(recorder_mod.RM.bars_written_total, feed=label)
@@ -274,7 +274,7 @@ def test_recorder_increments_written_counter_on_flush(tmp_path: Path) -> None:
 
 def test_recorder_resets_last_bar_age_on_in_rth_bar(tmp_path: Path) -> None:
     rec = ESBarsRecorder(adapter=_mk_adapter(), out_dir=tmp_path)
-    label = "ES-FUT-20260618"
+    label = "ES-FUT"
     rec.ingest_bar(_bar("2026-04-28T14:30:00Z"))
     val = _gauge_value(recorder_mod.RM.last_bar_age_seconds, feed=label)
     # Gauge is now wall-clock-derived. On bar arrival it computes
@@ -290,7 +290,7 @@ def test_recorder_bar_age_climbs_when_no_bars_arrive(tmp_path: Path) -> None:
     monotonic clock and verify the gauge tracks the delta forward.
     """
     rec = ESBarsRecorder(adapter=_mk_adapter(), out_dir=tmp_path)
-    label = "ES-FUT-20260618"
+    label = "ES-FUT"
     rec.ingest_bar(_bar("2026-04-28T14:30:00Z"))
     receipt_time = rec._last_bar_received_at  # type: ignore[attr-defined]
     assert receipt_time is not None
@@ -305,7 +305,7 @@ def test_recorder_bar_age_reports_uptime_when_no_bar_yet(tmp_path: Path) -> None
     """Before any bar arrives the gauge should report seconds-since-start,
     not 0.0 - a recorder that never subscribed must still fail freshness."""
     rec = ESBarsRecorder(adapter=_mk_adapter(), out_dir=tmp_path)
-    label = "ES-FUT-20260618"
+    label = "ES-FUT"
     start = rec._recorder_start_monotonic  # type: ignore[attr-defined]
     with patch.object(recorder_mod.time, "monotonic", return_value=start + 120.0):
         rec._update_age_gauge()
@@ -339,7 +339,7 @@ def test_recorder_increments_write_errors_when_flush_fails(tmp_path: Path, monke
         raise OSError("simulated disk failure")
 
     monkeypatch.setattr(pd.DataFrame, "to_parquet", _boom, raising=True)
-    label = "ES-FUT-20260618"
+    label = "ES-FUT"
     before = _counter_value(recorder_mod.RM.write_errors_total, feed=label, error_class="OSError")
     written = rec.flush()
     after = _counter_value(recorder_mod.RM.write_errors_total, feed=label, error_class="OSError")
