@@ -54,7 +54,6 @@ import asyncio
 import logging
 import signal
 import time
-from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
@@ -67,7 +66,7 @@ import pandas as pd
 import redis as redis_pkg
 
 from alpha_assay.bus.consumer import Consumer
-from alpha_assay.bus.streams import bars_stream_has_data, bars_stream_name, stream_name_for_bars
+from alpha_assay.bus.streams import bars_stream_name, stream_name_for_bars
 from alpha_assay.data.front_month import FrontMonthWatcher
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.observability import metrics as M
@@ -227,7 +226,6 @@ class ESBarsRecorder:
                 exchange=self._exchange,
                 current_expiry=str(self._contract_spec.get("expiry", "")),
                 pinned=front_month_pinned,
-                stream_has_data=self._make_stream_data_probe(bus_redis),
             )
             if bus_redis is not None
             else None
@@ -390,21 +388,6 @@ class ESBarsRecorder:
         """
         parts = [str(spec.get("symbol", "")), str(spec.get("sec_type", ""))]
         return "-".join(p for p in parts if p)
-
-    def _make_stream_data_probe(self, bus_redis: redis_pkg.Redis) -> Callable[[str], bool]:
-        """Build the data-gate probe for the watcher.
-
-        Reports whether the candidate contract's bar stream has data yet -
-        the signal that the producer has truly switched (it keeps publishing
-        the old stream after a pre-open key flip until its restart). Derived
-        from this instance's symbol/exchange, never a hard-coded root.
-        """
-        symbol, exchange = self._symbol, self._exchange
-
-        def _probe(expiry: str) -> bool:
-            return bars_stream_has_data(bus_redis, symbol, exchange, expiry)
-
-        return _probe
 
     def _set_consumer_front_month_gauge(self, expiry: str) -> None:
         """Reflect the expiry this recorder is currently consuming.

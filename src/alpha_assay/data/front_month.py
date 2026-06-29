@@ -193,53 +193,35 @@ class FrontMonthWatcher:
     this fix addresses). This watcher lets the consumer detect the roll on
     a cheap poll and rebind, with no process restart.
 
-    Data-gated cutover (the critical subtlety)
-    ------------------------------------------
-    The front-month KEY and the producer's actual PUBLISHING stream do not
-    flip together. The producer re-resolves at the 08:00 CT pre-open and
-    writes the new key + gauge, but - by design - keeps publishing the OLD
-    per-contract stream until its next restart (``infra/feed/run.py``
-    ``_pre_open_requalify_loop``). In the window between that key flip and
-    the restart, ``key == E2`` while the LIVE data is still on the E1
-    stream. A key-only rebind would abandon the live E1 stream for an empty
-    E2 stream - the same silent-stall failure class, just relocated.
-
-    So the cutover is gated on DATA, not the key: when the key flips the
-    watcher records a ``pending_expiry`` but does NOT advance the binding
-    until the new stream actually has >=1 entry (``stream_has_data``). The
-    producer only begins publishing the new stream after its restart, at
-    which point the old stream is provably dead - so "the new stream has
-    data" is the reliable cutover signal. Until then the consumer keeps
-    consuming the still-live old stream and is NOT considered diverged.
+    Atomic key+stream flip (why a plain key-watch is safe)
+    ------------------------------------------------------
+    The producer flips the front-month KEY and its publishing stream
+    together, atomically: on a detected rollover the feed daemon exits
+    ``EXIT_RESTART`` and cold-starts, which re-resolves, writes the new key,
+    and bakes the new per-contract stream in one step (see
+    ``infra/feed/run.py`` ``_pre_open_requalify_loop`` + ``_run_subscriptions``).
+    So when this watcher observes the key flip to a new expiry, the producer
+    is already publishing that stream - a key-watch rebind is safe, with no
+    pre-open-to-restart window for the key to lead the live stream.
 
     State:
 
-    - ``bound_expiry`` - the expiry the consumer's stream is attached to
-      and reading live data from. The consumer calls :meth:`mark_bound`
-      after it rebinds.
-    - ``resolved_expiry`` - the data-confirmed live front month. Advances
-      to a new expiry only when the cutover is warranted (key flipped AND
-      new stream live); it equals ``bound_expiry`` except in the brief
-      cutover instant.
-    - ``pending_expiry`` - the new key value while the cutover is gated
-      (key flipped but the new stream has no data yet), else ``None``.
+    - ``bound_expiry`` - the expiry the consumer's stream is attached to and
+      reading live data from. The consumer calls :meth:`mark_bound` after it
+      rebinds.
+    - ``resolved_expiry`` - the most recent good read of the front-month key
+      (what the producer is publishing now); equals ``bound_expiry`` except
+      in the brief instant between observing the flip and rebinding.
 
-    ``diverged`` is ``True`` only while ``resolved_expiry != bound_expiry``
-    - i.e. the new stream is provably live but the consumer has not yet
-    cut over. It is NOT true merely because the key changed: during the
-    pre-open-to-restart window the bound stream is still the live front
-    month. The paper-trader uses ``diverged`` as a trade-refusal backstop.
+    ``diverged`` is ``True`` while ``resolved_expiry != bound_expiry`` - the
+    transient between observing the new front month and the consumer
+    rebinding to it. The paper-trader uses ``diverged`` as a trade-refusal
+    backstop so it never acts on a rolled-off contract during that instant.
 
     Resilience: a missing key, an invalid value, or any Redis error returns
     ``None`` from :meth:`poll` and does NOT advance state - a transient blip
     must never tear down a healthy subscription. An operator env-pin
     (``pinned=True``) freezes the watcher entirely.
-
-    ``stream_has_data`` is an injected ``Callable[[str expiry], bool]`` that
-    reports whether the candidate contract's stream has entries (the
-    consumer supplies one backed by :func:`alpha_assay.bus.streams
-    .bars_stream_has_data`). When ``None`` the watcher falls back to
-    key-only cutover (used only where no producer-lag window exists).
     """
 
     def __init__(
@@ -250,16 +232,13 @@ class FrontMonthWatcher:
         exchange: str,
         current_expiry: str,
         pinned: bool = False,
-        stream_has_data: Callable[[str], bool] | None = None,
     ) -> None:
         self._redis = redis_client
         self._symbol = symbol
         self._exchange = exchange
         self._bound = current_expiry
         self._resolved = current_expiry
-        self._pending: str | None = None
         self._pinned = pinned
-        self._stream_has_data = stream_has_data
 
     @property
     def symbol(self) -> str:
@@ -276,35 +255,29 @@ class FrontMonthWatcher:
 
     @property
     def resolved_expiry(self) -> str:
-        """Data-confirmed live front month (advances only on cutover)."""
+        """Most recent good read of the front-month key."""
         return self._resolved
 
     @property
-    def pending_expiry(self) -> str | None:
-        """New key value while the data-gated cutover is held, else None."""
-        return self._pending
-
-    @property
     def diverged(self) -> bool:
-        """True only while a provably-live new stream awaits cutover."""
+        """True while the bound stream is not yet the resolved front month."""
         return self._resolved != self._bound
 
     def mark_bound(self, expiry: str) -> None:
         """Record that the consumer has rebound its stream to ``expiry``."""
         self._bound = expiry
-        if self._pending == expiry:
-            self._pending = None
 
     def poll(self) -> str | None:
-        """Re-read the key; return the new expiry only when a cutover is due.
+        """Re-read the key; return the new expiry when a cutover is due.
 
-        Returns the new expiry when the consumer should cut over - the key
-        has flipped AND (data gate) the new stream actually has data, so the
-        producer has provably switched. The caller rebinds its stream and
-        then calls :meth:`mark_bound`. Returns ``None`` when no cutover is
-        due: unchanged, pinned, no Redis handle, a transient missing/invalid
-        key, or the key flipped but the new stream is not yet live (the
-        producer is still publishing the old stream - keep consuming it).
+        Returns the new expiry when the key has flipped. The producer flips
+        the key and its publishing stream together (it exits EXIT_RESTART on
+        a rollover and cold-starts onto the new stream), so a flipped key
+        means the new stream is already live. The caller rebinds its stream
+        and then calls :meth:`mark_bound`. Returns ``None`` when no cutover
+        is due: unchanged, pinned, no Redis handle, or a transient
+        missing/invalid key (hold the current binding rather than tear down
+        a healthy subscription on a blip).
         """
         if self._pinned or self._redis is None:
             return None
@@ -318,26 +291,16 @@ class FrontMonthWatcher:
         except Exception:  # noqa: BLE001 - any Redis error is a transient blip
             _LOG.warning("front-month watch poll failed for %s@%s; holding binding", self._symbol, self._exchange)
             return None
-        if candidate == self._bound:
-            # Steady state: the bound stream is the resolved front month.
-            self._pending = None
-            self._resolved = candidate
-            return None
-        # The key has flipped. Data-gate the cutover: do not abandon the live
-        # bound stream until the new stream provably carries data.
-        if self._stream_has_data is not None and not self._stream_has_data(candidate):
-            if self._pending != candidate:
-                _LOG.info(
-                    "front-month key flipped %s -> %s for %s@%s but the new stream has no data yet; "
-                    "holding on the live stream until the producer restarts onto it",
-                    self._bound,
-                    candidate,
-                    self._symbol,
-                    self._exchange,
-                )
-            self._pending = candidate
-            return None
-        # New stream is live (has data, or no data gate configured) -> cut over.
-        self._pending = candidate
         self._resolved = candidate
+        if candidate == self._bound:
+            return None
+        # The key flipped: the producer rolled (key + stream flip atomically),
+        # so the new stream is live. Signal the consumer to rebind.
+        _LOG.info(
+            "front-month rolled %s -> %s for %s@%s; rebinding consumer stream",
+            self._bound,
+            candidate,
+            self._symbol,
+            self._exchange,
+        )
         return candidate

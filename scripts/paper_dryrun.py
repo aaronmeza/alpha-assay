@@ -123,7 +123,6 @@ from prometheus_client import start_http_server
 
 from alpha_assay.bus.consumer import Consumer
 from alpha_assay.bus.streams import (
-    bars_stream_has_data,
     bars_stream_name,
     stream_name_for_bars,
     stream_name_for_ticks,
@@ -976,7 +975,6 @@ def run(cfg: DryrunConfig) -> int:
             exchange="CME",
             current_expiry=expiry,
             pinned=front_month_pinned,
-            stream_has_data=lambda e: bars_stream_has_data(redis_client, "ES", "CME", e),
         )
 
         loaded = load_paper_strategy(dict(os.environ))

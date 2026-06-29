@@ -11,12 +11,9 @@ hard fail (consumers exit), additive minor fields are tolerated.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import msgpack
-
-if TYPE_CHECKING:
-    import redis as redis_pkg
 
 CURRENT_VERSION = 1
 
@@ -79,31 +76,6 @@ def bars_stream_name(symbol: str, venue: str, expiry: str | None = None) -> str:
     Raises ValueError if ``symbol`` or ``venue`` is missing or empty.
     """
     return stream_name_for_bars({"symbol": symbol, "exchange": venue, "expiry": expiry})
-
-
-def bars_stream_has_data(redis_client: redis_pkg.Redis, symbol: str, venue: str, expiry: str) -> bool:
-    """Non-destructively report whether a contract's bar stream has entries.
-
-    Used by the consumer-side roll cutover as the *data gate*: the producer
-    writes the new front-month key at the 08:00 CT pre-open re-qualify but
-    keeps publishing the OLD per-contract stream until its next restart
-    (``infra/feed/run.py`` ``_pre_open_requalify_loop`` - "stays on the
-    boot-time stream by design"). A key-only rebind would therefore abandon
-    the still-live old stream for an empty new one (silent starvation). The
-    producer only begins publishing the new stream after that restart, so
-    "the new stream has >=1 entry" is the reliable signal that the producer
-    has truly switched and the consumer may cut over.
-
-    Uses ``XLEN`` (O(1), read-only) - it never consumes entries, so it is
-    safe to call on a stream the consumer has not yet attached to. A missing
-    stream reports 0. Any Redis error is treated as "no data" so a transient
-    blip holds the consumer on its current (live) stream rather than cutting
-    over to an unverified one.
-    """
-    try:
-        return int(redis_client.xlen(bars_stream_name(symbol, venue, expiry))) > 0
-    except Exception:  # noqa: BLE001 - any Redis error -> hold (do not cut over)
-        return False
 
 
 def stream_name_for_ticks(symbol: str) -> str:
