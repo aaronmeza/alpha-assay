@@ -136,3 +136,62 @@ def test_async_main_exits_ok_on_clean_stop(monkeypatch):
     rc = _run_async_main(module, adapter, stop_event_thread, trip=stop_event_thread.set)
 
     assert rc == module.EXIT_OK
+
+
+def test_async_main_clean_stop_wins_concurrent_connection_loss(monkeypatch):
+    # Finding F: a stop requested via the threading event must win even when the
+    # connection is already lost and the threading->async bridge has not yet fired,
+    # so a clean shutdown is never misreported as a restart.
+    module = _load_script_module()
+    monkeypatch.setattr(module, "WATCHDOG_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(module, "_consume_bars_from_bus_sync", _idle_consume)
+    monkeypatch.setattr(module, "_consume_breadth_from_bus_sync", _idle_consume)
+
+    adapter = _FakeAdapter(connected=False)  # connection already lost -> wd_task ready at once
+    stop_event_thread = threading.Event()
+    stop_event_thread.set()  # stop requested concurrently
+
+    redis_client = fakeredis.FakeRedis()
+    bus_consumers = module._build_bus_consumers(_cfg(module), redis_client)
+    strategy = module.AlwaysFlatStrategy(exec_adapter=object(), trade_log=None)
+    rc = asyncio.run(
+        asyncio.wait_for(
+            module._async_main(_cfg(module), adapter, strategy, stop_event_thread, bus_consumers=bus_consumers),
+            timeout=8.0,
+        )
+    )
+    assert rc == module.EXIT_OK
+
+
+def test_connect_exec_with_retry_succeeds_after_transient_failures(monkeypatch):
+    # Finding E: the cold-start retry must actually be exercised - succeeds once a
+    # later attempt connects (gateway came back mid-IBC-cycle).
+    module = _load_script_module()
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    adapter = _FakeAdapter(connected=False)
+    calls = {"n": 0}
+
+    class _Exec:
+        def connect(self):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                adapter.is_connected = True
+            else:
+                raise ConnectionError("gateway down")
+
+    assert module._connect_exec_with_retry(_Exec(), adapter) is True
+    assert calls["n"] == 3
+
+
+def test_connect_exec_with_retry_returns_false_when_exhausted(monkeypatch):
+    # All attempts fail -> returns False (caller continues metrics-only; the
+    # watchdog/Docker loop recovers when the gateway returns).
+    module = _load_script_module()
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    adapter = _FakeAdapter(connected=False)
+
+    class _Exec:
+        def connect(self):
+            raise ConnectionError("gateway down")
+
+    assert module._connect_exec_with_retry(_Exec(), adapter) is False

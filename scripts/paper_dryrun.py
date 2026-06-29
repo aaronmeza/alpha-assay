@@ -762,7 +762,11 @@ async def _async_main(
         # clean SIGTERM/SIGINT and a connection loss become ready in the same loop
         # turn. Honour the clean stop (EXIT_OK) in that case, matching
         # infra/feed/run.py; only a connection loss with no stop requested restarts.
-        if stop_wait in done:
+        # stop_event_thread is the source-of-truth stop signal (set by the signal
+        # handler); checking it as well closes the ~200ms window where the
+        # threading->asyncio bridge has not yet set stop_event, during which a
+        # concurrent connection loss would otherwise win and force a needless restart.
+        if stop_wait in done or stop_event_thread.is_set():
             exit_code = EXIT_OK
         elif wd_task is not None and wd_task in done:
             exit_code = EXIT_RESTART
@@ -924,10 +928,11 @@ def run(cfg: DryrunConfig) -> int:
             starting_balance=cfg.paper_starting_balance,
         )
         exec_adapter.on_fill(runner.handle_fill)
-        try:
-            exec_adapter.connect()
-        except Exception:
-            _LOG.exception("initial ibkr connect failed; orders will fail until the gateway returns")
+        # Retry the cold-start connect with backoff: a freshly (re)started
+        # container can land mid-IBC-cycle while IB Gateway is briefly down, and
+        # exiting immediately would churn the watchdog/Docker restart loop.
+        if not _connect_exec_with_retry(exec_adapter, adapter):
+            _LOG.error("initial ibkr connect failed after retries; orders will fail until the gateway returns")
             runner.on_disconnect()
         if adapter.is_connected:
             qty, cancelled = runner.startup_reconcile()
