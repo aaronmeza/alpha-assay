@@ -35,6 +35,12 @@ def _mark_fired(state, rule, key):
     state.firing[(rule.name, key)] = True
 
 
+def _mark_resolved(state, rule, key):
+    """Simulate the caller dropping state after a resolve delivered (post succeeded)."""
+    state.firing.pop((rule.name, key), None)
+    state.breach_started.pop((rule.name, key), None)
+
+
 # --- in_rth -------------------------------------------------------------------
 
 
@@ -52,7 +58,23 @@ def test_in_rth_false_on_weekend_and_outside_window():
 
 def test_table_has_expected_rules():
     names = {r.name for r in _rules()}
-    assert names == {"ibkr_feed_freshness", "ibkr_feed_connected", "paper_trader_connected"}
+    assert names == {
+        "ibkr_feed_freshness",
+        "ibkr_feed_connected",
+        "paper_trader_connected",
+        "process_liveness",
+    }
+
+
+def test_process_liveness_rule_uses_up_metric():
+    # 0n6 backstop: a gone process exports no gauge, so only up==0 catches it.
+    # Scoped to the two connection-holding jobs, RTH-gated, keyed on job.
+    rule = _rule("process_liveness")
+    assert "up{" in rule.breach_query
+    assert "== 0" in rule.breach_query
+    assert "ibkr-feed" in rule.breach_query and "paper-trader" in rule.breach_query
+    assert rule.label_key == "job"
+    assert rule.rth_only is True
 
 
 def test_feed_connected_rule_scoped_to_ibkr_feed():
@@ -109,15 +131,34 @@ def test_undelivered_fire_is_retried():
 
 
 def test_recovery_resolves_once():
-    # Given a delivered firing series, When it stops breaching, Then it resolves once.
+    # Given a delivered firing series, When it stops breaching, Then it resolves once
+    # the resolve is itself delivered (caller drops state), and not again after.
     rule = _rule("paper_trader_connected")
     state = AlertState()
     evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0)
     evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0 + 120)  # returns fire
-    _mark_fired(state, rule, "paper-trader")  # caller delivered it
+    _mark_fired(state, rule, "paper-trader")  # caller delivered the fire
     resolved = evaluate_rule(rule, {}, state, 1000.0 + 130)
     assert [a for a, _k, _m in resolved] == ["resolve"]
+    _mark_resolved(state, rule, "paper-trader")  # caller delivered the resolve
     assert evaluate_rule(rule, {}, state, 1000.0 + 140) == []
+
+
+def test_undelivered_resolve_is_retried():
+    # Finding (round-5) regression: evaluate_rule must NOT self-clear firing on a
+    # resolve, so a resolve the caller never delivered (post_telegram failed) is
+    # returned again next poll rather than lost - else operators keep believing the
+    # outage is active.
+    rule = _rule("paper_trader_connected")
+    state = AlertState()
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0)
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0 + 120)  # fire
+    _mark_fired(state, rule, "paper-trader")
+    first = evaluate_rule(rule, {}, state, 1000.0 + 130)
+    assert [a for a, _k, _m in first] == ["resolve"]
+    # Caller did NOT mark the resolve delivered -> the recovered series re-resolves.
+    retry = evaluate_rule(rule, {}, state, 1000.0 + 140)
+    assert [a for a, _k, _m in retry] == ["resolve"]
 
 
 def test_transient_breach_clears_without_firing():

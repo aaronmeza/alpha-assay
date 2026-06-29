@@ -163,22 +163,23 @@ def evaluate_rule(
     """Advance one rule's state machine for a single poll.
 
     Returns a list of ``(action, series_key, message)`` where action is 'fire' or
-    'resolve'. Mutates ``state`` (breach timers; pops firing/breach state on
-    resolve) but does NOT set the firing flag for a fire - the caller sets it only
-    after the notification is delivered, so a transient Telegram failure on the
-    first fire is retried on the next poll instead of being permanently
-    suppressed. Pure w.r.t. I/O, so it is unit-testable with a fake clock and a
-    fake series map.
+    'resolve'. Mutates ``state`` only for breach timers; it does NOT clear firing/
+    breach state for either a fire OR a resolve - the caller mutates firing state
+    exclusively, and only after the notification is delivered. That makes both
+    transitions retry-safe symmetrically: an undelivered fire re-fires next poll,
+    and an undelivered resolve (Telegram failed mid-recovery) re-resolves next poll
+    instead of being lost while operators still believe the outage is active. Pure
+    w.r.t. I/O, so it is unit-testable with a fake clock and a fake series map.
     """
     actions: list[tuple[str, str, str]] = []
 
-    # Resolve: series we were firing on that no longer breach.
+    # Resolve: series we were firing on that no longer breach. State is left in
+    # place - the caller drops it only after the resolve post succeeds, so a failed
+    # resolve delivery is retried (mirror of the fire path).
     resolved = [k for (rn, k) in state.firing if rn == rule.name and k not in breaching]
     for key in resolved:
         msg = rule.resolve_template.format(key=key, threshold=rule.threshold, sustain=rule.sustain_seconds)
         actions.append(("resolve", key, msg))
-        state.firing.pop((rule.name, key), None)
-        state.breach_started.pop((rule.name, key), None)
 
     # Breach tracking + fire once the breach has been sustained. The firing flag
     # is intentionally NOT set here (see docstring) - the caller sets it on a
@@ -216,11 +217,22 @@ def build_rules(
       - paper-trader holds an ORDER connection ONLY in strategy mode; always-flat
         bus mode uses no exec adapter (no exec_mode series; the gauge defaults 0),
         so its rule is gated on exec_mode{mode=paper}==1 to avoid false RTH pages.
-    Process/target liveness ("the container is gone") is intentionally NOT an
-    alerter rule: a Prometheus up==0 rule is scrape-topology-coupled and would
-    false-fire on a mis-targeted scrape. That liveness is owned by the container-
-    state layer (the pre-market cron's Tier-1 restart + the operator healthcheck,
-    which read docker state directly), not by this metric poller.
+    Process/target liveness ("the container is gone") IS an alerter rule, because
+    it is a distinct failure mode from a connected==0 gauge and the gauge cannot
+    cover it: when paper-trader/ibkr-feed crashes, crash-loops, or wedges before
+    serving /metrics, Prometheus has no ``alpha_assay_ibkr_connected`` sample to
+    return, so the gauge==0 rules above see an empty vector and read it as healthy -
+    exactly the 0n6 silent-failure class. Only ``up{job} == 0`` (a configured-but-
+    unreachable target) catches it. Delegating this to the container-state layer
+    alone (pre-market cron + operator healthcheck) was the same "another layer
+    covers it" gap that let the order path die silently for ten days, so this rule
+    closes it with an RTH-gated Telegram page. RTH-gating excludes the nightly
+    ~22:50 CT ibkr-feed/IBC restart; a deploy force-recreate is shorter than the
+    sustain window, so neither false-fires. NOTE: ``up`` is only meaningful where
+    these jobs are real scrape targets - the deployed SER9 topology (host
+    networking, host.docker.internal:8000/8003, verified up=1). The dev/bridge base
+    compose publishes different host ports and is stub-only; making base-compose
+    scraping topology-correct + tested is tracked in epic alphaassay-e84.
     """
     return [
         AlertRule(
@@ -264,6 +276,23 @@ def build_rules(
                 "(ibkr_connected=0 in strategy mode, sustained {sustain}s) - order path is dead"
             ),
             resolve_template="resolved: paper-trader IBKR connection is back up",
+        ),
+        # 0n6 backstop: a dead/crash-looping/wedged process exports no gauge at
+        # all, so the gauge==0 rules above cannot see it. up==0 (configured target
+        # unreachable) is the only signal that catches a gone process. Scoped to
+        # the two connection-holding jobs this bead is about; RTH-gated so the
+        # nightly ibkr-feed/IBC restart and short deploy recreates do not page.
+        AlertRule(
+            name="process_liveness",
+            breach_query='up{job=~"ibkr-feed|paper-trader"} == 0',
+            label_key="job",
+            sustain_seconds=connected_sustain,
+            rth_only=True,
+            fire_template=(
+                "fired: '{key}' scrape target DOWN "
+                "(up=0, sustained {sustain}s) - container/process is gone or unreachable"
+            ),
+            resolve_template="resolved: '{key}' scrape target is back up",
         ),
     ]
 
@@ -322,11 +351,16 @@ def main() -> None:
                     except Exception as e:  # noqa: BLE001 - a telegram failure must not kill the poller
                         log.warning("telegram post failed (%s): %s", action, e)
                         continue
-                    # Mark firing ONLY after a successful fire post, so an
-                    # undelivered fire is retried next poll instead of being
-                    # silently suppressed while the outage continues.
+                    # Mutate firing state ONLY after a successful post, so an
+                    # undelivered notification is retried next poll instead of being
+                    # silently suppressed. Fire sets firing; resolve drops the
+                    # series' state (firing + breach timer) now that recovery has
+                    # been delivered.
                     if action == "fire":
                         state.firing[(rule.name, key)] = True
+                    else:
+                        state.firing.pop((rule.name, key), None)
+                        state.breach_started.pop((rule.name, key), None)
         except Exception as e:  # noqa: BLE001 - the poll loop must never die
             log.exception("unexpected error in poll loop: %s", e)
         time.sleep(poll_interval)
