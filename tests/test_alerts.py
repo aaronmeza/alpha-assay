@@ -2,10 +2,10 @@
 # Copyright 2026 Aaron Meza
 """Behaviour of the rules-driven alert poller (infra/alerts/main.py).
 
-The poller must fire once a breach is sustained, fire only once, and resolve once
-on recovery - for every rule in the table, not just feed freshness. The IBKR
-connection rule is the one whose absence let the paper-trader order path die
-silently for ten days (alphaassay-0n6).
+The poller must fire once a breach is sustained, fire only once *that was
+delivered*, and resolve once on recovery - for every rule in the table, not just
+feed freshness. The IBKR connection rules are the ones whose absence let the
+paper-trader order path die silently for ten days (alphaassay-0n6).
 """
 
 from __future__ import annotations
@@ -31,11 +31,15 @@ def _rule(name):
     return next(r for r in _rules() if r.name == name)
 
 
+def _mark_fired(state, rule, key):
+    """Simulate the caller marking a fire delivered (post_telegram succeeded)."""
+    state.firing[(rule.name, key)] = True
+
+
 # --- in_rth -------------------------------------------------------------------
 
 
 def test_in_rth_true_during_weekday_session():
-    # Wed 2026-06-24 10:00 CT is inside 08:30-15:00.
     assert in_rth(datetime(2026, 6, 24, 10, 0, tzinfo=CT), 8 * 60 + 30, 15 * 60)
 
 
@@ -47,15 +51,25 @@ def test_in_rth_false_on_weekend_and_outside_window():
 # --- rule table ---------------------------------------------------------------
 
 
-def test_table_has_freshness_and_connected_rules():
+def test_table_has_expected_rules():
     names = {r.name for r in _rules()}
-    assert names == {"ibkr_feed_freshness", "ibkr_connected"}
+    assert names == {"ibkr_feed_freshness", "ibkr_connected", "ibkr_target_down"}
 
 
 def test_connected_rule_excludes_recorder_jobs():
     # Recorders also export ibkr_connected=0 as bus consumers; the rule must scope
     # to the connection-holding jobs only, or it would false-fire on every recorder.
     rule = _rule("ibkr_connected")
+    assert 'job=~"ibkr-feed|paper-trader"' in rule.breach_query
+    assert "== 0" in rule.breach_query
+    assert rule.rth_only is True
+
+
+def test_target_down_rule_uses_up_metric():
+    # A fully-down target exports no alpha_assay_ibkr_connected series, so the
+    # connection rule is blind to it; the up==0 rule covers "process gone".
+    rule = _rule("ibkr_target_down")
+    assert rule.breach_query.startswith("up{")
     assert 'job=~"ibkr-feed|paper-trader"' in rule.breach_query
     assert "== 0" in rule.breach_query
     assert rule.rth_only is True
@@ -68,41 +82,54 @@ def test_breach_does_not_fire_before_sustain():
     # Given a breach, When it has not persisted sustain_seconds, Then no fire.
     rule = _rule("ibkr_connected")  # sustain 120s
     state = AlertState()
-    assert evaluate_rule(rule, {"paper-trader": 0.0}, state, now_ts=1000.0) == []
-    assert evaluate_rule(rule, {"paper-trader": 0.0}, state, now_ts=1000.0 + 119) == []
+    assert evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0) == []
+    assert evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0 + 119) == []
 
 
-def test_breach_fires_once_after_sustain():
-    # Given a sustained breach, Then it fires exactly once.
+def test_breach_fires_once_after_sustain_and_delivery():
+    # Given a sustained breach that the caller marks delivered, Then it fires once.
     rule = _rule("ibkr_connected")
     state = AlertState()
-    evaluate_rule(rule, {"paper-trader": 0.0}, state, now_ts=1000.0)
-    fired = evaluate_rule(rule, {"paper-trader": 0.0}, state, now_ts=1000.0 + 120)
-    assert [a for a, _ in fired] == ["fire"]
-    assert "paper-trader" in fired[0][1]
-    # Still breaching on the next poll: must NOT fire again.
-    again = evaluate_rule(rule, {"paper-trader": 0.0}, state, now_ts=1000.0 + 200)
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0)
+    fired = evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0 + 120)
+    assert [a for a, _k, _m in fired] == ["fire"]
+    assert fired[0][1] == "paper-trader"
+    _mark_fired(state, rule, "paper-trader")  # caller delivered it
+    again = evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0 + 200)
     assert again == []
 
 
-def test_recovery_resolves_once():
-    # Given a firing series, When it stops breaching, Then it resolves once.
+def test_undelivered_fire_is_retried():
+    # Finding A regression: evaluate_rule must NOT self-mark firing, so a fire the
+    # caller never delivered (post_telegram failed) is returned again next poll.
     rule = _rule("ibkr_connected")
     state = AlertState()
-    evaluate_rule(rule, {"paper-trader": 0.0}, state, now_ts=1000.0)
-    evaluate_rule(rule, {"paper-trader": 0.0}, state, now_ts=1000.0 + 120)  # fires
-    resolved = evaluate_rule(rule, {}, state, now_ts=1000.0 + 130)
-    assert [a for a, _ in resolved] == ["resolve"]
-    # State is clean; a second empty poll does nothing.
-    assert evaluate_rule(rule, {}, state, now_ts=1000.0 + 140) == []
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0)
+    first = evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0 + 120)
+    assert [a for a, _k, _m in first] == ["fire"]
+    # Caller did NOT mark delivered -> the still-breaching series re-fires.
+    retry = evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0 + 180)
+    assert [a for a, _k, _m in retry] == ["fire"]
+
+
+def test_recovery_resolves_once():
+    # Given a delivered firing series, When it stops breaching, Then it resolves once.
+    rule = _rule("ibkr_connected")
+    state = AlertState()
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0)
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 1000.0 + 120)  # returns fire
+    _mark_fired(state, rule, "paper-trader")  # caller delivered it
+    resolved = evaluate_rule(rule, {}, state, 1000.0 + 130)
+    assert [a for a, _k, _m in resolved] == ["resolve"]
+    assert evaluate_rule(rule, {}, state, 1000.0 + 140) == []
 
 
 def test_transient_breach_clears_without_firing():
     # Given a breach that recovers before sustain, Then no fire and the timer clears.
     rule = _rule("ibkr_connected")
     state = AlertState()
-    evaluate_rule(rule, {"ibkr-feed": 0.0}, state, now_ts=1000.0)
-    assert evaluate_rule(rule, {}, state, now_ts=1000.0 + 10) == []
+    evaluate_rule(rule, {"ibkr-feed": 0.0}, state, 1000.0)
+    assert evaluate_rule(rule, {}, state, 1000.0 + 10) == []
     assert state.breach_started == {}
     assert state.firing == {}
 
@@ -111,16 +138,17 @@ def test_freshness_fire_message_includes_value():
     # The freshness fire message reports the breaching freshness seconds.
     rule = _rule("ibkr_feed_freshness")
     state = AlertState()
-    evaluate_rule(rule, {"ES-FUT": 87.5}, state, now_ts=0.0)
-    fired = evaluate_rule(rule, {"ES-FUT": 87.5}, state, now_ts=300.0)
-    assert fired and "87.5s" in fired[0][1]
+    evaluate_rule(rule, {"ES-FUT": 87.5}, state, 0.0)
+    fired = evaluate_rule(rule, {"ES-FUT": 87.5}, state, 300.0)
+    assert fired and "87.5s" in fired[0][2]
 
 
 def test_clear_rule_drops_state_and_reports_firing():
     rule = _rule("ibkr_connected")
     state = AlertState()
-    evaluate_rule(rule, {"paper-trader": 0.0}, state, now_ts=0.0)
-    evaluate_rule(rule, {"paper-trader": 0.0}, state, now_ts=120.0)  # firing
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 0.0)
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 120.0)  # returns fire
+    _mark_fired(state, rule, "paper-trader")
     was_firing = state.clear_rule("ibkr_connected")
     assert was_firing == ["paper-trader"]
     assert state.breach_started == {}

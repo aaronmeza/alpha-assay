@@ -160,40 +160,38 @@ def evaluate_rule(
     breaching: dict[str, float],
     state: AlertState,
     now_ts: float,
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, str]]:
     """Advance one rule's state machine for a single poll.
 
-    Returns a list of ``(action, message)`` where action is 'fire' or 'resolve'.
-    Mutates ``state`` (breach timers + firing flags). Pure w.r.t. I/O so it is
-    unit-testable with a fake clock and a fake series map.
+    Returns a list of ``(action, series_key, message)`` where action is 'fire' or
+    'resolve'. Mutates ``state`` (breach timers; pops firing/breach state on
+    resolve) but does NOT set the firing flag for a fire - the caller sets it only
+    after the notification is delivered, so a transient Telegram failure on the
+    first fire is retried on the next poll instead of being permanently
+    suppressed. Pure w.r.t. I/O, so it is unit-testable with a fake clock and a
+    fake series map.
     """
-    actions: list[tuple[str, str]] = []
+    actions: list[tuple[str, str, str]] = []
 
     # Resolve: series we were firing on that no longer breach.
     resolved = [k for (rn, k) in state.firing if rn == rule.name and k not in breaching]
     for key in resolved:
-        actions.append(
-            ("resolve", rule.resolve_template.format(key=key, threshold=rule.threshold, sustain=rule.sustain_seconds))
-        )
+        msg = rule.resolve_template.format(key=key, threshold=rule.threshold, sustain=rule.sustain_seconds)
+        actions.append(("resolve", key, msg))
         state.firing.pop((rule.name, key), None)
         state.breach_started.pop((rule.name, key), None)
 
-    # Breach tracking + fire once the breach has been sustained.
+    # Breach tracking + fire once the breach has been sustained. The firing flag
+    # is intentionally NOT set here (see docstring) - the caller sets it on a
+    # successful post so an undelivered fire is retried.
     for key, val in breaching.items():
         sk = (rule.name, key)
         if sk not in state.breach_started:
             state.breach_started[sk] = now_ts
             log.info("breach started rule=%s series=%s value=%.3f", rule.name, key, val)
         elif now_ts - state.breach_started[sk] >= rule.sustain_seconds and not state.firing.get(sk):
-            actions.append(
-                (
-                    "fire",
-                    rule.fire_template.format(
-                        key=key, value=val, threshold=rule.threshold, sustain=rule.sustain_seconds
-                    ),
-                )
-            )
-            state.firing[sk] = True
+            msg = rule.fire_template.format(key=key, value=val, threshold=rule.threshold, sustain=rule.sustain_seconds)
+            actions.append(("fire", key, msg))
 
     # Clear breach timers for series that recovered before the sustain elapsed
     # (a transient blip should not leave a stale start time).
@@ -240,6 +238,23 @@ def build_rules(
                 "(ibkr_connected=0, sustained {sustain}s) - data/order path is dead"
             ),
             resolve_template="resolved: IBKR connection for '{key}' is back up",
+        ),
+        # The ibkr_connected rule above only matches an EXISTING series at 0; a
+        # fully-down target (process crashed, metrics endpoint unreachable) exports
+        # no alpha_assay_ibkr_connected at all, so it would be a blind spot. The
+        # Prometheus-internal `up` metric catches that: up==0 means the target is
+        # down. Together the two rules cover "connected-but-dead" and "gone".
+        AlertRule(
+            name="ibkr_target_down",
+            breach_query=f'up{{job=~"{connected_jobs}"}} == 0',
+            label_key="job",
+            sustain_seconds=connected_sustain,
+            rth_only=True,
+            fire_template=(
+                "fired: scrape target DOWN for '{key}' "
+                "(up=0, sustained {sustain}s) - process or metrics endpoint unreachable"
+            ),
+            resolve_template="resolved: scrape target '{key}' is back up",
         ),
     ]
 
@@ -290,7 +305,7 @@ def main() -> None:
                 except Exception as e:  # noqa: BLE001 - one bad query must not kill the poller
                     log.warning("prom query failed rule=%s: %s", rule.name, e)
                     continue
-                for action, msg in evaluate_rule(rule, breaching, state, time.time()):
+                for action, key, msg in evaluate_rule(rule, breaching, state, time.time()):
                     if action == "fire":
                         log.warning(msg)
                     else:
@@ -299,6 +314,12 @@ def main() -> None:
                         post_telegram(bot_token, chat_id, msg)
                     except Exception as e:  # noqa: BLE001 - a telegram failure must not kill the poller
                         log.warning("telegram post failed (%s): %s", action, e)
+                        continue
+                    # Mark firing ONLY after a successful fire post, so an
+                    # undelivered fire is retried next poll instead of being
+                    # silently suppressed while the outage continues.
+                    if action == "fire":
+                        state.firing[(rule.name, key)] = True
         except Exception as e:  # noqa: BLE001 - the poll loop must never die
             log.exception("unexpected error in poll loop: %s", e)
         time.sleep(poll_interval)

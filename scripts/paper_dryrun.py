@@ -758,7 +758,13 @@ async def _async_main(
         if wd_task is not None:
             race.append(wd_task)
         done, _ = await asyncio.wait(race, return_when=asyncio.FIRST_COMPLETED)
-        if wd_task is not None and wd_task in done:
+        # Stop wins ties: asyncio.wait(FIRST_COMPLETED) can return both when a
+        # clean SIGTERM/SIGINT and a connection loss become ready in the same loop
+        # turn. Honour the clean stop (EXIT_OK) in that case, matching
+        # infra/feed/run.py; only a connection loss with no stop requested restarts.
+        if stop_wait in done:
+            exit_code = EXIT_OK
+        elif wd_task is not None and wd_task in done:
             exit_code = EXIT_RESTART
             _LOG.error(
                 "IBKR connection lost; exiting EXIT_RESTART so the container "
@@ -766,6 +772,11 @@ async def _async_main(
             )
             _mark_ibkr_disconnected(adapter)
             # Wake the asyncio loops AND the bus-consumer threads for a clean drain.
+            # The bus-consumer threads poll stop_event_thread between iter_messages
+            # calls (block_ms=1000), so they observe it and exit within ~1s - the
+            # asyncio.run default-executor shutdown then does not hang. (A wedged
+            # consumer thread remaining a teardown hazard is tracked for the shared
+            # resilience-base hardening in alphaassay-e84.)
             stop_event.set()
             stop_event_thread.set()
     finally:
