@@ -18,11 +18,12 @@ from infra.alerts.main import AlertState, build_rules, evaluate_rule, in_rth
 CT = ZoneInfo("America/Chicago")
 
 
-def _rules():
+def _rules(liveness_jobs=("ibkr-feed", "paper-trader")):
     return build_rules(
         freshness_threshold=60,
         freshness_sustain=300,
         connected_sustain=120,
+        liveness_jobs=list(liveness_jobs),
     )
 
 
@@ -68,7 +69,7 @@ def test_table_has_expected_rules():
 
 def test_process_liveness_rule_uses_up_metric():
     # 0n6 backstop: a gone process exports no gauge, so only up==0 catches it.
-    # Scoped to the two connection-holding jobs, RTH-gated, keyed on job.
+    # Scoped to the DECLARED expected jobs, RTH-gated, keyed on job.
     rule = _rule("process_liveness")
     assert "up{" in rule.breach_query
     assert "== 0" in rule.breach_query
@@ -77,15 +78,28 @@ def test_process_liveness_rule_uses_up_metric():
     assert rule.rth_only is True
 
 
-def test_process_liveness_guarded_against_undeployed_targets():
-    # Review finding: a statically-scraped but profile-disabled job reports up=0
-    # (not absent), so a naive up==0 rule would page even though nothing failed.
-    # The max_over_time(..)==1 guard requires the target to have been up recently,
-    # so only a target that was running and then disappeared fires.
+def test_process_liveness_is_plain_up_not_window_guarded():
+    # Round-7 finding: a windowed max_over_time guard suppresses a target that died
+    # overnight / over a weekend and is still down at the open (no recent up=1) -
+    # the worst failure (silent at open). Expectation is DECLARED via liveness_jobs
+    # instead, so the rule is a plain up==0 with no time-window guard.
     rule = _rule("process_liveness")
-    assert "max_over_time(up{" in rule.breach_query
-    assert "== 1" in rule.breach_query
-    assert "and on(job)" in rule.breach_query
+    assert "max_over_time" not in rule.breach_query
+    assert rule.breach_query == 'up{job=~"ibkr-feed|paper-trader"} == 0'
+
+
+def test_process_liveness_jobs_are_declared_not_inferred():
+    # The job set comes from the deployment's declaration; an undeployed job is
+    # left out of the list rather than guessed from metric history.
+    rule = next(r for r in _rules(liveness_jobs=["paper-trader"]) if r.name == "process_liveness")
+    assert rule.breach_query == 'up{job=~"paper-trader"} == 0'
+
+
+def test_process_liveness_omitted_when_no_jobs_declared():
+    # Empty liveness_jobs -> no process-liveness rule at all (clean opt-out).
+    names = {r.name for r in _rules(liveness_jobs=[])}
+    assert "process_liveness" not in names
+    assert names == {"ibkr_feed_freshness", "ibkr_feed_connected", "paper_trader_connected"}
 
 
 def test_feed_connected_rule_scoped_to_ibkr_feed():

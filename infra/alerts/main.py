@@ -29,6 +29,9 @@ Env:
   FRESHNESS_THRESHOLD         default 60   (seconds; feed-freshness rule)
   SUSTAIN_SECONDS             default 300  (feed-freshness sustain)
   CONNECTED_SUSTAIN_SECONDS   default 120  (ibkr-connected sustain)
+  LIVENESS_JOBS               default "ibkr-feed,paper-trader" (comma-separated
+                              Prometheus job names the deployment declares MUST be
+                              up; empty disables the process-liveness rule)
   RTH_TZ                      default America/Chicago
   RTH_START_HHMM              default 0830
   RTH_END_HHMM                default 1500
@@ -207,6 +210,7 @@ def build_rules(
     freshness_threshold: int,
     freshness_sustain: int,
     connected_sustain: int,
+    liveness_jobs: list[str],
 ) -> list[AlertRule]:
     """Construct the active rule table from resolved config.
 
@@ -228,19 +232,24 @@ def build_rules(
     covers it" gap that let the order path die silently for ten days, so this rule
     closes it with an RTH-gated Telegram page. RTH-gating excludes the nightly
     ~22:50 CT ibkr-feed/IBC restart; a deploy force-recreate is shorter than the
-    sustain window, so neither false-fires. A ``max_over_time(up[8h]) == 1`` guard
-    requires the target to have been up within the window before a down state
-    counts, so a job that is statically scraped but intentionally not deployed
-    (profile off -> ``up`` is 0 forever, never absent) does NOT page - only a
-    target that was running and then disappeared does; the 8h window reaches back
-    before the RTH open so a full-session outage keeps firing without a false auto-
-    resolve. NOTE: ``up`` is only meaningful where these jobs are real scrape
-    targets - the deployed on-prem host-networking topology
-    (host.docker.internal:8000/8003, verified up=1). The dev/bridge base compose
-    publishes different host ports than it scrapes and is stub-only; making base-
-    compose scrape topology correct + tested is tracked in epic alphaassay-e84.
+    sustain window, so neither false-fires.
+
+    Liveness is scoped to ``liveness_jobs`` - the jobs the DEPLOYMENT DECLARES must
+    be up - rather than inferred from ``up`` history. Metric history cannot tell a
+    never-deployed target (statically scraped, profile off -> ``up`` is 0 forever)
+    apart from one that died long ago and stayed down: both have no recent ``up=1``.
+    A windowed ``max_over_time`` guard that excludes the first also wrongly excludes
+    a target that died overnight / over a weekend and is still down at the next open
+    - a silent failure exactly when it matters. So expectation is declared, not
+    guessed: a job in ``liveness_jobs`` that reports ``up == 0`` pages (incl. an
+    over-weekend death), and a job that is simply not deployed is left out of the
+    list. ``liveness_jobs`` empty -> no liveness rule. NOTE: ``up`` is only
+    meaningful where these jobs are real scrape targets - the deployed on-prem
+    host-networking topology (host.docker.internal:8000/8003, verified up=1); the
+    dev/bridge base compose publishes different host ports than it scrapes and is
+    stub-only (tracked in epic alphaassay-e84).
     """
-    return [
+    rules = [
         AlertRule(
             name="ibkr_feed_freshness",
             breach_query=f"alpha_assay_ibkr_feed_freshness_seconds > {freshness_threshold}",
@@ -283,30 +292,32 @@ def build_rules(
             ),
             resolve_template="resolved: paper-trader IBKR connection is back up",
         ),
-        # 0n6 backstop: a dead/crash-looping/wedged process exports no gauge at
-        # all, so the gauge==0 rules above cannot see it. up==0 (configured target
-        # unreachable) is the only signal that catches a gone process. Scoped to
-        # the two connection-holding jobs this bead is about; RTH-gated so the
-        # nightly ibkr-feed/IBC restart and short deploy recreates do not page. The
-        # `and on(job) max_over_time(up[8h]) == 1` guard fires only for a target
-        # that was up within the window and then went down, so a statically-scraped
-        # but undeployed job (profile off -> up=0 forever) never false-fires.
-        AlertRule(
-            name="process_liveness",
-            breach_query=(
-                'up{job=~"ibkr-feed|paper-trader"} == 0 '
-                'and on(job) max_over_time(up{job=~"ibkr-feed|paper-trader"}[8h]) == 1'
-            ),
-            label_key="job",
-            sustain_seconds=connected_sustain,
-            rth_only=True,
-            fire_template=(
-                "fired: '{key}' scrape target DOWN "
-                "(up=0, sustained {sustain}s) - container/process is gone or unreachable"
-            ),
-            resolve_template="resolved: '{key}' scrape target is back up",
-        ),
     ]
+
+    # 0n6 backstop: a dead/crash-looping/wedged process exports no gauge at all, so
+    # the gauge==0 rules above cannot see it. up==0 (configured target unreachable)
+    # is the only signal that catches a gone process - including one that died
+    # overnight and is still down at the open, which a windowed guard would miss.
+    # Fired for the DECLARED expected jobs only (liveness_jobs); a job that is not
+    # deployed is simply left out of the list rather than inferred from up history.
+    if liveness_jobs:
+        job_re = "|".join(liveness_jobs)
+        rules.append(
+            AlertRule(
+                name="process_liveness",
+                breach_query=f'up{{job=~"{job_re}"}} == 0',
+                label_key="job",
+                sustain_seconds=connected_sustain,
+                rth_only=True,
+                fire_template=(
+                    "fired: '{key}' scrape target DOWN "
+                    "(up=0, sustained {sustain}s) - container/process is gone or unreachable"
+                ),
+                resolve_template="resolved: '{key}' scrape target is back up",
+            )
+        )
+
+    return rules
 
 
 def main() -> None:
@@ -317,6 +328,7 @@ def main() -> None:
     freshness_threshold = _env_int("FRESHNESS_THRESHOLD", 60)
     freshness_sustain = _env_int("SUSTAIN_SECONDS", 300)
     connected_sustain = _env_int("CONNECTED_SUSTAIN_SECONDS", 120)
+    liveness_jobs = [j.strip() for j in _env_str("LIVENESS_JOBS", "ibkr-feed,paper-trader").split(",") if j.strip()]
     tz = ZoneInfo(_env_str("RTH_TZ", "America/Chicago"))
     rth_start = _hhmm_to_minutes(_env_str("RTH_START_HHMM", "0830"))
     rth_end = _hhmm_to_minutes(_env_str("RTH_END_HHMM", "1500"))
@@ -325,6 +337,7 @@ def main() -> None:
         freshness_threshold=freshness_threshold,
         freshness_sustain=freshness_sustain,
         connected_sustain=connected_sustain,
+        liveness_jobs=liveness_jobs,
     )
     state = AlertState()
 

@@ -459,6 +459,11 @@ services:
       POLL_INTERVAL_SECONDS: "60"
       FRESHNESS_THRESHOLD: "60"
       SUSTAIN_SECONDS: "300"
+      # Jobs this deployment DECLARES must be up - the process-liveness rule pages
+      # if any reports up==0 during RTH (catches a crashed/gone container, incl.
+      # one that died overnight). Both run in the default profile set alongside the
+      # alerter; a partial deployment should narrow this list. (alphaassay-0n6)
+      LIVENESS_JOBS: ibkr-feed,paper-trader
       RTH_TZ: America/Chicago
       RTH_START_HHMM: "0830"
       RTH_END_HHMM: "1500"
