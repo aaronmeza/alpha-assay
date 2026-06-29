@@ -29,9 +29,11 @@ Env:
   FRESHNESS_THRESHOLD         default 60   (seconds; feed-freshness rule)
   SUSTAIN_SECONDS             default 300  (feed-freshness sustain)
   CONNECTED_SUSTAIN_SECONDS   default 120  (ibkr-connected sustain)
-  LIVENESS_JOBS               default "ibkr-feed,paper-trader" (comma-separated
-                              Prometheus job names the deployment declares MUST be
-                              up; empty disables the process-liveness rule)
+  LIVENESS_JOBS               default "" (comma-separated Prometheus job names the
+                              deployment declares MUST be up; empty disables the
+                              process-liveness rule. The library presumes nothing -
+                              the deployment declares; the compose alerts service
+                              sets "ibkr-feed,paper-trader")
   RTH_TZ                      default America/Chicago
   RTH_START_HHMM              default 0830
   RTH_END_HHMM                default 1500
@@ -372,7 +374,12 @@ def main() -> None:
     freshness_threshold = _env_int("FRESHNESS_THRESHOLD", 60)
     freshness_sustain = _env_int("SUSTAIN_SECONDS", 300)
     connected_sustain = _env_int("CONNECTED_SUSTAIN_SECONDS", 120)
-    liveness_jobs = _parse_liveness_jobs(_env_str("LIVENESS_JOBS", "ibkr-feed,paper-trader"))
+    # Empty default on purpose: the library presumes NOTHING about what is
+    # deployed (a default job list would false-page a partial stack). The
+    # deployment declares its expected jobs - the compose alerts service sets
+    # LIVENESS_JOBS=ibkr-feed,paper-trader, asserted by test_compose_stack so it
+    # cannot silently regress.
+    liveness_jobs = _parse_liveness_jobs(_env_str("LIVENESS_JOBS", ""))
     tz = ZoneInfo(_env_str("RTH_TZ", "America/Chicago"))
     rth_start = _hhmm_to_minutes(_env_str("RTH_START_HHMM", "0830"))
     rth_end = _hhmm_to_minutes(_env_str("RTH_END_HHMM", "1500"))

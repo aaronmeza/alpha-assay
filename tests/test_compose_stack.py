@@ -103,6 +103,16 @@ def test_compose_yaml_is_valid() -> None:
     assert pt_env.get("ALPHA_ASSAY_ENV") == "paper-dryrun"
     assert pt_env.get("TZ") == "America/Chicago"
 
+    # The alerts service must DECLARE its expected liveness jobs - the library
+    # default is empty (presumes nothing), so the process-liveness rule only exists
+    # because the deployment declares it here. Guard against silent regression
+    # (alphaassay-0n6).
+    alerts_env = services["alerts"].get("environment", {})
+    if isinstance(alerts_env, list):
+        alerts_env = dict(item.split("=", 1) for item in alerts_env)
+    liveness = {j.strip() for j in str(alerts_env.get("LIVENESS_JOBS", "")).split(",") if j.strip()}
+    assert liveness == {"ibkr-feed", "paper-trader"}, f"alerts must declare both core liveness jobs; got {liveness}"
+
 
 def test_prometheus_scrape_targets() -> None:
     data = _load_yaml(PROMETHEUS_PATH)
