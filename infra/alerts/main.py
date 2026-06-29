@@ -29,7 +29,6 @@ Env:
   FRESHNESS_THRESHOLD         default 60   (seconds; feed-freshness rule)
   SUSTAIN_SECONDS             default 300  (feed-freshness sustain)
   CONNECTED_SUSTAIN_SECONDS   default 120  (ibkr-connected sustain)
-  CONNECTED_JOBS              default "ibkr-feed|paper-trader" (regex of jobs with a real IBKR connection)
   RTH_TZ                      default America/Chicago
   RTH_START_HHMM              default 0830
   RTH_END_HHMM                default 1500
@@ -206,10 +205,23 @@ def build_rules(
     *,
     freshness_threshold: int,
     freshness_sustain: int,
-    connected_jobs: str,
     connected_sustain: int,
 ) -> list[AlertRule]:
-    """Construct the active rule table from resolved config."""
+    """Construct the active rule table from resolved config.
+
+    Connection rules are per-component, not a single job regex, because the two
+    connection-holding jobs have different liveness contracts:
+      - ibkr-feed ALWAYS holds a data connection (it is profile-gated, so when not
+        deployed its series is simply absent and never matches).
+      - paper-trader holds an ORDER connection ONLY in strategy mode; always-flat
+        bus mode uses no exec adapter (no exec_mode series; the gauge defaults 0),
+        so its rule is gated on exec_mode{mode=paper}==1 to avoid false RTH pages.
+    Process/target liveness ("the container is gone") is intentionally NOT an
+    alerter rule: a Prometheus up==0 rule is scrape-topology-coupled and would
+    false-fire on a mis-targeted scrape. That liveness is owned by the container-
+    state layer (the pre-market cron's Tier-1 restart + the operator healthcheck,
+    which read docker state directly), not by this metric poller.
+    """
     return [
         AlertRule(
             name="ibkr_feed_freshness",
@@ -223,38 +235,35 @@ def build_rules(
             ),
             resolve_template="resolved: ibkr feed '{key}' freshness back below {threshold}s",
         ),
-        # The 0n6 gap: a dead IBKR connection on a job that holds a real one
-        # (ibkr-feed = data, paper-trader = order path). Recorders also export
-        # ibkr_connected=0 as bus consumers, so the job regex is restricted to the
-        # connection-holding jobs to avoid false fires.
         AlertRule(
-            name="ibkr_connected",
-            breach_query=f'alpha_assay_ibkr_connected{{job=~"{connected_jobs}"}} == 0',
+            name="ibkr_feed_connected",
+            breach_query='alpha_assay_ibkr_connected{job="ibkr-feed"} == 0',
             label_key="job",
             sustain_seconds=connected_sustain,
             rth_only=True,
             fire_template=(
-                "fired: IBKR connection DOWN for '{key}' "
-                "(ibkr_connected=0, sustained {sustain}s) - data/order path is dead"
+                "fired: ibkr-feed IBKR connection DOWN " "(ibkr_connected=0, sustained {sustain}s) - data path is dead"
             ),
-            resolve_template="resolved: IBKR connection for '{key}' is back up",
+            resolve_template="resolved: ibkr-feed IBKR connection is back up",
         ),
-        # The ibkr_connected rule above only matches an EXISTING series at 0; a
-        # fully-down target (process crashed, metrics endpoint unreachable) exports
-        # no alpha_assay_ibkr_connected at all, so it would be a blind spot. The
-        # Prometheus-internal `up` metric catches that: up==0 means the target is
-        # down. Together the two rules cover "connected-but-dead" and "gone".
+        # 0n6 core: the paper-trader order path. Gated on exec_mode so it only
+        # alerts when the paper-trader is actually in strategy mode (holding an
+        # order connection); always-flat mode exports neither exec_mode nor a real
+        # connection, so the gate keeps it from false-firing.
         AlertRule(
-            name="ibkr_target_down",
-            breach_query=f'up{{job=~"{connected_jobs}"}} == 0',
+            name="paper_trader_connected",
+            breach_query=(
+                'alpha_assay_ibkr_connected{job="paper-trader"} == 0 '
+                'and on(job) alpha_assay_exec_mode{mode="paper"} == 1'
+            ),
             label_key="job",
             sustain_seconds=connected_sustain,
             rth_only=True,
             fire_template=(
-                "fired: scrape target DOWN for '{key}' "
-                "(up=0, sustained {sustain}s) - process or metrics endpoint unreachable"
+                "fired: paper-trader IBKR connection DOWN "
+                "(ibkr_connected=0 in strategy mode, sustained {sustain}s) - order path is dead"
             ),
-            resolve_template="resolved: scrape target '{key}' is back up",
+            resolve_template="resolved: paper-trader IBKR connection is back up",
         ),
     ]
 
@@ -267,7 +276,6 @@ def main() -> None:
     freshness_threshold = _env_int("FRESHNESS_THRESHOLD", 60)
     freshness_sustain = _env_int("SUSTAIN_SECONDS", 300)
     connected_sustain = _env_int("CONNECTED_SUSTAIN_SECONDS", 120)
-    connected_jobs = _env_str("CONNECTED_JOBS", "ibkr-feed|paper-trader")
     tz = ZoneInfo(_env_str("RTH_TZ", "America/Chicago"))
     rth_start = _hhmm_to_minutes(_env_str("RTH_START_HHMM", "0830"))
     rth_end = _hhmm_to_minutes(_env_str("RTH_END_HHMM", "1500"))
@@ -275,7 +283,6 @@ def main() -> None:
     rules = build_rules(
         freshness_threshold=freshness_threshold,
         freshness_sustain=freshness_sustain,
-        connected_jobs=connected_jobs,
         connected_sustain=connected_sustain,
     )
     state = AlertState()
