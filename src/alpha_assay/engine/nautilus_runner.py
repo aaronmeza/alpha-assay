@@ -84,6 +84,8 @@ class _NautilusStrategyAdapter(NautilusStrategy):
         strategy,
         risk_caps,
         position_sizer: PositionSizer | None = None,
+        minutes_after_open: int = 30,
+        minutes_before_close: int = 30,
     ) -> None:
         super().__init__()
         self._bar_type = bar_type
@@ -92,6 +94,8 @@ class _NautilusStrategyAdapter(NautilusStrategy):
         self._strategy_name = type(strategy).__name__
         self._risk_caps = risk_caps
         self._position_sizer = position_sizer
+        self._minutes_after_open = minutes_after_open
+        self._minutes_before_close = minutes_before_close
         self._bars_records: list[dict[str, Any]] = []
         self._latest_tick: float = 0.0
         self._latest_add: float = 0.0
@@ -136,7 +140,11 @@ class _NautilusStrategyAdapter(NautilusStrategy):
         # Session gate: only evaluate on in-window bars. Spec Section 5
         # lookahead guarantee + Section 7 pre-close policy make this a
         # merge-blocker invariant.
-        in_session = session_mask(df.index)
+        in_session = session_mask(
+            df.index,
+            minutes_after_open=self._minutes_after_open,
+            minutes_before_close=self._minutes_before_close,
+        )
         if not bool(in_session.iloc[-1]):
             M.in_session.set(0.0)
             return
@@ -229,6 +237,8 @@ class NautilusBacktestRunner:
         risk_caps: RiskCaps | None = None,
         risk_per_trade_pct: float | None = None,
         max_contracts: int = 1,
+        minutes_after_open: int = 30,
+        minutes_before_close: int = 30,
     ) -> None:
         self.strategy = strategy
         self.data = data
@@ -237,6 +247,8 @@ class NautilusBacktestRunner:
         self.risk_caps = risk_caps or RiskCaps(max_stop_pts=5.0, min_target_pts=2.5, min_target_to_stop_ratio=2.0)
         self.risk_per_trade_pct = risk_per_trade_pct
         self.max_contracts = max_contracts
+        self.minutes_after_open = minutes_after_open
+        self.minutes_before_close = minutes_before_close
 
     def _build_engine(self) -> BacktestEngine:
         config = BacktestEngineConfig(
@@ -289,6 +301,8 @@ class NautilusBacktestRunner:
                 strategy=self.strategy,
                 risk_caps=self.risk_caps,
                 position_sizer=position_sizer,
+                minutes_after_open=self.minutes_after_open,
+                minutes_before_close=self.minutes_before_close,
             )
             engine.add_strategy(adapter)
             engine.run()

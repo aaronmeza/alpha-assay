@@ -111,6 +111,8 @@ def backtest(
         risk_caps=risk_caps,
         risk_per_trade_pct=cfg.execution.risk_per_trade_pct,
         max_contracts=cfg.execution.max_contracts,
+        minutes_after_open=cfg.session.minutes_after_open,
+        minutes_before_close=cfg.session.minutes_before_close,
     )
     result = runner.run()
 
