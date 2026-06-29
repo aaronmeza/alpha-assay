@@ -288,7 +288,7 @@ def build_rules(
         # (bus-consumer + PAPER_STRATEGY) that is exactly the live-order-path mode
         # this rule targets, and bus always-flat mode uses a stub adapter (no
         # exec_mode series), so the gate excludes it. CAVEAT: the legacy direct-
-        # IBKR always-flat path (build_adapters, not deployed on SER9) also builds
+        # IBKR always-flat path (build_adapters, not the deployed mode) also builds
         # an exec adapter and so sets the gauge despite having no active order path,
         # so exec_mode is a proxy, not a precise strategy-mode signal; a dedicated
         # order-path-active gauge for that legacy mode is tracked in alphaassay-e84.
