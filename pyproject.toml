@@ -22,7 +22,11 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
 ]
 dependencies = [
-    "pandas>=2.0",
+    # Cap below 3.0: pandas 3.0 changed the default datetime resolution (ns -> us),
+    # which breaks the trades.parquet timestamp dtype contract the dashboard loader
+    # relies on (datetime64[ns, UTC]); pyfolio-reloaded also requires pandas<3.0.
+    # The 3.0 migration is tracked separately - do not bump this without it.
+    "pandas>=2.0,<3.0",
     "numpy>=1.24",
     "pyyaml>=6",
     "pytz>=2024.1",
