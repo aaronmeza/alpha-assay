@@ -273,11 +273,45 @@ class PaperStrategyRunner:
         once the bus subscription has rebound to a new contract. A
         divergence between the two halts new entries until the rebind
         catches up.
+
+        When ``consumed_expiry`` advances (a roll cutover), the ORDER
+        contract is re-pointed too: ``_contract_spec`` is rebuilt for the
+        new expiry so ``place_bracket_order`` / ``cancel_open_orders`` /
+        ``position_quantity`` / ``startup_reconcile`` all act on the LIVE
+        contract. Without this the runner would generate signals from
+        new-contract bars but submit orders against the rolled-off
+        contract.
+
+        Flat-at-roll invariant: the roll happens pre-open (the producer
+        re-qualifies at 08:00 CT, before the 08:30 RTH open) and the
+        strategy flattens into the close, so the runner is flat at the
+        cutover. Re-pointing the order contract while a position is OPEN
+        would orphan the resting bracket on the old contract, so that
+        case is refused loudly (divergence is left in place, halting new
+        entries) rather than silently re-pointed - a manual-intervention
+        signal, never expected in normal operation.
         """
-        if consumed_expiry is not None:
-            self._consumed_expiry = consumed_expiry
         if resolved_expiry is not None:
             self._resolved_expiry = resolved_expiry
+        if consumed_expiry is not None and consumed_expiry != self._consumed_expiry:
+            if self._position is not None:
+                _LOG.error(
+                    "front-month cutover to %s while a position is OPEN on contract %s; NOT re-pointing "
+                    "the order contract (would orphan the resting bracket) and NOT clearing divergence - "
+                    "the open position is managed on its original contract and new entries stay halted; "
+                    "manual intervention required",
+                    consumed_expiry,
+                    self._contract_spec.get("expiry"),
+                )
+                return
+            self._contract_spec = {**self._contract_spec, "expiry": consumed_expiry}
+            self._consumed_expiry = consumed_expiry
+            _LOG.warning(
+                "front-month cutover: order contract re-pointed to expiry %s (flat at roll)",
+                consumed_expiry,
+            )
+        elif consumed_expiry is not None:
+            self._consumed_expiry = consumed_expiry
 
     # --- bus event surface --------------------------------------------------
 

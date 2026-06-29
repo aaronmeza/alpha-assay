@@ -522,3 +522,56 @@ def test_strategy_refuses_to_trade_while_front_month_diverged():
     # resumes - the guard is transient, not a latch.
     runner_div.update_front_month(consumed_expiry="20260918")
     assert runner_div.front_month_diverged is False
+
+
+# ---------------------------------------------------------------------------
+# Order-contract rebind: orders must follow the cutover to the live contract.
+# ---------------------------------------------------------------------------
+
+
+def test_runner_repoints_order_contract_on_cutover():
+    """After a roll cutover the runner must place orders on the NEW contract.
+
+    Regression for the cross-review finding: the cutover advanced the
+    consumed/resolved expiries but left ``_contract_spec`` at the startup
+    expiry, so the runner generated signals from new-contract bars yet
+    submitted bracket orders against the rolled-off contract.
+    """
+    from tests.test_paper_runner import _ct, _feed_minutes, _make_runner
+
+    fire = _ct("10:05")
+    runner, exec_adapter = _make_runner(fire_at={fire: 1})
+    assert runner._contract_spec["expiry"] == "20260618"  # startup contract
+
+    # Roll cutover (flat at roll, pre-open): the order contract re-points too.
+    runner.update_front_month(consumed_expiry="20260918", resolved_expiry="20260918")
+    assert runner._contract_spec["expiry"] == "20260918"
+    assert not runner.front_month_diverged
+
+    # A signal now submits the bracket on the NEW contract - never the old.
+    _feed_minutes(runner, _ct("10:00"), 8)
+    assert len(exec_adapter.brackets) == 1
+    assert exec_adapter.brackets[0]["contract_spec"]["expiry"] == "20260918"
+    assert all(b["contract_spec"]["expiry"] != "20260618" for b in exec_adapter.brackets)
+
+
+def test_runner_refuses_contract_repoint_while_position_open():
+    """Flat-at-roll invariant: never silently re-point an OPEN position.
+
+    The roll is pre-open so the runner is flat; if a position were somehow
+    open across a roll, re-pointing the order contract would orphan the
+    resting bracket on the old contract. The runner must hold the contract,
+    stay diverged (halting new entries), and log loudly instead.
+    """
+    from tests.test_paper_runner import _ct, _feed_minutes, _make_runner
+
+    fire = _ct("10:05")
+    runner, exec_adapter = _make_runner(fire_at={fire: 1})
+    _feed_minutes(runner, _ct("10:00"), 8)  # opens a position on the E1 contract
+    assert runner.open_position is not None
+    assert exec_adapter.brackets[0]["contract_spec"]["expiry"] == "20260618"
+
+    # A cutover arriving while the position is open must NOT re-point.
+    runner.update_front_month(consumed_expiry="20260918", resolved_expiry="20260918")
+    assert runner._contract_spec["expiry"] == "20260618"  # held, bracket not orphaned
+    assert runner.front_month_diverged  # stays diverged -> new entries halted
