@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -75,6 +76,28 @@ def _env_str(name: str, default: str | None = None, required: bool = False) -> s
 def _hhmm_to_minutes(hhmm: str) -> int:
     s = hhmm.strip().zfill(4)
     return int(s[:2]) * 60 + int(s[2:])
+
+
+# Prometheus job names are conventionally [A-Za-z0-9_-]. LIVENESS_JOBS is
+# interpolated into a PromQL regex (up{job=~"..."}), so each value is validated
+# against this before use - a stray quote or regex metacharacter would otherwise
+# break the query or silently broaden the match.
+_JOB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _parse_liveness_jobs(raw: str) -> list[str]:
+    """Parse LIVENESS_JOBS (comma-separated) into validated job names; invalid
+    entries are dropped with a warning rather than interpolated into PromQL."""
+    jobs: list[str] = []
+    for token in raw.split(","):
+        name = token.strip()
+        if not name:
+            continue
+        if not _JOB_NAME_RE.match(name):
+            log.warning("ignoring invalid LIVENESS_JOBS entry (must match [A-Za-z0-9_-]+): %r", name)
+            continue
+        jobs.append(name)
+    return jobs
 
 
 def in_rth(now: datetime, start_min: int, end_min: int) -> bool:
@@ -115,6 +138,12 @@ class AlertState:
 
     breach_started: dict[tuple[str, str], float] = field(default_factory=dict)
     firing: dict[tuple[str, str], bool] = field(default_factory=dict)
+
+    def firing_series(self, rule_name: str) -> list[str]:
+        """Series this rule is currently firing on, WITHOUT mutating state. Lets
+        the window-close path build a stand-down notice and clear state only after
+        the notice is delivered (retry-safe), instead of clearing up front."""
+        return [k for (rn, k) in self.firing if rn == rule_name]
 
     def clear_rule(self, rule_name: str) -> list[str]:
         """Drop all state for a rule (called at end of its active window). Returns
@@ -343,7 +372,7 @@ def main() -> None:
     freshness_threshold = _env_int("FRESHNESS_THRESHOLD", 60)
     freshness_sustain = _env_int("SUSTAIN_SECONDS", 300)
     connected_sustain = _env_int("CONNECTED_SUSTAIN_SECONDS", 120)
-    liveness_jobs = [j.strip() for j in _env_str("LIVENESS_JOBS", "ibkr-feed,paper-trader").split(",") if j.strip()]
+    liveness_jobs = _parse_liveness_jobs(_env_str("LIVENESS_JOBS", "ibkr-feed,paper-trader"))
     tz = ZoneInfo(_env_str("RTH_TZ", "America/Chicago"))
     rth_start = _hhmm_to_minutes(_env_str("RTH_START_HHMM", "0830"))
     rth_end = _hhmm_to_minutes(_env_str("RTH_END_HHMM", "1500"))
@@ -372,18 +401,23 @@ def main() -> None:
             in_window = in_rth(now, rth_start, rth_end)
             for rule in rules:
                 if rule.rth_only and not in_window:
-                    was_firing = state.clear_rule(rule.name)
-                    if was_firing:
-                        # A page was active when the RTH window closed. Don't let it
-                        # vanish silently - send one stand-down so the operator gets
-                        # closure (this is NOT a claim the issue resolved; out-of-RTH
-                        # disconnects are expected, so the rule re-evaluates next open).
-                        log.info("window closed; standing down firing rule=%s series=%s", rule.name, was_firing)
-                        msg = _stand_down_message(rule.name, was_firing)
+                    # A page active when the RTH window closes must not vanish
+                    # silently - send one stand-down so the operator gets closure
+                    # (NOT a claim the issue resolved; out-of-RTH disconnects are
+                    # expected, so the rule re-evaluates next open). Peek firing
+                    # state and clear it only AFTER the stand-down is delivered, so a
+                    # failed post is retried next poll (retry-safe, like fire/resolve)
+                    # instead of being dropped with the state.
+                    firing_keys = state.firing_series(rule.name)
+                    if firing_keys:
+                        msg = _stand_down_message(rule.name, firing_keys)
                         try:
                             post_telegram(bot_token, chat_id, msg)
                         except Exception as e:  # noqa: BLE001 - a telegram failure must not kill the poller
                             log.warning("telegram post failed (stand-down): %s", e)
+                            continue  # keep firing state; retry the stand-down next poll
+                        log.info("window closed; stood down rule=%s series=%s", rule.name, firing_keys)
+                    state.clear_rule(rule.name)
                     continue
                 try:
                     breaching = query_prom_series(prom_url, rule.breach_query, rule.label_key)

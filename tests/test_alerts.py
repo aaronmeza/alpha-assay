@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from infra.alerts.main import (
     AlertState,
+    _parse_liveness_jobs,
     _stand_down_message,
     build_rules,
     evaluate_rule,
@@ -232,3 +233,28 @@ def test_window_close_stand_down_message_is_not_a_false_resolve():
     assert "RTH window closed" in msg
     assert "paper-trader" in msg
     assert "resolved" not in msg.lower()
+
+
+def test_firing_series_peek_is_non_mutating():
+    # Round-9 finding: the stand-down must be retry-safe. firing_series lets the
+    # caller read firing state and post BEFORE clearing, so a failed stand-down
+    # post is retried (state intact) instead of dropped. The peek must not mutate.
+    rule = _rule("paper_trader_connected")
+    state = AlertState()
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 0.0)
+    evaluate_rule(rule, {"paper-trader": 0.0}, state, 120.0)  # fire
+    _mark_fired(state, rule, "paper-trader")
+    assert state.firing_series("paper_trader_connected") == ["paper-trader"]
+    # Peeking again still returns it (no clear) - so an undelivered stand-down retries.
+    assert state.firing_series("paper_trader_connected") == ["paper-trader"]
+    assert state.firing == {("paper_trader_connected", "paper-trader"): True}
+
+
+def test_parse_liveness_jobs_validates_and_drops_unsafe_values():
+    # Round-9 security finding: LIVENESS_JOBS is interpolated into a PromQL regex,
+    # so values must be validated. Valid job names pass; entries with quotes / regex
+    # metacharacters / whitespace are dropped so they cannot break or broaden the query.
+    assert _parse_liveness_jobs("ibkr-feed,paper-trader") == ["ibkr-feed", "paper-trader"]
+    assert _parse_liveness_jobs(" ibkr-feed , paper-trader ") == ["ibkr-feed", "paper-trader"]
+    assert _parse_liveness_jobs("") == []
+    assert _parse_liveness_jobs('paper-trader,bad"job,a|b,c.*') == ["paper-trader"]
