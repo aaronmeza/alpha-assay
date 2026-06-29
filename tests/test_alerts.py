@@ -13,7 +13,13 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from infra.alerts.main import AlertState, build_rules, evaluate_rule, in_rth
+from infra.alerts.main import (
+    AlertState,
+    _stand_down_message,
+    build_rules,
+    evaluate_rule,
+    in_rth,
+)
 
 CT = ZoneInfo("America/Chicago")
 
@@ -215,3 +221,14 @@ def test_clear_rule_drops_state_and_reports_firing():
     assert was_firing == ["paper-trader"]
     assert state.breach_started == {}
     assert state.firing == {}
+
+
+def test_window_close_stand_down_message_is_not_a_false_resolve():
+    # Round-8 finding: a page active at RTH close was cleared silently. The loop
+    # now sends a stand-down for the firing series so the operator gets closure -
+    # phrased as a stand-down, NOT a resolution (the issue may still be live).
+    msg = _stand_down_message("paper_trader_connected", ["paper-trader"])
+    assert "stood down" in msg
+    assert "RTH window closed" in msg
+    assert "paper-trader" in msg
+    assert "resolved" not in msg.lower()

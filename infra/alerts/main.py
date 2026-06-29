@@ -205,6 +205,16 @@ def evaluate_rule(
     return actions
 
 
+def _stand_down_message(rule_name: str, series_keys: list[str]) -> str:
+    """Operator notice that an active page is being stood down because the RTH
+    window closed - explicitly NOT a resolution (out-of-RTH disconnects are
+    expected); the rule re-evaluates at the next open."""
+    return (
+        f"stood down (RTH window closed): {rule_name} was firing for "
+        f"{', '.join(series_keys)} - re-evaluates at next open"
+    )
+
+
 def build_rules(
     *,
     freshness_threshold: int,
@@ -273,10 +283,15 @@ def build_rules(
             ),
             resolve_template="resolved: ibkr-feed IBKR connection is back up",
         ),
-        # 0n6 core: the paper-trader order path. Gated on exec_mode so it only
-        # alerts when the paper-trader is actually in strategy mode (holding an
-        # order connection); always-flat mode exports neither exec_mode nor a real
-        # connection, so the gate keeps it from false-firing.
+        # 0n6 core: the paper-trader order path. Gated on exec_mode{mode=paper}==1,
+        # which means "a PAPER IBKRExecAdapter exists". In the DEPLOYED mode
+        # (bus-consumer + PAPER_STRATEGY) that is exactly the live-order-path mode
+        # this rule targets, and bus always-flat mode uses a stub adapter (no
+        # exec_mode series), so the gate excludes it. CAVEAT: the legacy direct-
+        # IBKR always-flat path (build_adapters, not deployed on SER9) also builds
+        # an exec adapter and so sets the gauge despite having no active order path,
+        # so exec_mode is a proxy, not a precise strategy-mode signal; a dedicated
+        # order-path-active gauge for that legacy mode is tracked in alphaassay-e84.
         AlertRule(
             name="paper_trader_connected",
             breach_query=(
@@ -359,7 +374,16 @@ def main() -> None:
                 if rule.rth_only and not in_window:
                     was_firing = state.clear_rule(rule.name)
                     if was_firing:
-                        log.info("window closed; clearing firing state rule=%s series=%s", rule.name, was_firing)
+                        # A page was active when the RTH window closed. Don't let it
+                        # vanish silently - send one stand-down so the operator gets
+                        # closure (this is NOT a claim the issue resolved; out-of-RTH
+                        # disconnects are expected, so the rule re-evaluates next open).
+                        log.info("window closed; standing down firing rule=%s series=%s", rule.name, was_firing)
+                        msg = _stand_down_message(rule.name, was_firing)
+                        try:
+                            post_telegram(bot_token, chat_id, msg)
+                        except Exception as e:  # noqa: BLE001 - a telegram failure must not kill the poller
+                            log.warning("telegram post failed (stand-down): %s", e)
                     continue
                 try:
                     breaching = query_prom_series(prom_url, rule.breach_query, rule.label_key)
