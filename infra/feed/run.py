@@ -293,6 +293,7 @@ async def _run_subscriptions(
     staleness_timeout: float = 180.0,
     staleness_poll: float = 15.0,
     freshness: FreshnessTracker | None = None,
+    roll_restart: asyncio.Event | None = None,
 ) -> int:
     """Run all subscriptions plus the watchdogs until one ends.
 
@@ -327,6 +328,10 @@ async def _run_subscriptions(
     ]
     wd_task = asyncio.create_task(_watch_connection(adapter, poll_seconds=watchdog_poll), name="watchdog")
     stop_task = asyncio.create_task(stop_event.wait(), name="stop")
+    # A per-root pre-open re-qualify loop sets roll_restart on a detected
+    # rollover; racing on it here turns "front month rolled" into EXIT_RESTART
+    # so cold-start re-bakes the new contract stream atomically.
+    roll_task = asyncio.create_task(roll_restart.wait(), name="roll-restart") if roll_restart is not None else None
 
     # Data-staleness watchdog: required feeds only (see _watch_staleness).
     required_streams = [sub.stream for sub in subscriptions if sub.required]
@@ -351,6 +356,8 @@ async def _run_subscriptions(
     wait_set = [*required_tasks, wd_task, stop_task]
     if stale_task is not None:
         wait_set.append(stale_task)
+    if roll_task is not None:
+        wait_set.append(roll_task)
 
     done, pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
     for t in [*pending, *optional_tasks]:
@@ -380,9 +387,16 @@ async def _run_subscriptions(
         _mark_stale_restart(adapter, stale_stream)
         return EXIT_RESTART
 
+    if roll_task is not None and roll_task in done:
+        LOG.warning(
+            "front-month rollover requested a restart; exiting EXIT_RESTART so cold-start "
+            "re-resolves and bakes the new contract stream (key + stream flip atomically)"
+        )
+        return EXIT_RESTART
+
     # A required subscription task finished. Surface why, then exit for a restart.
     for t in done:
-        if t is stop_task or t is wd_task or t is stale_task:
+        if t is stop_task or t is wd_task or t is stale_task or t is roll_task:
             continue
         exc = t.exception()
         if exc is not None:
@@ -397,6 +411,7 @@ async def _pre_open_requalify_loop(
     adapter,
     redis_client,
     *,
+    roll_restart: asyncio.Event,
     symbol: str = "ES",
     exchange: str = "CME",
     currency: str = "USD",
@@ -405,19 +420,27 @@ async def _pre_open_requalify_loop(
 
     Reads the current expiry from Redis (the source of truth written at
     startup by ``_resolve_front_months``). If IBKR resolves a different
-    expiry a rollover has occurred: the Redis key and the Prometheus gauge
-    are updated so consumers pick up the new stream key on their next
-    restart. ``_main`` starts one loop per futures root in the manifest.
+    expiry a rollover has occurred.
 
-    The running subscription loop is NOT torn down - the stream name is
-    baked at startup inside ``run_subscription`` and stays on the
-    boot-time stream for the rest of the process lifetime. Stream-key
-    switch takes effect on the next feed restart; mid-session the
-    producer stays on the boot-time stream by design.
+    On a detected rollover this loop does NOT write the new key/gauge
+    itself. The subscription stream name is baked at startup inside
+    ``run_subscription`` and cannot switch in-process, so writing
+    ``key=new_expiry`` here while still publishing the old stream would let
+    the key lead the live stream - the exact silent-roll divergence
+    consumers cannot safely mitigate. Instead it sets ``roll_restart`` and
+    returns, so the daemon exits ``EXIT_RESTART`` and the supervisor recycles
+    it: the proven cold-start path (``_resolve_front_months``) then
+    re-resolves, writes the key, AND bakes the new stream - so the key and
+    the live publishing stream flip together, atomically, from every
+    consumer's view. The 08:00 CT run is pre-open (before the 08:30 RTH
+    open), so the whole-daemon restart's gap is pre-RTH and matches the
+    proven nightly IBC restart cycle. ``_main`` starts one loop per futures
+    root in the manifest.
 
     A single-iteration failure (IBKR error, Redis unavailable) is logged
     as WARNING and skipped; the loop continues sleeping until the next
-    08:00 CT. The coroutine only exits via cancellation (SIGTERM/stop).
+    08:00 CT. The coroutine otherwise exits on a detected rollover (it
+    requests a restart) or via cancellation (SIGTERM/stop).
     """
     while True:
         now = datetime.now(CHICAGO)
@@ -460,31 +483,25 @@ async def _pre_open_requalify_loop(
             LOG.info("pre-open re-qualify: %s front-month unchanged (%s)", symbol, new_expiry)
             continue
 
-        # --- Rollover detected ---
+        # --- Rollover detected: request a self-restart (do NOT pre-write) ---
+        # Deliberately do not write the key/gauge here. The producer bakes its
+        # publishing stream at startup and cannot switch it in-process, so a
+        # pre-write would leave key=new_expiry while still publishing the old
+        # stream. Exit EXIT_RESTART instead: cold-start (_resolve_front_months)
+        # re-resolves, writes key=new_expiry, and bakes the new stream together,
+        # so the key and the live stream flip atomically from every consumer's
+        # view. The unchanged-check above is the loop-guard against restart loops.
         LOG.warning(
             "FRONT-MONTH ROLLOVER detected for %s: %s -> %s (%s); "
-            "updating Redis key + gauge. "
-            "Stream-key switch takes effect on the next feed restart; "
-            "the mid-session producer stays on the boot-time stream by design.",
+            "requesting EXIT_RESTART so cold-start re-bakes the new contract stream "
+            "(key + live stream flip together, atomically).",
             symbol,
             current_expiry,
             new_expiry,
             fut.localSymbol,
         )
-        try:
-            # validate_yyyymmdd already ran above; write_front_month validates
-            # again internally (defense-in-depth). Gauge int cast is safe.
-            write_front_month(redis_client, symbol=symbol, exchange=exchange, expiry=new_expiry)
-            M.front_month_expiry.labels(symbol=symbol, exchange=exchange).set(int(new_expiry))
-        except Exception as exc:  # noqa: BLE001 - best-effort write; log and continue
-            LOG.warning(
-                "pre-open re-qualify: failed to persist new %s expiry %s (%s); "
-                "consumers will not learn of the rollover until the write succeeds; "
-                "manual restart may be required.",
-                symbol,
-                new_expiry,
-                exc,
-            )
+        roll_restart.set()
+        return
 
 
 async def _resolve_front_months(
@@ -671,11 +688,23 @@ async def _main() -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
+    # Any per-root pre-open re-qualify loop sets this on a detected rollover;
+    # _run_subscriptions races on it and returns EXIT_RESTART so the daemon
+    # cold-starts onto the new contract (key + publishing stream flip atomically).
+    roll_restart = asyncio.Event()
+
     # Start one daily pre-open re-qualify loop per resolved futures root
     # (none for breadth-only deployments).
     for symbol, exchange, currency in resolved_roots:
         asyncio.create_task(
-            _pre_open_requalify_loop(adapter, redis_client, symbol=symbol, exchange=exchange, currency=currency),
+            _pre_open_requalify_loop(
+                adapter,
+                redis_client,
+                roll_restart=roll_restart,
+                symbol=symbol,
+                exchange=exchange,
+                currency=currency,
+            ),
             name=f"pre-open-requalify-{symbol.lower()}",
         )
         LOG.info("daily pre-open re-qualify task started for %s@%s", symbol, exchange)
@@ -689,6 +718,7 @@ async def _main() -> int:
         staleness_timeout=staleness_timeout,
         staleness_poll=staleness_poll,
         freshness=freshness,
+        roll_restart=roll_restart,
     )
 
 
