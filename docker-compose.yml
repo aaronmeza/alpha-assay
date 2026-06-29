@@ -37,7 +37,11 @@ services:
       dockerfile: infra/paper-trader/Dockerfile
     image: alphaassay/paper-trader:0.1.0
     container_name: alphaassay-paper-trader
-    restart: on-failure:3
+    # unless-stopped (not on-failure:N) so the connection watchdog's EXIT_RESTART
+    # reconnects indefinitely across the nightly IB Gateway / IBC restart - the
+    # capped on-failure:3 would stop recycling after 3 exits and re-strand the
+    # order path. Matches ibkr-feed. (alphaassay-0n6)
+    restart: unless-stopped
     command: ["python", "-u", "/app/scripts/paper_dryrun.py"]
     environment:
       METRICS_PORT: "8000"

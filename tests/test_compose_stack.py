@@ -81,8 +81,11 @@ def test_compose_yaml_is_valid() -> None:
         recorder.get("profiles") or []
     ), "breadth-recorder must declare profiles: [recorder] so default `up` skips it"
 
-    # Restart policies per spec.
-    assert services["paper-trader"].get("restart") == "on-failure:3"
+    # Restart policies per spec. paper-trader is unless-stopped (not on-failure:N)
+    # so the connection watchdog's EXIT_RESTART reconnects indefinitely across the
+    # nightly IB Gateway restart - a capped on-failure:3 stops recycling and
+    # re-strands the order path (alphaassay-0n6).
+    assert services["paper-trader"].get("restart") == "unless-stopped"
     assert services["breadth-recorder"].get("restart") == "on-failure:3"
     assert services["prometheus"].get("restart") == "unless-stopped"
     assert services["grafana"].get("restart") == "unless-stopped"

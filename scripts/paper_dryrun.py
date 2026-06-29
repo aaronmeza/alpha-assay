@@ -109,6 +109,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
@@ -131,11 +132,24 @@ from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.exec.ibkr import ExecMode, IBKRExecAdapter, build_exec_adapter
 from alpha_assay.exec.loop_marshal import IBLoopThread
 from alpha_assay.exec.trade_log import TradeLog, TradeRecord
+from alpha_assay.exec.watchdog import EXIT_OK, EXIT_RESTART, watch_connection
 from alpha_assay.observability import metrics as M
 from alpha_assay.paper.runner import PaperStrategyRunner, load_paper_strategy
 
 HEARTBEAT_INTERVAL_SECONDS = 30
 DRAIN_TIMEOUT_SECONDS = 20
+# Connection watchdog poll cadence (strategy mode order path). A peer-closed
+# socket - the nightly IB Gateway / IBC restart - leaves ib_insync disconnected
+# with no auto-reconnect, so the watchdog exits EXIT_RESTART and Docker
+# (restart: unless-stopped) brings the process back on a fresh connect. Mirrors
+# the ibkr-feed producer; see alpha_assay.exec.watchdog.
+WATCHDOG_POLL_SECONDS = 5
+# Cold-start connect retry: a freshly (re)started container can land mid-IBC
+# cycle while IB Gateway is briefly down. Retry with backoff before giving up
+# so the watchdog/Docker loop is not churned during the nightly restart window.
+CONNECT_RETRY_ATTEMPTS = 5
+CONNECT_RETRY_BASE_DELAY = 2.0
+CONNECT_RETRY_MAX_DELAY = 30.0
 
 # Default runs directory inside the container. Override via RUNS_DIR env var.
 # Outside container (local dev / CI) set RUNS_DIR to a temp path.
@@ -226,8 +240,6 @@ def _resolve_es_expiry_with_wait(
         FrontMonthMissingError: neither env nor Redis key available after
             max_wait_seconds.
     """
-    import time
-
     override = os.environ.get("ES_EXPIRY", "").strip()
     if override:
         # Validate before using - bad env value must fail loudly.
@@ -417,6 +429,45 @@ def build_adapters(cfg: DryrunConfig) -> tuple[IBKRAdapter, IBKRExecAdapter]:
         dry_run=True,
     )
     return adapter, exec_adapter
+
+
+def _mark_ibkr_disconnected(adapter: IBKRAdapter) -> None:
+    """Reflect a watchdog-detected connection loss in the metrics.
+
+    Mirrors ``infra.feed.run._mark_disconnected``: ``adapter.disconnect()`` is a
+    no-op once ``is_connected`` is already False (the peer closed the socket -
+    the nightly IB Gateway restart), so it never moves the gauge. Setting it
+    explicitly is what stops ``alpha_assay_ibkr_connected`` from being stuck at 1
+    while the order path is actually dead - the silent-failure that made the 10-day
+    paper-trader outage invisible to every alert. The actual socket teardown is
+    handled by the caller's ``finally`` (``exec_adapter.disconnect()``).
+    """
+    M.ibkr_connected.set(0)
+    M.ibkr_connection_events_total.labels(event="disconnected").inc()
+
+
+def _connect_exec_with_retry(exec_adapter: IBKRExecAdapter, adapter: IBKRAdapter) -> bool:
+    """Connect the exec adapter, retrying with exponential backoff.
+
+    A freshly (re)started container can land mid-IBC-cycle while IB Gateway is
+    briefly down. Rather than connect once and immediately trip the watchdog into
+    a Docker restart loop, give the gateway a short window to come back. Returns
+    True once connected; False if every attempt failed (the caller continues in a
+    metrics-only state and the watchdog/Docker loop recovers when the gateway
+    returns). Mirrors ``infra.feed.run._connect_with_retry``.
+    """
+    for i in range(CONNECT_RETRY_ATTEMPTS):
+        try:
+            exec_adapter.connect()
+        except Exception:  # noqa: BLE001 - retry on any connect failure
+            _LOG.warning("ibkr connect attempt %d/%d failed", i + 1, CONNECT_RETRY_ATTEMPTS, exc_info=True)
+        if adapter.is_connected:
+            return True
+        if i < CONNECT_RETRY_ATTEMPTS - 1:
+            delay = min(CONNECT_RETRY_MAX_DELAY, CONNECT_RETRY_BASE_DELAY * (2**i))
+            _LOG.warning("retrying ibkr connect in %.0fs", delay)
+            time.sleep(delay)
+    return False
 
 
 # ----------------------------------------------------------------------
@@ -685,18 +736,51 @@ async def _async_main(
 
         deadline_task = asyncio.create_task(_deadline())
 
+    # Connection watchdog: only where there is a real IBKR connection to lose -
+    # the strategy-mode order path, or legacy direct-IBKR mode. Always-flat bus
+    # mode (adapter=None) holds no IBKR connection and is not watched. On a
+    # peer-closed socket (the nightly IB Gateway / IBC restart) ib_insync does
+    # not auto-reconnect, so the watchdog exits EXIT_RESTART and Docker
+    # (restart: unless-stopped) reconnects on a fresh start - mirroring ibkr-feed.
+    wd_task: asyncio.Task[None] | None = None
+    if adapter is not None:
+        wd_task = asyncio.create_task(
+            watch_connection(adapter, poll_seconds=WATCHDOG_POLL_SECONDS),
+            name="ibkr-watchdog",
+        )
+    stop_wait = asyncio.create_task(stop_event.wait(), name="stop-wait")
+
+    exit_code = EXIT_OK
     try:
-        # Block until stop signaled.
-        await stop_event.wait()
+        # Block until a stop is requested OR (strategy mode) the IBKR
+        # connection is lost.
+        race: list[asyncio.Future[Any]] = [stop_wait]
+        if wd_task is not None:
+            race.append(wd_task)
+        done, _ = await asyncio.wait(race, return_when=asyncio.FIRST_COMPLETED)
+        if wd_task is not None and wd_task in done:
+            exit_code = EXIT_RESTART
+            _LOG.error(
+                "IBKR connection lost; exiting EXIT_RESTART so the container "
+                "restart policy reconnects on a fresh start"
+            )
+            _mark_ibkr_disconnected(adapter)
+            # Wake the asyncio loops AND the bus-consumer threads for a clean drain.
+            stop_event.set()
+            stop_event_thread.set()
     finally:
-        for t in (bars_task, breadth_task, heartbeat_task, bridge_task):
+        for t in (bars_task, breadth_task, heartbeat_task, bridge_task, stop_wait):
             t.cancel()
+        if wd_task is not None:
+            wd_task.cancel()
         if ad_task is not None:
             ad_task.cancel()
         if deadline_task is not None:
             deadline_task.cancel()
         # Drain with a hard deadline so SIGTERM honors DRAIN_TIMEOUT_SECONDS.
-        pending = [bars_task, breadth_task, heartbeat_task, bridge_task]
+        pending = [bars_task, breadth_task, heartbeat_task, bridge_task, stop_wait]
+        if wd_task is not None:
+            pending.append(wd_task)
         if ad_task is not None:
             pending.append(ad_task)
         if deadline_task is not None:
@@ -717,7 +801,7 @@ async def _async_main(
             except Exception:
                 _LOG.exception("trade log flush failed on shutdown; records may be lost")
 
-    return 0
+    return exit_code
 
 
 def run(cfg: DryrunConfig) -> int:

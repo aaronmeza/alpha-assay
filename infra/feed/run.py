@@ -59,6 +59,8 @@ from alpha_assay.data.front_month import (
     write_front_month,
 )
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
+from alpha_assay.exec.watchdog import EXIT_OK, EXIT_RESTART
+from alpha_assay.exec.watchdog import watch_connection as _watch_connection
 
 # Single source for the RTH boundary, shared with the strategy session filter
 # and the freshness alerter (08:30-15:00 CT).
@@ -72,9 +74,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
+# EXIT_OK / EXIT_RESTART and the connection watchdog (_watch_connection) are the
+# shared resilience primitives in alpha_assay.exec.watchdog, imported above so
+# every IBKR-connected component (producer + paper-trader) uses one source.
 # Docker `restart: unless-stopped` recycles the container on any non-zero exit.
-EXIT_OK = 0
-EXIT_RESTART = 2
 
 # Daily pre-open re-qualify schedule.
 CHICAGO = ZoneInfo("America/Chicago")
@@ -122,17 +125,6 @@ def _in_rth(now_ct: datetime) -> bool:
         return False
     minute_of_day = now_ct.hour * 60 + now_ct.minute
     return OPEN_CT_MINUTES <= minute_of_day < CLOSE_CT_MINUTES
-
-
-async def _watch_connection(adapter, poll_seconds: float = 5.0) -> None:
-    """Block until the IBKR connection is lost.
-
-    Polls ``adapter.is_connected``; returns as soon as it reads False.
-    Cheap (one bool check per ``poll_seconds``) and side-effect free -
-    the caller decides what to do with the news.
-    """
-    while adapter.is_connected:
-        await asyncio.sleep(poll_seconds)
 
 
 async def _watch_staleness(
