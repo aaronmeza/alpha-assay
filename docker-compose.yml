@@ -41,6 +41,14 @@ services:
     # reconnects indefinitely across the nightly IB Gateway / IBC restart - the
     # capped on-failure:3 would stop recycling after 3 exits and re-strand the
     # order path. Matches ibkr-feed. (alphaassay-0n6)
+    #
+    # Deliberately NOT uncapped `on-failure`: this is the always-on deployment
+    # service (DRYRUN_DURATION_SECONDS=0, never self-exits EXIT_OK), so the only
+    # clean exit is an operator `docker stop`, which unless-stopped honours (stays
+    # down). unless-stopped also survives a host reboot, which on-failure does not.
+    # The EXIT_OK/EXIT_RESTART distinction the code returns still matters for a
+    # finite dry-run run OUTSIDE compose (e.g. `docker run --rm` with a duration);
+    # under this always-on service both codes recycle, which is the intent here.
     restart: unless-stopped
     command: ["python", "-u", "/app/scripts/paper_dryrun.py"]
     environment:

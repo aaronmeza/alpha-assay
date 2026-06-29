@@ -77,6 +77,17 @@ def test_process_liveness_rule_uses_up_metric():
     assert rule.rth_only is True
 
 
+def test_process_liveness_guarded_against_undeployed_targets():
+    # Review finding: a statically-scraped but profile-disabled job reports up=0
+    # (not absent), so a naive up==0 rule would page even though nothing failed.
+    # The max_over_time(..)==1 guard requires the target to have been up recently,
+    # so only a target that was running and then disappeared fires.
+    rule = _rule("process_liveness")
+    assert "max_over_time(up{" in rule.breach_query
+    assert "== 1" in rule.breach_query
+    assert "and on(job)" in rule.breach_query
+
+
 def test_feed_connected_rule_scoped_to_ibkr_feed():
     rule = _rule("ibkr_feed_connected")
     assert 'job="ibkr-feed"' in rule.breach_query

@@ -228,11 +228,17 @@ def build_rules(
     covers it" gap that let the order path die silently for ten days, so this rule
     closes it with an RTH-gated Telegram page. RTH-gating excludes the nightly
     ~22:50 CT ibkr-feed/IBC restart; a deploy force-recreate is shorter than the
-    sustain window, so neither false-fires. NOTE: ``up`` is only meaningful where
-    these jobs are real scrape targets - the deployed SER9 topology (host
-    networking, host.docker.internal:8000/8003, verified up=1). The dev/bridge base
-    compose publishes different host ports and is stub-only; making base-compose
-    scraping topology-correct + tested is tracked in epic alphaassay-e84.
+    sustain window, so neither false-fires. A ``max_over_time(up[8h]) == 1`` guard
+    requires the target to have been up within the window before a down state
+    counts, so a job that is statically scraped but intentionally not deployed
+    (profile off -> ``up`` is 0 forever, never absent) does NOT page - only a
+    target that was running and then disappeared does; the 8h window reaches back
+    before the RTH open so a full-session outage keeps firing without a false auto-
+    resolve. NOTE: ``up`` is only meaningful where these jobs are real scrape
+    targets - the deployed on-prem host-networking topology
+    (host.docker.internal:8000/8003, verified up=1). The dev/bridge base compose
+    publishes different host ports than it scrapes and is stub-only; making base-
+    compose scrape topology correct + tested is tracked in epic alphaassay-e84.
     """
     return [
         AlertRule(
@@ -281,10 +287,16 @@ def build_rules(
         # all, so the gauge==0 rules above cannot see it. up==0 (configured target
         # unreachable) is the only signal that catches a gone process. Scoped to
         # the two connection-holding jobs this bead is about; RTH-gated so the
-        # nightly ibkr-feed/IBC restart and short deploy recreates do not page.
+        # nightly ibkr-feed/IBC restart and short deploy recreates do not page. The
+        # `and on(job) max_over_time(up[8h]) == 1` guard fires only for a target
+        # that was up within the window and then went down, so a statically-scraped
+        # but undeployed job (profile off -> up=0 forever) never false-fires.
         AlertRule(
             name="process_liveness",
-            breach_query='up{job=~"ibkr-feed|paper-trader"} == 0',
+            breach_query=(
+                'up{job=~"ibkr-feed|paper-trader"} == 0 '
+                'and on(job) max_over_time(up{job=~"ibkr-feed|paper-trader"}[8h]) == 1'
+            ),
             label_key="job",
             sustain_seconds=connected_sustain,
             rth_only=True,
