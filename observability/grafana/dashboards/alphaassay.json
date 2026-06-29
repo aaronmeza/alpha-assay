@@ -536,7 +536,8 @@
     {
       "type": "stat",
       "id": 19,
-      "title": "IBKR connected",
+      "title": "IBKR connected (per job)",
+      "description": "1 = connected, 0 = DOWN. Broken out per connection-holding job (ibkr-feed = data path, paper-trader = order path); recorders are bus consumers and excluded. Background goes red on 0. (alphaassay-0n6)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -547,10 +548,58 @@
         "x": 12,
         "y": 61
       },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
       "targets": [
         {
-          "expr": "alpha_assay_ibkr_connected",
-          "legendFormat": "ibkr",
+          "expr": "alpha_assay_ibkr_connected{job=~\"ibkr-feed|paper-trader\"}",
+          "legendFormat": "{{job}}",
           "refId": "A"
         }
       ]
@@ -994,6 +1043,77 @@
         {
           "expr": "alpha_assay_front_month_expiry",
           "legendFormat": "{{symbol}} @ {{exchange}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 107,
+      "title": "Scrape target up (per job)",
+      "description": "1 = process scraped OK, 0 = DOWN (configured target unreachable: container gone / crash-looping / metrics endpoint wedged). This is the signal the connection gauge cannot give - on a crash the gauge goes ABSENT, so only up==0 shows DOWN here. Pairs with the process_liveness Telegram rule. (alphaassay-0n6)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 101
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "up{job=~\"ibkr-feed|paper-trader\"}",
+          "legendFormat": "{{job}}",
           "refId": "A"
         }
       ]

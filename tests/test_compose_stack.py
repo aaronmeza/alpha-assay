@@ -81,8 +81,11 @@ def test_compose_yaml_is_valid() -> None:
         recorder.get("profiles") or []
     ), "breadth-recorder must declare profiles: [recorder] so default `up` skips it"
 
-    # Restart policies per spec.
-    assert services["paper-trader"].get("restart") == "on-failure:3"
+    # Restart policies per spec. paper-trader is unless-stopped (not on-failure:N)
+    # so the connection watchdog's EXIT_RESTART reconnects indefinitely across the
+    # nightly IB Gateway restart - a capped on-failure:3 stops recycling and
+    # re-strands the order path (alphaassay-0n6).
+    assert services["paper-trader"].get("restart") == "unless-stopped"
     assert services["breadth-recorder"].get("restart") == "on-failure:3"
     assert services["prometheus"].get("restart") == "unless-stopped"
     assert services["grafana"].get("restart") == "unless-stopped"
@@ -99,6 +102,16 @@ def test_compose_yaml_is_valid() -> None:
     assert pt_env.get("METRICS_PORT") == "8000"
     assert pt_env.get("ALPHA_ASSAY_ENV") == "paper-dryrun"
     assert pt_env.get("TZ") == "America/Chicago"
+
+    # The alerts service must DECLARE its expected liveness jobs - the library
+    # default is empty (presumes nothing), so the process-liveness rule only exists
+    # because the deployment declares it here. Guard against silent regression
+    # (alphaassay-0n6).
+    alerts_env = services["alerts"].get("environment", {})
+    if isinstance(alerts_env, list):
+        alerts_env = dict(item.split("=", 1) for item in alerts_env)
+    liveness = {j.strip() for j in str(alerts_env.get("LIVENESS_JOBS", "")).split(",") if j.strip()}
+    assert liveness == {"ibkr-feed", "paper-trader"}, f"alerts must declare both core liveness jobs; got {liveness}"
 
 
 def test_prometheus_scrape_targets() -> None:
