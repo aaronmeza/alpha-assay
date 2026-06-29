@@ -736,14 +736,18 @@ async def _async_main(
 
         deadline_task = asyncio.create_task(_deadline())
 
-    # Connection watchdog: only where there is a real IBKR connection to lose -
-    # the strategy-mode order path, or legacy direct-IBKR mode. Always-flat bus
-    # mode (adapter=None) holds no IBKR connection and is not watched. On a
-    # peer-closed socket (the nightly IB Gateway / IBC restart) ib_insync does
-    # not auto-reconnect, so the watchdog exits EXIT_RESTART and Docker
-    # (restart: unless-stopped) reconnects on a fresh start - mirroring ibkr-feed.
+    # Connection watchdog: scoped to STRATEGY mode (adapter is not None AND bus
+    # mode), i.e. the order path - its whole purpose. On a peer-closed socket (the
+    # nightly IB Gateway / IBC restart) ib_insync does not auto-reconnect, so the
+    # watchdog exits EXIT_RESTART and Docker (restart: unless-stopped) reconnects
+    # on a fresh start - mirroring ibkr-feed. Deliberately NOT armed in legacy
+    # direct-IBKR mode (bus_consumers is None): that path intentionally serves
+    # metrics-only and waits for the gateway rather than restart-looping, and a
+    # gateway-down cold start would otherwise trip the watchdog immediately.
+    # Always-flat bus mode (adapter=None) holds no IBKR connection at all.
+    watch_enabled = adapter is not None and bus_consumers is not None
     wd_task: asyncio.Task[None] | None = None
-    if adapter is not None:
+    if watch_enabled:
         wd_task = asyncio.create_task(
             watch_connection(adapter, poll_seconds=WATCHDOG_POLL_SECONDS),
             name="ibkr-watchdog",

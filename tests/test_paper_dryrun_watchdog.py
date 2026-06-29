@@ -163,6 +163,39 @@ def test_async_main_clean_stop_wins_concurrent_connection_loss(monkeypatch):
     assert rc == module.EXIT_OK
 
 
+def test_async_main_direct_mode_does_not_arm_watchdog(monkeypatch):
+    # Finding G: legacy direct-IBKR mode (no bus_consumers) must NOT arm the
+    # watchdog - a gateway-down cold start serves metrics and waits for a clean
+    # stop rather than restart-looping. If the watchdog were armed, a disconnected
+    # adapter would return EXIT_RESTART immediately; we assert EXIT_OK on stop.
+    module = _load_script_module()
+    monkeypatch.setattr(module, "WATCHDOG_POLL_SECONDS", 0.02)
+
+    async def _idle_async(*_a, **_k):
+        while True:
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(module, "_consume_bars", _idle_async)
+    monkeypatch.setattr(module, "_consume_breadth", _idle_async)
+
+    adapter = _FakeAdapter(connected=False)  # gateway down at cold start
+    stop_event_thread = threading.Event()
+    strategy = module.AlwaysFlatStrategy(exec_adapter=object(), trade_log=None)
+
+    async def _run():
+        async def _stop_later():
+            await asyncio.sleep(0.1)
+            stop_event_thread.set()
+
+        asyncio.create_task(_stop_later())
+        return await asyncio.wait_for(
+            module._async_main(_cfg(module), adapter, strategy, stop_event_thread),  # no bus_consumers -> direct mode
+            timeout=8.0,
+        )
+
+    assert asyncio.run(_run()) == module.EXIT_OK
+
+
 def test_connect_exec_with_retry_succeeds_after_transient_failures(monkeypatch):
     # Finding E: the cold-start retry must actually be exercised - succeeds once a
     # later attempt connects (gateway came back mid-IBC-cycle).
