@@ -507,3 +507,115 @@ def test_engine_increments_signals_filtered_risk_cap_counter():
         strategy="OversizedStop", filter_name="risk_caps", reason="risk_cap"
     )._value.get()
     assert after >= before + 1
+
+
+# ---------------------------------------------------------------------------
+# cfg.session threading: minutes_after_open / minutes_before_close (alphaassay-s8n)
+# ---------------------------------------------------------------------------
+# April 28 2026 is CDT (UTC-5). 14:30 CT = 19:30 UTC.
+# Default session window: [09:30 CT, 14:30 CT) -- 14:30 CT bar is excluded.
+# Expanded window (minutes_before_close=0): [09:30 CT, 15:00 CT) -- 14:30 CT bar is included.
+
+
+def _make_late_afternoon_df() -> "pd.DataFrame":
+    """20 bars starting at 14:30 CT (19:30 UTC) on a CDT day.
+
+    These bars fall outside the default 30/30 session window but inside
+    a window with minutes_before_close=0.
+    """
+    idx = pd.date_range("2026-04-28 19:30", periods=20, freq="1min", tz="UTC")
+    n = len(idx)
+    return pd.DataFrame(
+        {
+            "timestamp": idx,
+            "ES_open": [5000.0] * n,
+            "ES_high": [5002.0] * n,
+            "ES_low": [4998.0] * n,
+            "ES_close": [5001.0] * n,
+            "ES_volume": [100] * n,
+            "TICK": [0.0] * n,
+            "ADD": [0.0] * n,
+        }
+    )
+
+
+def test_cfg_session_minutes_before_close_zero_fires_at_1430_ct():
+    """Runner with minutes_before_close=0 must evaluate 14:30 CT bars and
+    fire a signal -- the bar that the default 30/30 window excludes.
+
+    This is the regression test for alphaassay-s8n: the runner was
+    previously hardcoded to the default 30/30 window and silently
+    dropped entry signals for strategies whose active window extends
+    past 14:30 CT.
+    """
+    from alpha_assay.strategy.base import BaseStrategy, ExitParams, Signal
+
+    class EarlyFireStrategy(BaseStrategy):
+        _fired = False
+
+        def generate_signals(self, data: pd.DataFrame) -> pd.Series:
+            out = pd.Series(0, index=data.index, dtype=int)
+            if not EarlyFireStrategy._fired and len(data) >= 5:
+                EarlyFireStrategy._fired = True
+                out.iloc[-1] = 1
+            return out
+
+        def get_exit_params(self, signal: Signal, data: pd.DataFrame) -> ExitParams:
+            return ExitParams(stop_points=1.0, target_points=2.5)
+
+    EarlyFireStrategy._fired = False
+
+    df = _make_late_afternoon_df()
+    runner = NautilusBacktestRunner(
+        strategy=EarlyFireStrategy(config={}),
+        data=df,
+        instrument_symbol="MESM6",
+        starting_balance_usd=100_000.0,
+        minutes_after_open=30,
+        minutes_before_close=0,
+    )
+    result = runner.run()
+    assert result.session_metrics.get("submitted_signals", 0) >= 1, (
+        "expected at least one signal to fire with minutes_before_close=0 "
+        f"on 14:30 CT bars; got session_metrics={result.session_metrics!r}"
+    )
+    assert result.session_metrics.get("orders_submitted", 0) >= 1, (
+        "expected at least one bracket order with minutes_before_close=0; "
+        f"got session_metrics={result.session_metrics!r}"
+    )
+
+
+def test_default_session_gates_1430_ct_bars_out():
+    """Runner with default 30/30 window must gate out 14:30 CT bars so no
+    signal fires -- confirming tick_fade behavior is byte-identical to before
+    the alphaassay-s8n fix.
+    """
+    from alpha_assay.strategy.base import BaseStrategy, ExitParams, Signal
+
+    class EarlyFireStrategy(BaseStrategy):
+        _fired = False
+
+        def generate_signals(self, data: pd.DataFrame) -> pd.Series:
+            out = pd.Series(0, index=data.index, dtype=int)
+            if not EarlyFireStrategy._fired and len(data) >= 5:
+                EarlyFireStrategy._fired = True
+                out.iloc[-1] = 1
+            return out
+
+        def get_exit_params(self, signal: Signal, data: pd.DataFrame) -> ExitParams:
+            return ExitParams(stop_points=1.0, target_points=2.5)
+
+    EarlyFireStrategy._fired = False
+
+    df = _make_late_afternoon_df()
+    # No minutes_after_open / minutes_before_close -> defaults 30/30.
+    runner = NautilusBacktestRunner(
+        strategy=EarlyFireStrategy(config={}),
+        data=df,
+        instrument_symbol="MESM6",
+        starting_balance_usd=100_000.0,
+    )
+    result = runner.run()
+    assert result.session_metrics.get("orders_submitted", 0) == 0, (
+        "default 30/30 window must gate out all 14:30+ CT bars; " f"got session_metrics={result.session_metrics!r}"
+    )
