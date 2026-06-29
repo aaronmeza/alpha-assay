@@ -52,7 +52,7 @@ import pytest
 
 from alpha_assay.bus.consumer import Consumer
 from alpha_assay.bus.producer import Producer
-from alpha_assay.bus.streams import bars_stream_name
+from alpha_assay.bus.streams import bars_stream_has_data, bars_stream_name
 from alpha_assay.data.front_month import FrontMonthWatcher, write_front_month
 from alpha_assay.observability import metrics as M
 from infra.recorders.ibkr_es_bars import recorder_metrics as RM
@@ -215,6 +215,82 @@ def test_recorder_pinned_expiry_never_rebinds(tmp_path: Path):
     assert rec._stream == bars_stream_name("ES", "CME", "20260619")
 
 
+@pytest.mark.parametrize(
+    "symbol,exchange,e1,e2",
+    [
+        ("ES", "CME", "20260619", "20260918"),
+        ("NQ", "CME", "20260619", "20260918"),
+    ],
+)
+def test_recorder_holds_on_live_e1_until_e2_has_data(symbol, exchange, e1, e2, tmp_path: Path):
+    """Data-gated cutover: the pre-open window where key=E2 but E1 is live.
+
+    The producer writes the new key at the 08:00 CT pre-open re-qualify but
+    keeps publishing the OLD stream until its restart. A key-only rebind
+    would abandon the live E1 stream for an empty E2 stream (silent
+    starvation). The recorder must hold on E1 until E2 actually has data.
+    """
+    r = fakeredis.FakeRedis()
+    write_front_month(r, symbol=symbol, exchange=exchange, expiry=e1)
+    producer = Producer(redis_client=r)
+    s1 = bars_stream_name(symbol, exchange, e1)
+    s2 = bars_stream_name(symbol, exchange, e2)
+    service = f"{symbol.lower()}-bars-recorder"
+
+    _publish(producer, s1, f"{_DAY}T13:30:00+00:00", 5000.0)
+    rec = ESBarsRecorder(
+        out_dir=tmp_path,
+        contract_spec={"symbol": symbol, "sec_type": "FUT", "exchange": exchange, "expiry": e1},
+        bus_redis=r,
+        bus_consumer_id=service,
+        service_label=service,
+    )
+    asyncio.run(rec.consume_n_messages_for_test(1))
+    rec.flush()
+    assert rec._stream == s1
+
+    # ---- PRE-OPEN ROLL: key flips to E2, but the producer keeps publishing
+    # the LIVE E1 stream; the E2 stream does not exist yet. ----
+    write_front_month(r, symbol=symbol, exchange=exchange, expiry=e2)
+    _publish(producer, s1, f"{_DAY}T13:31:00+00:00", 5001.0)  # live E1 bar after the key flip
+
+    # (a) the recorder must NOT cut over while E2 is empty.
+    assert asyncio.run(rec.check_and_rebind_for_test()) is None
+    assert rec._stream == s1
+    assert rec._watcher is not None and rec._watcher.pending_expiry == e2  # roll noticed, cutover held
+    assert not rec._watcher.diverged  # E1 is still the live front month - NOT diverged
+    assert _gauge(M.consumer_front_month_expiry, service=service, symbol=symbol.lower()) == float(int(e1))
+
+    # (b) it CONTINUES consuming the live E1 bars (no starvation).
+    asyncio.run(rec.consume_n_messages_for_test(1))
+    rec.flush()
+    df_window = pd.read_parquet(tmp_path / f"{_DAY}.parquet")
+    assert list(df_window["close"]) == [5000.0, 5001.0]  # both live E1 bars on disk
+
+    # ---- Producer restarts onto E2: the new stream now has data. ----
+    _publish(producer, s2, f"{_DAY}T13:32:00+00:00", 5002.0)
+    _publish(producer, s2, f"{_DAY}T13:33:00+00:00", 5003.0)
+
+    new_expiry = asyncio.run(rec.check_and_rebind_for_test())
+    assert new_expiry == e2  # now cuts over (data gate open)
+    assert rec._stream == s2
+    assert rec._watcher.pending_expiry is None and not rec._watcher.diverged
+    assert _gauge(M.consumer_front_month_expiry, service=service, symbol=symbol.lower()) == float(int(e2))
+
+    asyncio.run(rec.consume_n_messages_for_test(2))
+    rec.flush()
+
+    df = pd.read_parquet(tmp_path / f"{_DAY}.parquet")
+    # (c) drained E1 then cut over; single-expiry; correct NEW price at boundary.
+    boundary = df[df["timestamp"] == pd.Timestamp(f"{_DAY}T13:32:00+00:00")]
+    assert len(boundary) == 1 and boundary.iloc[0]["close"] == 5002.0
+    # (d) NO bars lost: the live E1 bars are kept and E2 picks up contiguously.
+    assert list(df["timestamp"]) == [pd.Timestamp(f"{_DAY}T13:3{m}:00+00:00") for m in range(4)]
+    assert list(df["close"]) == [5000.0, 5001.0, 5002.0, 5003.0]
+    # feed_label continuity across the held-then-cutover roll.
+    assert rec._feed_label == f"{symbol}-FUT"
+
+
 # ---------------------------------------------------------------------------
 # Paper-trader: rebind on the running consumer loop; no restart, no replay.
 # ---------------------------------------------------------------------------
@@ -266,7 +342,13 @@ def test_paper_trader_rebinds_across_roll_no_restart_no_replay():
 
     M.consumer_front_month_expiry.labels(service="paper-trader", symbol="es").set(int(e1))
     strat = _CountingStrategy()
-    watcher = FrontMonthWatcher(r, symbol="ES", exchange="CME", current_expiry=e1)
+    watcher = FrontMonthWatcher(
+        r,
+        symbol="ES",
+        exchange="CME",
+        current_expiry=e1,
+        stream_has_data=lambda e: bars_stream_has_data(r, "ES", "CME", e),
+    )
     rebinder = mod._BarsRebinder(r, watcher, strat, symbol="ES", exchange="CME", consumer_id="paper-trader-bars")
     # start_id='$' so the strategy never replays buffered history (real config).
     consumer = Consumer(redis_client=r, stream=s1, consumer_id="paper-trader-bars", start_id="$")
@@ -313,6 +395,78 @@ def test_paper_trader_rebinds_across_roll_no_restart_no_replay():
     # (d) clean one-bar gap: the strategy's timeline jumps 13:31 -> 13:33, the
     # buffered 13:32 dropped - exactly one bar, never a mixed-contract overlap.
     assert 5002.0 in strat.closes
+
+
+def test_paper_trader_holds_on_live_e1_until_e2_has_data():
+    """Data-gated cutover for the paper-trader: pre-open window, E1 still live.
+
+    Mirrors the recorder hold test on the running paper-trader bars loop: the
+    key flips to E2 while the producer keeps publishing the live E1 stream
+    (E2 empty). The loop must KEEP consuming/feeding the live E1 bars and NOT
+    cut over (not starved, not diverged) until E2 actually has data.
+    """
+    mod = _load_paper_dryrun()
+    e1, e2 = "20260619", "20260918"
+    r = fakeredis.FakeRedis()
+    write_front_month(r, symbol="ES", exchange="CME", expiry=e1)
+    producer = Producer(redis_client=r)
+    s1 = bars_stream_name("ES", "CME", e1)
+    s2 = bars_stream_name("ES", "CME", e2)
+
+    M.consumer_front_month_expiry.labels(service="paper-trader", symbol="es").set(int(e1))
+    strat = _CountingStrategy()
+    watcher = FrontMonthWatcher(
+        r,
+        symbol="ES",
+        exchange="CME",
+        current_expiry=e1,
+        stream_has_data=lambda e: bars_stream_has_data(r, "ES", "CME", e),
+    )
+    rebinder = mod._BarsRebinder(r, watcher, strat, symbol="ES", exchange="CME", consumer_id="paper-trader-bars")
+    consumer = Consumer(redis_client=r, stream=s1, consumer_id="paper-trader-bars", start_id="$")
+
+    stop = threading.Event()
+    th = threading.Thread(target=mod._consume_bars_from_bus_sync, args=(consumer, strat, stop, rebinder), daemon=True)
+    th.start()
+    try:
+        time.sleep(0.4)
+        _publish(producer, s1, f"{_DAY}T13:30:00+00:00", 5000.0)
+        assert _wait_until(lambda: strat.bars_seen >= 1), "initial E1 bar not consumed"
+
+        # PRE-OPEN ROLL: key flips, but the producer keeps publishing live E1
+        # and the E2 stream stays empty.
+        write_front_month(r, symbol="ES", exchange="CME", expiry=e2)
+        _publish(producer, s1, f"{_DAY}T13:31:00+00:00", 5001.0)
+        # (b) the loop keeps consuming the LIVE E1 stream - not starved.
+        assert _wait_until(lambda: strat.bars_seen >= 2), "live E1 bar after key flip not consumed (starved)"
+
+        # (a) NO cutover while E2 is empty: the loop notices the key flip (sets
+        # pending) but holds on the live E1 stream - still bound to E1, not
+        # diverged, and the strategy is not refused (it kept ingesting E1).
+        assert _wait_until(lambda: watcher.pending_expiry == e2), "loop did not notice the key flip"
+        assert _gauge(M.consumer_front_month_expiry, service="paper-trader", symbol="es") == float(int(e1))
+        assert not watcher.diverged
+        assert strat.consumed_expiry != e2
+
+        # ---- Producer restarts onto E2: the new stream now has data. ----
+        _publish(producer, s2, f"{_DAY}T13:32:00+00:00", 5002.0)
+        assert _wait_until(
+            lambda: _gauge(M.consumer_front_month_expiry, service="paper-trader", symbol="es") == float(int(e2))
+        ), "paper-trader did not cut over once E2 had data"
+        assert strat.consumed_expiry == e2
+
+        _publish(producer, s2, f"{_DAY}T13:33:00+00:00", 5003.0)
+        assert _wait_until(lambda: 5003.0 in strat.closes), "post-cutover E2 bar not delivered"
+    finally:
+        stop.set()
+        th.join(timeout=5)
+
+    # The live E1 bars were consumed during the hold window (b); (c) no reset.
+    assert strat.closes[:2] == [5000.0, 5001.0]
+    assert strat.bars_seen >= 3
+    # (d) start_id='$' on the cutover: at most the one E2 bar present at attach
+    # (13:32 = 5002) is skipped - the clean one-bar gap, never a replay.
+    assert 5003.0 in strat.closes
 
 
 # ---------------------------------------------------------------------------

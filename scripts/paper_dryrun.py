@@ -122,7 +122,12 @@ import pandas as pd
 from prometheus_client import start_http_server
 
 from alpha_assay.bus.consumer import Consumer
-from alpha_assay.bus.streams import bars_stream_name, stream_name_for_bars, stream_name_for_ticks
+from alpha_assay.bus.streams import (
+    bars_stream_has_data,
+    bars_stream_name,
+    stream_name_for_bars,
+    stream_name_for_ticks,
+)
 from alpha_assay.data.front_month import FrontMonthWatcher, read_front_month_with_wait
 from alpha_assay.data.ibkr_adapter import IBKRAdapter
 from alpha_assay.exec.ibkr import ExecMode, IBKRExecAdapter, build_exec_adapter
@@ -960,6 +965,10 @@ def run(cfg: DryrunConfig) -> int:
         # visible immediately, not only after the first roll).
         _set_consumer_front_month_gauge("paper-trader", "ES", expiry)
         # An ES_EXPIRY operator pin freezes the roll watcher (manual control).
+        # The cutover is data-gated: the producer writes the new key at the
+        # pre-open re-qualify but keeps publishing the old stream until its
+        # restart, so the watcher waits until the new stream has data before
+        # abandoning the live old one (no silent starvation in that window).
         front_month_pinned = bool(os.environ.get("ES_EXPIRY", "").strip())
         watcher = FrontMonthWatcher(
             redis_client,
@@ -967,6 +976,7 @@ def run(cfg: DryrunConfig) -> int:
             exchange="CME",
             current_expiry=expiry,
             pinned=front_month_pinned,
+            stream_has_data=lambda e: bars_stream_has_data(redis_client, "ES", "CME", e),
         )
 
         loaded = load_paper_strategy(dict(os.environ))
