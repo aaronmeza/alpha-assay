@@ -440,3 +440,83 @@ def test_runner_defers_contract_repoint_while_position_open_then_applies_on_clos
     assert runner._contract_spec["expiry"] == "20260918"  # deferred cutover applied
     assert runner._pending_consumed_expiry is None
     assert not runner.front_month_diverged  # divergence cleared -> entries resume
+
+
+def test_round_trip_close_advances_even_if_trade_log_write_raises():
+    """Cross-review focus2: a trade-log write failure on the exit fill must NOT
+    block in-memory close-state advancement.
+
+    The broker-side exit has already closed the round trip, so the position must
+    clear AND any deferred front-month cutover must apply regardless of trade-log
+    durability. If the close were gated on the log write, a write failure would
+    latch the position 'open' forever and divergence could never clear.
+    """
+    from tests.test_paper_runner import _ct, _feed_minutes, _make_runner
+
+    class _RaisingTradeLog:
+        """Duck-typed trade log whose write always raises."""
+
+        def write(self, record):  # noqa: ARG002 - signature match only
+            raise OSError("disk full")
+
+        def flush(self):
+            pass
+
+    fire = _ct("10:05")
+    runner, exec_adapter = _make_runner(fire_at={fire: 1}, trade_log=_RaisingTradeLog())
+    _feed_minutes(runner, _ct("10:00"), 8)  # opens a position on the E1 contract
+    pos = runner.open_position
+    assert pos is not None
+
+    # Park a deferred cutover while the position is open.
+    runner.update_front_month(consumed_expiry="20260918", resolved_expiry="20260918")
+    assert runner._pending_consumed_expiry == "20260918"
+
+    # Close via target. The trade-log write raises, but the close must still
+    # complete: position cleared, deferred cutover applied, divergence cleared.
+    exec_adapter.fire_fill(pos.plan.parent_id, 5000.0, pos.contracts, "2026-06-02 15:06:00+00:00")
+    exec_adapter.fire_fill(pos.plan.target_id, 5004.0, pos.contracts, "2026-06-02 15:10:00+00:00")
+    assert runner.open_position is None  # close advanced despite log failure
+    assert runner._pending_consumed_expiry is None  # deferred cutover applied
+    assert runner._contract_spec["expiry"] == "20260918"
+    assert not runner.front_month_diverged
+
+
+def test_front_month_diverged_reads_under_lock():
+    """Cross-review focus1: front_month_diverged must read the
+    consumed/resolved pair under self._lock so an off-thread ops/health caller
+    can never observe a torn (impossible) divergence state.
+
+    A torn-read race is too narrow to catch probabilistically in CPython, so
+    this asserts the property deterministically: it must acquire self._lock to
+    read. The lock is swapped for an enter-counting wrapper around the real
+    RLock; reading the property must enter it at least once.
+    """
+    from tests.test_paper_runner import _make_runner
+
+    class _CountingLock:
+        """Delegates to the real RLock but counts context-manager entries."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.enters = 0
+
+        def __enter__(self):
+            self.enters += 1
+            return self._inner.__enter__()
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+        def acquire(self, *a, **k):
+            return self._inner.acquire(*a, **k)
+
+        def release(self):
+            return self._inner.release()
+
+    runner, _ = _make_runner()
+    counting = _CountingLock(runner._lock)
+    runner._lock = counting
+
+    _ = runner.front_month_diverged
+    assert counting.enters >= 1, "front_month_diverged must read under self._lock"

@@ -259,12 +259,22 @@ class PaperStrategyRunner:
         The runner refuses to open new positions while this holds (see
         :meth:`_on_row`): trading on a rolled-off contract is exactly the
         failure this fix prevents.
+
+        Read under ``self._lock`` so the consumed/resolved pair is observed
+        atomically: ``update_front_month`` mutates both under the same lock,
+        and this is a public property an off-thread ops/health caller may
+        read concurrently. Without the lock such a caller could observe
+        ``_consumed_expiry`` from before a cutover and ``_resolved_expiry``
+        from after it - a transient divergence state that never actually
+        existed. The lock is an ``RLock``, so the in-lock caller ``_on_row``
+        re-enters it safely.
         """
-        return (
-            self._consumed_expiry is not None
-            and self._resolved_expiry is not None
-            and self._consumed_expiry != self._resolved_expiry
-        )
+        with self._lock:
+            return (
+                self._consumed_expiry is not None
+                and self._resolved_expiry is not None
+                and self._consumed_expiry != self._resolved_expiry
+            )
 
     def update_front_month(
         self,
@@ -585,13 +595,21 @@ class PaperStrategyRunner:
                 mock_pnl_dollars=realized,
                 account_balance_after=self._balance,
             )
-            self._trade_log.write(record)
-            # Flush per round trip: a handful of trades per session, and
-            # the dashboard reads the parquet while the process runs.
+            # Trade-log persistence must NEVER block in-memory close-state
+            # advancement. The broker-side exit fill has already closed this
+            # round trip, so the position MUST clear and any deferred
+            # front-month cutover MUST apply below regardless of whether the
+            # log write/flush succeeds - otherwise a write failure latches the
+            # position "open" forever and divergence can never clear. Both the
+            # write and the per-round-trip flush are guarded; a failure drops
+            # the record (logged) but never aborts the close.
             try:
+                self._trade_log.write(record)
+                # Flush per round trip: a handful of trades per session, and
+                # the dashboard reads the parquet while the process runs.
                 self._trade_log.flush()
             except Exception:
-                _LOG.exception("trade log flush failed; record buffered for shutdown flush")
+                _LOG.exception("trade log write/flush failed; record dropped, close-state still advancing")
         _LOG.info(
             "round trip closed (%s): %s %d x %.2f -> %.2f = %+.2f USD (balance %.2f)",
             outcome,
