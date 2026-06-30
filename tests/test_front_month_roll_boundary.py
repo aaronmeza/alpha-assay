@@ -483,15 +483,20 @@ def test_round_trip_close_advances_even_if_trade_log_write_raises():
     assert not runner.front_month_diverged
 
 
-def test_round_trip_close_advances_and_record_retained_when_flush_raises(tmp_path: Path):
+def test_round_trip_close_advances_and_record_retained_when_flush_raises(tmp_path: Path, caplog):
     """Cross-review confirming pass: a trade-log FLUSH failure (the realistic
-    transient I/O case) must advance close-state WITHOUT losing the record.
+    transient I/O case) must advance close-state WITHOUT losing the record, and
+    must leave a reconstruction trail.
 
     write() has already buffered the record, so a flush() failure is
     self-recovering: the whole buffer is rewritten by the next round-trip flush
-    or the shutdown flush. This asserts both halves - the close advances AND the
-    record stays in the buffer (retained for retry), never silently dropped.
+    or the shutdown flush. This asserts (a) the close advances, (b) the record
+    stays in the buffer (retained for retry), and (c) the full record is logged -
+    so even if the process dies before the buffer ever persists, the audit trail
+    survives in the logs.
     """
+    import logging
+
     from alpha_assay.exec.trade_log import TradeLog
     from tests.test_paper_runner import _ct, _feed_minutes, _make_runner
 
@@ -513,12 +518,15 @@ def test_round_trip_close_advances_and_record_retained_when_flush_raises(tmp_pat
 
     # Close via target. flush() raises, but write() succeeded (record buffered).
     exec_adapter.fire_fill(pos.plan.parent_id, 5000.0, pos.contracts, "2026-06-02 15:06:00+00:00")
-    exec_adapter.fire_fill(pos.plan.target_id, 5004.0, pos.contracts, "2026-06-02 15:10:00+00:00")
+    with caplog.at_level(logging.ERROR, logger="alpha_assay.paper.runner"):
+        exec_adapter.fire_fill(pos.plan.target_id, 5004.0, pos.contracts, "2026-06-02 15:10:00+00:00")
 
     assert runner.open_position is None  # close advanced despite flush failure
     assert flush_calls["n"] >= 1  # flush was attempted
     # The record is RETAINED in the buffer (not dropped): a later flush recovers it.
     assert len(trade_log._buffer) == 1
+    # The full record is logged for reconstruction (survives a crash before persist).
+    assert "TradeRecord" in caplog.text and "flush failed" in caplog.text
     # Proof of recovery: invoking the real (unbound) flush persists the retained
     # record - exactly what the next round-trip flush or shutdown flush does.
     TradeLog.flush(trade_log)

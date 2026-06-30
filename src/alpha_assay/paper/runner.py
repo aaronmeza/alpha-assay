@@ -622,9 +622,18 @@ class PaperStrategyRunner:
                 try:
                     self._trade_log.flush()
                 except Exception:
+                    # The record is in the buffer and recovers on the next
+                    # round-trip flush or the shutdown flush. But that recovery
+                    # assumes the process survives to flush again - a crash (or a
+                    # failing shutdown flush) before then would lose a buffer that
+                    # only ever lived in memory. So log the FULL record here too,
+                    # guaranteeing a reconstruction trail independent of whether
+                    # the buffer ever reaches parquet.
                     _LOG.exception(
                         "trade log flush failed; record retained in buffer for the next round-trip "
-                        "or shutdown flush (no loss)"
+                        "or shutdown flush. Full record for reconstruction if the buffer never "
+                        "persists: %r",
+                        record,
                     )
         _LOG.info(
             "round trip closed (%s): %s %d x %.2f -> %.2f = %+.2f USD (balance %.2f)",

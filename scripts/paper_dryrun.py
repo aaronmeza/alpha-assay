@@ -894,7 +894,14 @@ async def _async_main(
                 strategy._trade_log.flush()
                 _LOG.info("trade log flushed on shutdown")
             except Exception:
-                _LOG.exception("trade log flush failed on shutdown; records may be lost")
+                # Last chance to persist - if it fails, the buffer dies with the
+                # process. Dump every pending record so the audit trail survives
+                # in the logs even when parquet never receives them.
+                _LOG.exception(
+                    "trade log flush failed on shutdown; dumping %d unpersisted record(s) for " "reconstruction: %r",
+                    len(strategy._trade_log._buffer),
+                    strategy._trade_log._buffer,
+                )
 
     return exit_code
 
