@@ -490,6 +490,52 @@ def test_requalify_loop_detects_rollover_requests_restart(monkeypatch):
     assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260620"
 
 
+def test_requalify_loop_pinned_does_not_restart(monkeypatch):
+    """A root pinned via <SYMBOL>_EXPIRY must NEVER request an auto-roll restart,
+    even when IBKR resolves a different front month: the pin is an explicit
+    operator instruction to stay on a contract, and a restart would just re-pin
+    to the same value and loop. The divergence is logged; roll_restart stays
+    clear and the key is untouched."""
+    import fakeredis
+
+    import infra.feed.run as run_mod
+    from alpha_assay.data.front_month import read_front_month, write_front_month
+
+    redis_client = fakeredis.FakeRedis()
+    write_front_month(redis_client, symbol="ES", exchange="CME", expiry="20260620")
+
+    fake_fut = MagicMock()
+    fake_fut.lastTradeDateOrContractMonth = "20260918"  # IBKR's natural front month
+    fake_fut.localSymbol = "ESU6"
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = AsyncMock(return_value=fake_fut)
+
+    monkeypatch.setattr(run_mod, "_seconds_until_next_pre_open", lambda _now: 0.0)
+
+    roll_restart = asyncio.Event()
+
+    async def _run():
+        task = asyncio.create_task(
+            _pre_open_requalify_loop(adapter, redis_client, roll_restart=roll_restart, pinned=True)
+        )
+        # Let at least one iteration fire and detect the divergence.
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run())
+
+    adapter.resolve_front_month_future.assert_awaited()
+    # Pinned: NO restart requested despite the IBKR divergence...
+    assert not roll_restart.is_set()
+    # ...and the pinned key is left untouched.
+    assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260620"
+
+
 def test_requalify_loop_continues_on_ibkr_error(monkeypatch):
     """An IBKR exception on one iteration must not kill the loop - it
     continues sleeping until the next 08:00 CT."""

@@ -227,6 +227,12 @@ class PaperStrategyRunner:
         # fresh from the front-month key on each consumer poll.
         self._consumed_expiry: str | None = contract_spec.get("expiry")
         self._resolved_expiry: str | None = contract_spec.get("expiry")
+        # If a roll cutover arrives while a position is OPEN (should not happen -
+        # the roll is pre-open and the strategy is flat into the close), the
+        # order-contract re-point is DEFERRED here and applied automatically the
+        # moment the runner goes flat (see _finalize_round_trip), so divergence
+        # can never latch permanently.
+        self._pending_consumed_expiry: str | None = None
 
         M.position_contracts.set(0)
         M.realized_pnl_dollars.set(0.0)
@@ -287,31 +293,51 @@ class PaperStrategyRunner:
         strategy flattens into the close, so the runner is flat at the
         cutover. Re-pointing the order contract while a position is OPEN
         would orphan the resting bracket on the old contract, so that
-        case is refused loudly (divergence is left in place, halting new
-        entries) rather than silently re-pointed - a manual-intervention
-        signal, never expected in normal operation.
+        case does NOT re-point immediately: the new expiry is parked in
+        ``_pending_consumed_expiry`` and the cutover is applied the moment
+        the position closes (see :meth:`_finalize_round_trip`). Divergence
+        stays in place until then, halting new entries, but can never latch
+        permanently. This open-at-roll path is logged loudly and is never
+        expected in normal operation.
         """
-        if resolved_expiry is not None:
-            self._resolved_expiry = resolved_expiry
-        if consumed_expiry is not None and consumed_expiry != self._consumed_expiry:
+        # Acquire the lock: this mutates state (_resolved/_consumed/_contract_spec)
+        # that _on_row reads under the same lock, and it is called from the bus
+        # rebinder thread, distinct from the bars/breadth executor threads.
+        with self._lock:
+            if resolved_expiry is not None:
+                self._resolved_expiry = resolved_expiry
+            if consumed_expiry is None or consumed_expiry == self._consumed_expiry:
+                return
             if self._position is not None:
-                _LOG.error(
-                    "front-month cutover to %s while a position is OPEN on contract %s; NOT re-pointing "
-                    "the order contract (would orphan the resting bracket) and NOT clearing divergence - "
-                    "the open position is managed on its original contract and new entries stay halted; "
-                    "manual intervention required",
+                # A roll cutover arrived mid-position. This should not happen -
+                # the producer rolls pre-open and the strategy is flat into the
+                # close - so re-pointing now would orphan the resting bracket on
+                # the old contract. DEFER the re-point: keep the order contract +
+                # divergence in place (new entries stay halted) and apply it
+                # automatically once the position closes (_finalize_round_trip),
+                # so divergence can never latch.
+                self._pending_consumed_expiry = consumed_expiry
+                _LOG.warning(
+                    "front-month cutover to %s while a position is OPEN on contract %s; deferring the "
+                    "order-contract re-point until flat (new entries halted until then)",
                     consumed_expiry,
                     self._contract_spec.get("expiry"),
                 )
                 return
-            self._contract_spec = {**self._contract_spec, "expiry": consumed_expiry}
-            self._consumed_expiry = consumed_expiry
-            _LOG.warning(
-                "front-month cutover: order contract re-pointed to expiry %s (flat at roll)",
-                consumed_expiry,
-            )
-        elif consumed_expiry is not None:
-            self._consumed_expiry = consumed_expiry
+            self._apply_consumed_cutover(consumed_expiry)
+
+    def _apply_consumed_cutover(self, expiry: str) -> None:
+        """Advance the consumed front month and re-point the order contract.
+
+        The caller must hold ``self._lock``. Used both for the normal
+        flat-at-roll cutover (from :meth:`update_front_month`) and for the
+        deferred recovery once an open position clears (from
+        :meth:`_finalize_round_trip`).
+        """
+        self._contract_spec = {**self._contract_spec, "expiry": expiry}
+        self._consumed_expiry = expiry
+        self._pending_consumed_expiry = None
+        _LOG.warning("front-month cutover: order contract re-pointed to expiry %s", expiry)
 
     # --- bus event surface --------------------------------------------------
 
@@ -577,6 +603,18 @@ class PaperStrategyRunner:
             self._balance,
         )
         self._position = None
+
+        # Deferred front-month cutover recovery: if a roll arrived while this
+        # position was open, update_front_month parked the new expiry rather
+        # than re-pointing the order contract mid-trade. Now that we are flat,
+        # apply it so divergence clears and new entries can resume on the live
+        # contract. Reached under self._lock (handle_fill holds the RLock).
+        if self._pending_consumed_expiry is not None:
+            _LOG.warning(
+                "applying deferred front-month cutover to %s now that the position is closed",
+                self._pending_consumed_expiry,
+            )
+            self._apply_consumed_cutover(self._pending_consumed_expiry)
 
     def _in_session(self, ts: pd.Timestamp) -> bool:
         mask = session_mask(

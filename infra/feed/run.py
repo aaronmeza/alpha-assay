@@ -19,12 +19,18 @@ and the daemon exits non-zero so the container restart policy
 
 A daily pre-open re-qualify loop fires at 08:00 CT each day to
 detect front-month rollovers without operator action - one loop per
-futures root in the manifest (ES, NQ, ...). On change it updates the
-per-symbol Redis metadata key and the Prometheus gauge so consumers
-pick up the new stream key on their next restart. The running
-subscription loop stays on the boot-time stream by design (the
-stream name is baked into ``run_subscription`` at startup from the
-patched manifest).
+futures root in the manifest (ES, NQ, ...). The producer bakes its
+publishing stream at startup and cannot switch it in-process, so on a
+detected roll the loop requests a self-restart (``roll_restart`` ->
+``EXIT_RESTART``) rather than pre-writing the key. Cold-start
+(``_resolve_front_months``) then re-resolves, writes the per-symbol
+Redis key + Prometheus gauge, AND bakes the new stream together, so the
+key and the live publishing stream flip atomically from every consumer's
+view (closing the silent key-leads-stream divergence that stalled
+consumers across a roll). The 08:00 CT timing keeps the restart gap
+pre-RTH, matching the proven nightly gateway-restart cycle. A root
+pinned via ``<SYMBOL>_EXPIRY`` never auto-rolls: the divergence is logged
+and the daemon stays on the pinned contract.
 
 Subscriptions marked ``required: false`` in the manifest degrade
 gracefully: a failure (e.g. a missing market-data entitlement) is
@@ -415,12 +421,23 @@ async def _pre_open_requalify_loop(
     symbol: str = "ES",
     exchange: str = "CME",
     currency: str = "USD",
+    pinned: bool = False,
 ) -> None:
     """Re-qualify one futures root's front-month every day at 08:00 CT.
 
     Reads the current expiry from Redis (the source of truth written at
     startup by ``_resolve_front_months``). If IBKR resolves a different
     expiry a rollover has occurred.
+
+    ``pinned`` is True when the operator set ``<SYMBOL>_EXPIRY`` (the
+    emergency override path in ``_resolve_front_months``). A pin is an
+    explicit instruction to stay on a specific contract, so a pinned root
+    NEVER requests an auto-roll restart: a detected IBKR/pin divergence is
+    logged for visibility and the daemon stays on the pinned contract. Auto-
+    roll resumes only when the operator clears the env var (which takes
+    effect on the next restart). Without this, a stale pin would fight a
+    cold-start that re-pins to the same value - a restart loop that defeats
+    the override.
 
     On a detected rollover this loop does NOT write the new key/gauge
     itself. The subscription stream name is baked at startup inside
@@ -481,6 +498,23 @@ async def _pre_open_requalify_loop(
 
         if new_expiry == current_expiry:
             LOG.info("pre-open re-qualify: %s front-month unchanged (%s)", symbol, new_expiry)
+            continue
+
+        # --- Operator pin in effect: never auto-roll ---
+        # <SYMBOL>_EXPIRY is an explicit instruction to stay on a specific
+        # contract. Log the divergence for visibility but do NOT request a
+        # restart: cold-start would re-pin to the same value, so a restart
+        # would loop and defeat the override. Auto-roll resumes when the
+        # operator clears the env var.
+        if pinned:
+            LOG.warning(
+                "pre-open re-qualify: %s pinned to %s via %s_EXPIRY, but IBKR resolves %s; "
+                "staying on the pinned contract (clear the env var to resume auto-roll)",
+                symbol,
+                current_expiry,
+                symbol.upper(),
+                new_expiry,
+            )
             continue
 
         # --- Rollover detected: request a self-restart (do NOT pre-write) ---
@@ -694,8 +728,10 @@ async def _main() -> int:
     roll_restart = asyncio.Event()
 
     # Start one daily pre-open re-qualify loop per resolved futures root
-    # (none for breadth-only deployments).
+    # (none for breadth-only deployments). A root pinned via <SYMBOL>_EXPIRY
+    # runs the loop for visibility but never requests an auto-roll restart.
     for symbol, exchange, currency in resolved_roots:
+        pinned = bool(os.environ.get(f"{symbol.upper()}_EXPIRY", "").strip())
         asyncio.create_task(
             _pre_open_requalify_loop(
                 adapter,
@@ -704,10 +740,16 @@ async def _main() -> int:
                 symbol=symbol,
                 exchange=exchange,
                 currency=currency,
+                pinned=pinned,
             ),
             name=f"pre-open-requalify-{symbol.lower()}",
         )
-        LOG.info("daily pre-open re-qualify task started for %s@%s", symbol, exchange)
+        LOG.info(
+            "daily pre-open re-qualify task started for %s@%s%s",
+            symbol,
+            exchange,
+            " (pinned; auto-roll suppressed)" if pinned else "",
+        )
 
     return await _run_subscriptions(
         daemon,

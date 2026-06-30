@@ -406,23 +406,37 @@ def test_runner_repoints_order_contract_on_cutover():
     assert all(b["contract_spec"]["expiry"] != "20260618" for b in exec_adapter.brackets)
 
 
-def test_runner_refuses_contract_repoint_while_position_open():
-    """Flat-at-roll invariant: never silently re-point an OPEN position.
+def test_runner_defers_contract_repoint_while_position_open_then_applies_on_close():
+    """Flat-at-roll invariant: never silently re-point an OPEN position, but
+    never latch divergence either.
 
     The roll is pre-open so the runner is flat; if a position were somehow
     open across a roll, re-pointing the order contract would orphan the
-    resting bracket on the old contract. The runner must hold the contract,
-    stay diverged (halting new entries), and log loudly instead.
+    resting bracket on the old contract. So the cutover is DEFERRED: the
+    runner holds the old contract and stays diverged (halting new entries)
+    while open, then applies the parked cutover automatically the moment the
+    position closes - so divergence can never latch permanently.
     """
     from tests.test_paper_runner import _ct, _feed_minutes, _make_runner
 
     fire = _ct("10:05")
     runner, exec_adapter = _make_runner(fire_at={fire: 1})
     _feed_minutes(runner, _ct("10:00"), 8)  # opens a position on the E1 contract
-    assert runner.open_position is not None
+    pos = runner.open_position
+    assert pos is not None
     assert exec_adapter.brackets[0]["contract_spec"]["expiry"] == "20260618"
 
-    # A cutover arriving while the position is open must NOT re-point.
+    # A cutover arriving while the position is open must NOT re-point now.
     runner.update_front_month(consumed_expiry="20260918", resolved_expiry="20260918")
     assert runner._contract_spec["expiry"] == "20260618"  # held, bracket not orphaned
     assert runner.front_month_diverged  # stays diverged -> new entries halted
+    assert runner._pending_consumed_expiry == "20260918"  # cutover parked
+
+    # Close the position (entry fill then target fill). On going flat the
+    # deferred cutover applies: the order contract re-points and divergence clears.
+    exec_adapter.fire_fill(pos.plan.parent_id, 5000.0, pos.contracts, "2026-06-02 15:06:00+00:00")
+    exec_adapter.fire_fill(pos.plan.target_id, 5004.0, pos.contracts, "2026-06-02 15:10:00+00:00")
+    assert runner.open_position is None
+    assert runner._contract_spec["expiry"] == "20260918"  # deferred cutover applied
+    assert runner._pending_consumed_expiry is None
+    assert not runner.front_month_diverged  # divergence cleared -> entries resume
