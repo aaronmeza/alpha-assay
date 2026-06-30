@@ -443,27 +443,28 @@ def test_runner_defers_contract_repoint_while_position_open_then_applies_on_clos
 
 
 def test_round_trip_close_advances_even_if_trade_log_write_raises():
-    """Cross-review focus2: a trade-log write failure on the exit fill must NOT
+    """Cross-review focus2: a trade-log WRITE failure on the exit fill must NOT
     block in-memory close-state advancement.
 
-    The broker-side exit has already closed the round trip, so the position must
-    clear AND any deferred front-month cutover must apply regardless of trade-log
-    durability. If the close were gated on the log write, a write failure would
-    latch the position 'open' forever and divergence could never clear.
+    write() only appends to TradeLog's in-memory buffer, so a failure is the
+    near-impossible (OOM) case where the record is genuinely unrecoverable. The
+    broker-side exit has already closed the round trip, so the position must
+    still clear AND any deferred front-month cutover must apply - gating the
+    close on the log write would latch the position 'open' forever.
     """
     from tests.test_paper_runner import _ct, _feed_minutes, _make_runner
 
-    class _RaisingTradeLog:
-        """Duck-typed trade log whose write always raises."""
+    class _WriteRaisingTradeLog:
+        """Duck-typed trade log whose write always raises (records lost)."""
 
         def write(self, record):  # noqa: ARG002 - signature match only
-            raise OSError("disk full")
+            raise OSError("out of memory")
 
         def flush(self):
             pass
 
     fire = _ct("10:05")
-    runner, exec_adapter = _make_runner(fire_at={fire: 1}, trade_log=_RaisingTradeLog())
+    runner, exec_adapter = _make_runner(fire_at={fire: 1}, trade_log=_WriteRaisingTradeLog())
     _feed_minutes(runner, _ct("10:00"), 8)  # opens a position on the E1 contract
     pos = runner.open_position
     assert pos is not None
@@ -480,6 +481,49 @@ def test_round_trip_close_advances_even_if_trade_log_write_raises():
     assert runner._pending_consumed_expiry is None  # deferred cutover applied
     assert runner._contract_spec["expiry"] == "20260918"
     assert not runner.front_month_diverged
+
+
+def test_round_trip_close_advances_and_record_retained_when_flush_raises(tmp_path: Path):
+    """Cross-review confirming pass: a trade-log FLUSH failure (the realistic
+    transient I/O case) must advance close-state WITHOUT losing the record.
+
+    write() has already buffered the record, so a flush() failure is
+    self-recovering: the whole buffer is rewritten by the next round-trip flush
+    or the shutdown flush. This asserts both halves - the close advances AND the
+    record stays in the buffer (retained for retry), never silently dropped.
+    """
+    from alpha_assay.exec.trade_log import TradeLog
+    from tests.test_paper_runner import _ct, _feed_minutes, _make_runner
+
+    trade_log = TradeLog(out_dir=tmp_path)
+
+    flush_calls = {"n": 0}
+
+    def _raising_flush():
+        flush_calls["n"] += 1
+        raise OSError("transient disk error")
+
+    trade_log.flush = _raising_flush  # type: ignore[method-assign]
+
+    fire = _ct("10:05")
+    runner, exec_adapter = _make_runner(fire_at={fire: 1}, trade_log=trade_log)
+    _feed_minutes(runner, _ct("10:00"), 8)
+    pos = runner.open_position
+    assert pos is not None
+
+    # Close via target. flush() raises, but write() succeeded (record buffered).
+    exec_adapter.fire_fill(pos.plan.parent_id, 5000.0, pos.contracts, "2026-06-02 15:06:00+00:00")
+    exec_adapter.fire_fill(pos.plan.target_id, 5004.0, pos.contracts, "2026-06-02 15:10:00+00:00")
+
+    assert runner.open_position is None  # close advanced despite flush failure
+    assert flush_calls["n"] >= 1  # flush was attempted
+    # The record is RETAINED in the buffer (not dropped): a later flush recovers it.
+    assert len(trade_log._buffer) == 1
+    # Proof of recovery: invoking the real (unbound) flush persists the retained
+    # record - exactly what the next round-trip flush or shutdown flush does.
+    TradeLog.flush(trade_log)
+    persisted = pd.read_parquet(tmp_path / "trades.parquet")
+    assert len(persisted) == 1
 
 
 def test_front_month_diverged_reads_under_lock():

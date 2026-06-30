@@ -598,18 +598,34 @@ class PaperStrategyRunner:
             # Trade-log persistence must NEVER block in-memory close-state
             # advancement. The broker-side exit fill has already closed this
             # round trip, so the position MUST clear and any deferred
-            # front-month cutover MUST apply below regardless of whether the
-            # log write/flush succeeds - otherwise a write failure latches the
-            # position "open" forever and divergence can never clear. Both the
-            # write and the per-round-trip flush are guarded; a failure drops
-            # the record (logged) but never aborts the close.
+            # front-month cutover MUST apply below regardless of trade-log
+            # durability - otherwise a persistence failure latches the position
+            # "open" forever and divergence can never clear. write and flush are
+            # guarded SEPARATELY because their failure modes differ:
+            #   - write() only appends to TradeLog's in-memory buffer, so a
+            #     failure is near-impossible (effectively OOM) and the record is
+            #     NOT buffered - genuinely unrecoverable, so log the full record
+            #     for manual reconstruction.
+            #   - flush() rewrites the whole buffer to parquet; a transient I/O
+            #     failure leaves the record IN the buffer, to be persisted by the
+            #     next round-trip flush or the shutdown flush (paper_dryrun). So
+            #     it is self-recovering - log it as retained, never as dropped.
+            buffered = False
             try:
                 self._trade_log.write(record)
+                buffered = True
+            except Exception:
+                _LOG.exception("trade log write FAILED; round-trip record unrecoverable: %r", record)
+            if buffered:
                 # Flush per round trip: a handful of trades per session, and
                 # the dashboard reads the parquet while the process runs.
-                self._trade_log.flush()
-            except Exception:
-                _LOG.exception("trade log write/flush failed; record dropped, close-state still advancing")
+                try:
+                    self._trade_log.flush()
+                except Exception:
+                    _LOG.exception(
+                        "trade log flush failed; record retained in buffer for the next round-trip "
+                        "or shutdown flush (no loss)"
+                    )
         _LOG.info(
             "round trip closed (%s): %s %d x %.2f -> %.2f = %+.2f USD (balance %.2f)",
             outcome,
