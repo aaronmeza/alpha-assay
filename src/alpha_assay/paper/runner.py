@@ -219,6 +219,21 @@ class PaperStrategyRunner:
         # generate_signals over the end-state frame.
         self.fired_signals: list[Signal] = []
 
+        # Front-month roll backstop: the expiry the bus subscription is
+        # bound to vs the producer's resolved front month. While they
+        # diverge (a roll the consumer has not yet rebound across) the
+        # runner REFUSES to submit orders - it must never trade on bars
+        # from a rolled-off contract. The paper-trader harness keeps these
+        # fresh from the front-month key on each consumer poll.
+        self._consumed_expiry: str | None = contract_spec.get("expiry")
+        self._resolved_expiry: str | None = contract_spec.get("expiry")
+        # If a roll cutover arrives while a position is OPEN (should not happen -
+        # the roll is pre-open and the strategy is flat into the close), the
+        # order-contract re-point is DEFERRED here and applied automatically the
+        # moment the runner goes flat (see _finalize_round_trip), so divergence
+        # can never latch permanently.
+        self._pending_consumed_expiry: str | None = None
+
         M.position_contracts.set(0)
         M.realized_pnl_dollars.set(0.0)
 
@@ -236,6 +251,103 @@ class PaperStrategyRunner:
     @property
     def open_position(self) -> _OpenPosition | None:
         return self._position
+
+    @property
+    def front_month_diverged(self) -> bool:
+        """True while the consumed expiry differs from the resolved front month.
+
+        The runner refuses to open new positions while this holds (see
+        :meth:`_on_row`): trading on a rolled-off contract is exactly the
+        failure this fix prevents.
+
+        Read under ``self._lock`` so the consumed/resolved pair is observed
+        atomically: ``update_front_month`` mutates both under the same lock,
+        and this is a public property an off-thread ops/health caller may
+        read concurrently. Without the lock such a caller could observe
+        ``_consumed_expiry`` from before a cutover and ``_resolved_expiry``
+        from after it - a transient divergence state that never actually
+        existed. The lock is an ``RLock``, so the in-lock caller ``_on_row``
+        re-enters it safely.
+        """
+        with self._lock:
+            return (
+                self._consumed_expiry is not None
+                and self._resolved_expiry is not None
+                and self._consumed_expiry != self._resolved_expiry
+            )
+
+    def update_front_month(
+        self,
+        *,
+        consumed_expiry: str | None = None,
+        resolved_expiry: str | None = None,
+    ) -> None:
+        """Refresh the consumed / resolved front-month expiries.
+
+        Called by the paper-trader harness on each consumer poll:
+        ``resolved_expiry`` from the front-month key, ``consumed_expiry``
+        once the bus subscription has rebound to a new contract. A
+        divergence between the two halts new entries until the rebind
+        catches up.
+
+        When ``consumed_expiry`` advances (a roll cutover), the ORDER
+        contract is re-pointed too: ``_contract_spec`` is rebuilt for the
+        new expiry so ``place_bracket_order`` / ``cancel_open_orders`` /
+        ``position_quantity`` / ``startup_reconcile`` all act on the LIVE
+        contract. Without this the runner would generate signals from
+        new-contract bars but submit orders against the rolled-off
+        contract.
+
+        Flat-at-roll invariant: the roll happens pre-open (the producer
+        re-qualifies at 08:00 CT, before the 08:30 RTH open) and the
+        strategy flattens into the close, so the runner is flat at the
+        cutover. Re-pointing the order contract while a position is OPEN
+        would orphan the resting bracket on the old contract, so that
+        case does NOT re-point immediately: the new expiry is parked in
+        ``_pending_consumed_expiry`` and the cutover is applied the moment
+        the position closes (see :meth:`_finalize_round_trip`). Divergence
+        stays in place until then, halting new entries, but can never latch
+        permanently. This open-at-roll path is logged loudly and is never
+        expected in normal operation.
+        """
+        # Acquire the lock: this mutates state (_resolved/_consumed/_contract_spec)
+        # that _on_row reads under the same lock, and it is called from the bus
+        # rebinder thread, distinct from the bars/breadth executor threads.
+        with self._lock:
+            if resolved_expiry is not None:
+                self._resolved_expiry = resolved_expiry
+            if consumed_expiry is None or consumed_expiry == self._consumed_expiry:
+                return
+            if self._position is not None:
+                # A roll cutover arrived mid-position. This should not happen -
+                # the producer rolls pre-open and the strategy is flat into the
+                # close - so re-pointing now would orphan the resting bracket on
+                # the old contract. DEFER the re-point: keep the order contract +
+                # divergence in place (new entries stay halted) and apply it
+                # automatically once the position closes (_finalize_round_trip),
+                # so divergence can never latch.
+                self._pending_consumed_expiry = consumed_expiry
+                _LOG.warning(
+                    "front-month cutover to %s while a position is OPEN on contract %s; deferring the "
+                    "order-contract re-point until flat (new entries halted until then)",
+                    consumed_expiry,
+                    self._contract_spec.get("expiry"),
+                )
+                return
+            self._apply_consumed_cutover(consumed_expiry)
+
+    def _apply_consumed_cutover(self, expiry: str) -> None:
+        """Advance the consumed front month and re-point the order contract.
+
+        The caller must hold ``self._lock``. Used both for the normal
+        flat-at-roll cutover (from :meth:`update_front_month`) and for the
+        deferred recovery once an open position clears (from
+        :meth:`_finalize_round_trip`).
+        """
+        self._contract_spec = {**self._contract_spec, "expiry": expiry}
+        self._consumed_expiry = expiry
+        self._pending_consumed_expiry = None
+        _LOG.warning("front-month cutover: order contract re-pointed to expiry %s", expiry)
 
     # --- bus event surface --------------------------------------------------
 
@@ -354,6 +466,17 @@ class PaperStrategyRunner:
         if direction == 0:
             return
         M.signals_generated_total.labels(strategy=self._strategy_name, direction=str(direction)).inc()
+        if self.front_month_diverged:
+            # Backstop: the bus subscription is on a rolled-off contract
+            # (the producer has moved to a new front month and the consumer
+            # has not yet rebound). Refuse to enter on stale-contract bars.
+            self._filtered("front_month_diverged", "stale_contract")
+            _LOG.error(
+                "front-month diverged (consuming %s, resolved %s); refusing to trade until rebind",
+                self._consumed_expiry,
+                self._resolved_expiry,
+            )
+            return
         if not self._in_session(ts):
             self._filtered("session_mask", "outside_window")
             return
@@ -472,13 +595,46 @@ class PaperStrategyRunner:
                 mock_pnl_dollars=realized,
                 account_balance_after=self._balance,
             )
-            self._trade_log.write(record)
-            # Flush per round trip: a handful of trades per session, and
-            # the dashboard reads the parquet while the process runs.
+            # Trade-log persistence must NEVER block in-memory close-state
+            # advancement. The broker-side exit fill has already closed this
+            # round trip, so the position MUST clear and any deferred
+            # front-month cutover MUST apply below regardless of trade-log
+            # durability - otherwise a persistence failure latches the position
+            # "open" forever and divergence can never clear. write and flush are
+            # guarded SEPARATELY because their failure modes differ:
+            #   - write() only appends to TradeLog's in-memory buffer, so a
+            #     failure is near-impossible (effectively OOM) and the record is
+            #     NOT buffered - genuinely unrecoverable, so log the full record
+            #     for manual reconstruction.
+            #   - flush() rewrites the whole buffer to parquet; a transient I/O
+            #     failure leaves the record IN the buffer, to be persisted by the
+            #     next round-trip flush or the shutdown flush (paper_dryrun). So
+            #     it is self-recovering - log it as retained, never as dropped.
+            buffered = False
             try:
-                self._trade_log.flush()
+                self._trade_log.write(record)
+                buffered = True
             except Exception:
-                _LOG.exception("trade log flush failed; record buffered for shutdown flush")
+                _LOG.exception("trade log write FAILED; round-trip record unrecoverable: %r", record)
+            if buffered:
+                # Flush per round trip: a handful of trades per session, and
+                # the dashboard reads the parquet while the process runs.
+                try:
+                    self._trade_log.flush()
+                except Exception:
+                    # The record is in the buffer and recovers on the next
+                    # round-trip flush or the shutdown flush. But that recovery
+                    # assumes the process survives to flush again - a crash (or a
+                    # failing shutdown flush) before then would lose a buffer that
+                    # only ever lived in memory. So log the FULL record here too,
+                    # guaranteeing a reconstruction trail independent of whether
+                    # the buffer ever reaches parquet.
+                    _LOG.exception(
+                        "trade log flush failed; record retained in buffer for the next round-trip "
+                        "or shutdown flush. Full record for reconstruction if the buffer never "
+                        "persists: %r",
+                        record,
+                    )
         _LOG.info(
             "round trip closed (%s): %s %d x %.2f -> %.2f = %+.2f USD (balance %.2f)",
             outcome,
@@ -490,6 +646,18 @@ class PaperStrategyRunner:
             self._balance,
         )
         self._position = None
+
+        # Deferred front-month cutover recovery: if a roll arrived while this
+        # position was open, update_front_month parked the new expiry rather
+        # than re-pointing the order contract mid-trade. Now that we are flat,
+        # apply it so divergence clears and new entries can resume on the live
+        # contract. Reached under self._lock (handle_fill holds the RLock).
+        if self._pending_consumed_expiry is not None:
+            _LOG.warning(
+                "applying deferred front-month cutover to %s now that the position is closed",
+                self._pending_consumed_expiry,
+            )
+            self._apply_consumed_cutover(self._pending_consumed_expiry)
 
     def _in_session(self, ts: pd.Timestamp) -> bool:
         mask = session_mask(

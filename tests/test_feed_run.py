@@ -19,6 +19,7 @@ import pytest
 
 from infra.feed.feed import FeedManifest, FreshnessTracker, IBKRFeedDaemon, Subscription
 from infra.feed.run import (
+    EXIT_RESTART,
     _connect_with_retry,
     _env_bool,
     _in_rth,
@@ -423,8 +424,10 @@ def test_requalify_loop_logs_unchanged_and_continues(monkeypatch, caplog):
     # Patch _seconds_until_next_pre_open to return 0 so the loop fires immediately.
     monkeypatch.setattr(run_mod, "_seconds_until_next_pre_open", lambda _now: 0.0)
 
+    roll_restart = asyncio.Event()
+
     async def _run():
-        task = asyncio.create_task(_pre_open_requalify_loop(adapter, redis_client))
+        task = asyncio.create_task(_pre_open_requalify_loop(adapter, redis_client, roll_restart=roll_restart))
         # Give the loop time to fire one iteration (sleep(0) + resolve + compare).
         await asyncio.sleep(0.05)
         task.cancel()
@@ -442,10 +445,15 @@ def test_requalify_loop_logs_unchanged_and_continues(monkeypatch, caplog):
     assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260619"
     # The unchanged branch emits an INFO log with "unchanged" in the message
     assert any("unchanged" in r.message for r in caplog.records if r.levelno == logging.INFO)
+    # No rollover -> no restart requested.
+    assert not roll_restart.is_set()
 
 
-def test_requalify_loop_detects_rollover(monkeypatch):
-    """When IBKR returns a new expiry the loop writes the new key + sets the gauge."""
+def test_requalify_loop_detects_rollover_requests_restart(monkeypatch):
+    """When IBKR returns a new expiry the loop requests a self-restart and
+    returns WITHOUT pre-writing the key/gauge. Cold-start (after the restart)
+    writes the new key + bakes the new stream atomically, so the key must NOT
+    lead the live stream here."""
     import fakeredis
 
     import infra.feed.run as run_mod
@@ -464,10 +472,55 @@ def test_requalify_loop_detects_rollover(monkeypatch):
     # Patch _seconds_until_next_pre_open to return 0 so the loop fires immediately.
     monkeypatch.setattr(run_mod, "_seconds_until_next_pre_open", lambda _now: 0.0)
 
+    roll_restart = asyncio.Event()
+
     async def _run():
-        task = asyncio.create_task(_pre_open_requalify_loop(adapter, redis_client))
-        # Give the loop time to fire one iteration (sleep(0) + resolve + write).
-        await asyncio.sleep(0.05)
+        task = asyncio.create_task(_pre_open_requalify_loop(adapter, redis_client, roll_restart=roll_restart))
+        # The loop sets roll_restart and returns on its own - no cancel needed.
+        await asyncio.wait_for(roll_restart.wait(), timeout=1.0)
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(_run())
+
+    adapter.resolve_front_month_future.assert_awaited()
+    # Restart requested...
+    assert roll_restart.is_set()
+    # ...and the key was NOT pre-written: it stays the old expiry until cold-start
+    # re-resolves and writes it (key + stream flip together, atomically).
+    assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260620"
+
+
+def test_requalify_loop_pinned_does_not_restart(monkeypatch):
+    """A root pinned via <SYMBOL>_EXPIRY must NEVER request an auto-roll restart,
+    even when IBKR resolves a different front month: the pin is an explicit
+    operator instruction to stay on a contract, and a restart would just re-pin
+    to the same value and loop. The divergence is logged; roll_restart stays
+    clear and the key is untouched."""
+    import fakeredis
+
+    import infra.feed.run as run_mod
+    from alpha_assay.data.front_month import read_front_month, write_front_month
+
+    redis_client = fakeredis.FakeRedis()
+    write_front_month(redis_client, symbol="ES", exchange="CME", expiry="20260620")
+
+    fake_fut = MagicMock()
+    fake_fut.lastTradeDateOrContractMonth = "20260918"  # IBKR's natural front month
+    fake_fut.localSymbol = "ESU6"
+
+    adapter = MagicMock()
+    adapter.resolve_front_month_future = AsyncMock(return_value=fake_fut)
+
+    monkeypatch.setattr(run_mod, "_seconds_until_next_pre_open", lambda _now: 0.0)
+
+    roll_restart = asyncio.Event()
+
+    async def _run():
+        task = asyncio.create_task(
+            _pre_open_requalify_loop(adapter, redis_client, roll_restart=roll_restart, pinned=True)
+        )
+        # Let at least one iteration fire and detect the divergence.
+        await asyncio.sleep(0.1)
         task.cancel()
         try:
             await task
@@ -477,7 +530,10 @@ def test_requalify_loop_detects_rollover(monkeypatch):
     asyncio.run(_run())
 
     adapter.resolve_front_month_future.assert_awaited()
-    assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260918"
+    # Pinned: NO restart requested despite the IBKR divergence...
+    assert not roll_restart.is_set()
+    # ...and the pinned key is left untouched.
+    assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260620"
 
 
 def test_requalify_loop_continues_on_ibkr_error(monkeypatch):
@@ -502,8 +558,10 @@ def test_requalify_loop_continues_on_ibkr_error(monkeypatch):
 
     monkeypatch.setattr(run_mod, "_seconds_until_next_pre_open", lambda _now: 0.0)
 
+    roll_restart = asyncio.Event()
+
     async def _run():
-        task = asyncio.create_task(_pre_open_requalify_loop(adapter, redis_client))
+        task = asyncio.create_task(_pre_open_requalify_loop(adapter, redis_client, roll_restart=roll_restart))
         # Let multiple iterations fire.
         await asyncio.sleep(0.1)
         task.cancel()
@@ -518,6 +576,34 @@ def test_requalify_loop_continues_on_ibkr_error(monkeypatch):
     assert call_count["n"] > 1
     # Redis key must remain unchanged (no write on failure).
     assert read_front_month(redis_client, symbol="ES", exchange="CME") == "20260620"
+    # A resolve failure must NOT request a restart.
+    assert not roll_restart.is_set()
+
+
+def test_run_subscriptions_exits_restart_on_rollover(redis_client, tmp_path):
+    """A front-month rollover (roll_restart set by a re-qualify loop) wins the
+    FIRST_COMPLETED race and returns EXIT_RESTART, so the daemon cold-starts
+    onto the new contract (key + stream flip atomically)."""
+    adapter = _adapter_with_blocking_bars()
+    daemon = IBKRFeedDaemon(adapter=adapter, redis_client=redis_client, wal_dir=tmp_path / "wal")
+    stop = asyncio.Event()
+    roll_restart = asyncio.Event()
+
+    async def _run():
+        async def _roll_later():
+            await asyncio.sleep(0.1)
+            roll_restart.set()
+
+        asyncio.create_task(_roll_later())
+        return await asyncio.wait_for(
+            _run_subscriptions(daemon, adapter, [_bars_sub()], stop, watchdog_poll=0.02, roll_restart=roll_restart),
+            timeout=3.0,
+        )
+
+    rc = asyncio.run(_run())
+    assert rc == EXIT_RESTART
+    # A clean stop was NOT requested - this is a restart, not a graceful shutdown.
+    assert not stop.is_set()
 
 
 # --- _resolve_front_months: multi-root (ES + NQ) ---------------------------
