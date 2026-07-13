@@ -72,12 +72,17 @@ if TYPE_CHECKING:
 _LOG = logging.getLogger(__name__)
 
 _DEFAULT_CHECKLIST_SUFFIX = Path(".alpha_assay") / "go_live_checklist_signed"
-# ib_insync 0.9.86 keeps this as a local in wrapper.py:Wrapper.error,
-# not as a public attribute: warningCodes = {110, 165, 202, 399,
-# 404, 434, 492, 10167}. Keep this mirror paired with the source
-# because those notices must not be treated as terminal order rejects.
-_IB_INSYNC_WARNING_CODES = {110, 165, 202, 399, 404, 434, 492, 10167}
-_BENIGN_NOTICE_CODES = _IB_INSYNC_WARNING_CODES | {10349}
+# Keep this set intentionally tiny. In ib_insync 0.9.86
+# wrapper.py:1122-1134, Wrapper.error appends a TradeLogEntry with
+# errorCode only on the non-warning branch; warningCodes notices only log
+# at INFO, so they cannot appear as trade.log[-1].errorCode here. A real
+# terminal Cancelled arrives through wrapper.orderStatus, which appends
+# TradeLogEntry(time, status, msg) with the objects.py:172 default
+# errorCode=0, and this filter does not suppress code 0. Code 10349 is
+# different: ib_insync does not classify the TIF preset rewrite as a
+# warning, but production observes it as a transient Cancelled followed by
+# normal PreSubmitted/fill, so we drop exactly that broker notice.
+_BENIGN_NOTICE_CODES = {10349}
 
 
 class ExecMode(Enum):

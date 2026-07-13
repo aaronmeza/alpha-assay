@@ -113,6 +113,7 @@ class FakeExecAdapter:
     cancelled: list[int] = field(default_factory=list)
     open_position_qty: float = 0.0
     position_quantities: list[float] = field(default_factory=list)
+    position_quantity_calls: int = 0
     open_order_count: int = 0
     _callbacks: list = field(default_factory=list)
     _order_status_callbacks: list = field(default_factory=list)
@@ -147,6 +148,7 @@ class FakeExecAdapter:
         self.cancelled.append(order_id)
 
     def position_quantity(self, contract_spec: dict[str, Any]) -> float:
+        self.position_quantity_calls += 1
         if self.position_quantities:
             self.open_position_qty = self.position_quantities.pop(0)
         return self.open_position_qty
@@ -531,7 +533,7 @@ def test_ibkr_phantom_cancelled_entry_status_does_not_clear_position():
     assert exec_adapter._ib.cancelOrder.call_args_list == []
 
 
-def test_genuine_entry_rejection_clears_flat_broker_position():
+def test_genuine_entry_rejection_defers_flat_broker_clear_to_next_bar():
     before = _counter_value(M.orders_rejected_total, type="entry")
     runner, exec_adapter = _make_runner(fire_at={_ct("10:05"): 1})
 
@@ -539,6 +541,7 @@ def test_genuine_entry_rejection_clears_flat_broker_position():
     pos = runner.open_position
     assert pos is not None
     exec_adapter.open_position_qty = 0.0
+    calls_before = exec_adapter.position_quantity_calls
 
     exec_adapter.fire_order_status(
         {
@@ -548,6 +551,13 @@ def test_genuine_entry_rejection_clears_flat_broker_position():
             "message": "Order rejected - insufficient margin",
         }
     )
+
+    assert runner.open_position is pos
+    assert runner.open_position.needs_broker_verification is True
+    assert exec_adapter.cancelled == []
+    assert exec_adapter.position_quantity_calls == calls_before
+
+    _feed_minutes(runner, _ct("10:09"), 1)
 
     assert runner.open_position is None
     assert exec_adapter.cancelled == [pos.plan.stop_id, pos.plan.target_id]
@@ -715,6 +725,44 @@ def test_flatten_sizes_market_order_from_broker_quantity():
     assert exec_adapter.market_orders[0]["quantity"] == 2
 
 
+def test_partial_flatten_larger_than_runner_contracts_waits_for_exit_target(tmp_path):
+    config = _make_config(max_contracts=1)
+    trade_log = TradeLog(out_dir=tmp_path)
+    runner, exec_adapter = _make_runner(
+        fire_at={_ct("10:05"): 1},
+        config=config,
+        trade_log=trade_log,
+        time_stop_min=3,
+    )
+
+    _feed_minutes(runner, _ct("10:00"), 7)
+    pos = runner.open_position
+    assert pos is not None
+    assert pos.contracts == 1
+    exec_adapter.open_position_qty = 2.0
+    _feed_minutes(runner, _ct("10:07"), 5)
+
+    assert len(exec_adapter.market_orders) == 1
+    assert exec_adapter.market_orders[0]["quantity"] == 2
+    assert pos.exit_target_qty == pytest.approx(2.0)
+
+    exec_adapter.fire_fill(pos.plan.parent_id, 5000.25, 1, "2026-06-02 15:06:05+00:00")
+    exec_adapter.fire_fill(pos.flatten_order_id, 5001.25, 1, "2026-06-02 15:09:00+00:00")
+
+    assert runner.open_position is pos
+    assert runner.account_balance == pytest.approx(100_000.0)
+
+    exec_adapter.fire_fill(pos.flatten_order_id, 5001.25, 1, "2026-06-02 15:10:00+00:00")
+    exec_adapter.fire_fill(pos.flatten_order_id, 5001.25, 1, "2026-06-02 15:11:00+00:00")
+
+    expected = (5001.25 - 5000.25) * 1 * 50.0
+    assert runner.open_position is None
+    assert runner.account_balance == pytest.approx(100_000.0 + expected)
+    df = pd.read_parquet(tmp_path / "trades.parquet")
+    assert len(df) == 1
+    assert df.iloc[0]["mock_pnl_dollars"] == pytest.approx(expected)
+
+
 def test_rejected_flatten_clears_marker_and_next_fresh_bar_retries():
     before = _counter_value(M.orders_rejected_total, type="flatten")
     runner, exec_adapter = _make_runner(fire_at={_ct("10:05"): 1}, time_stop_min=3)
@@ -723,6 +771,7 @@ def test_rejected_flatten_clears_marker_and_next_fresh_bar_retries():
     assert len(exec_adapter.market_orders) == 1
     pos = runner.open_position
     rejected_order_id = pos.flatten_order_id
+    calls_before = exec_adapter.position_quantity_calls
 
     exec_adapter.fire_order_status(
         {
@@ -734,6 +783,8 @@ def test_rejected_flatten_clears_marker_and_next_fresh_bar_retries():
     )
 
     assert runner.open_position.flatten_order_id is None
+    assert runner.open_position.flatten_reason is None
+    assert exec_adapter.position_quantity_calls == calls_before
     assert _counter_value(M.orders_rejected_total, type="flatten") == before + 1
 
     _feed_minutes(runner, _ct("10:13"), 2)
@@ -742,7 +793,7 @@ def test_rejected_flatten_clears_marker_and_next_fresh_bar_retries():
     assert runner.open_position.flatten_order_id != rejected_order_id
 
 
-def test_rejected_flatten_clears_position_when_broker_already_flat():
+def test_rejected_flatten_defers_flat_broker_clear_to_next_bar():
     before = _counter_value(M.orders_rejected_total, type="flatten")
     runner, exec_adapter = _make_runner(fire_at={_ct("10:05"): 1}, time_stop_min=3)
 
@@ -751,6 +802,7 @@ def test_rejected_flatten_clears_position_when_broker_already_flat():
     pos = runner.open_position
     rejected_order_id = pos.flatten_order_id
     exec_adapter.open_position_qty = 0.0
+    calls_before = exec_adapter.position_quantity_calls
 
     exec_adapter.fire_order_status(
         {
@@ -760,6 +812,11 @@ def test_rejected_flatten_clears_position_when_broker_already_flat():
             "message": "Order rejected - already flat",
         }
     )
+
+    assert runner.open_position is pos
+    assert runner.open_position.flatten_order_id is None
+    assert exec_adapter.position_quantity_calls == calls_before
+
     _feed_minutes(runner, _ct("10:13"), 2)
 
     assert runner.open_position is None
