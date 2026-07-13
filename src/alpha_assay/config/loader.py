@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Literal
 
@@ -115,14 +116,32 @@ class AlphaAssayConfig(BaseModel):
         """
         # A `risk` block that is not a dict, or that does not declare BOTH
         # distances as non-null, is not a static-exit declaration. Leave it
-        # opaque rather than guess - third-party strategies keep their own
-        # plugin config under `params`, and an incomplete pair cannot be
-        # cap-checked anyway (a strategy missing a distance it needs fails
-        # loudly on its own, at the first signal, without placing an order).
+        # opaque rather than guess: `strategy.params` belongs to the strategy,
+        # and a third-party plugin may legitimately keep unrelated config here.
         risk = self.strategy.params.get("risk")
         if not isinstance(risk, dict):
             return self
-        if any(risk.get(key) is None for key in _STATIC_EXIT_KEYS):
+        declared = [key for key in _STATIC_EXIT_KEYS if risk.get(key) is not None]
+        if len(declared) < len(_STATIC_EXIT_KEYS):
+            # Half a pair cannot be cap-checked (the ratio invariant needs
+            # both), so the load-time check is skipped - but say so rather than
+            # skip in silence, because a typo (`target_pts` for
+            # `target_points`) otherwise looks exactly like a validated config.
+            # This warns instead of raising: the caps are not bypassed, since
+            # the engine validates whatever get_exit_params() returns on EVERY
+            # signal and drops the trade on violation, so the worst case is a
+            # zero-trade run, never an out-of-cap order. Raising here would
+            # instead reject a third-party strategy that uses one of these key
+            # names for something else entirely.
+            if declared:
+                missing = [key for key in _STATIC_EXIT_KEYS if key not in declared]
+                warnings.warn(
+                    f"strategy.params.risk declares {declared[0]} without {missing[0]}; "
+                    "the load-time risk-cap check needs both and was skipped. Declare both "
+                    "to have static exit distances validated against risk_caps at load time.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             return self
 
         # Coerce each declared distance to a real, finite float before the caps

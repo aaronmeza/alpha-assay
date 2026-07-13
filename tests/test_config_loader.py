@@ -1,4 +1,5 @@
 import textwrap
+import warnings
 
 import pytest
 from pydantic import ValidationError
@@ -237,28 +238,38 @@ def test_skips_exit_cap_check_when_no_static_risk_block(tmp_path):
 
 
 def test_skips_exit_cap_check_when_risk_block_has_only_unrelated_keys(tmp_path):
+    # A `risk` block naming NEITHER reserved key is ordinary opaque plugin
+    # config. It must load SILENTLY - warning here would nag every third-party
+    # strategy that happens to have a `risk` block.
     valid = VALID_WITH_EXITS.replace(
         "    risk:\n      stop_points: 0.5\n      target_points: 1.0\n",
         "    risk:\n      position_size_multiplier: 2\n",
     )
     p = tmp_path / "unrelated_risk_keys.yaml"
     p.write_text(valid)
-    cfg = load_config(p)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning fails the test
+        cfg = load_config(p)
     assert cfg.strategy.params["risk"]["position_size_multiplier"] == 2
 
 
-def test_skips_exit_cap_check_when_static_exit_block_is_partial(tmp_path):
-    # Only a COMPLETE pair is a static-exit declaration. A lone stop_points is
-    # not cap-checkable, and treating it as reserved would reject a third-party
-    # strategy that keeps unrelated config under `risk` - breaking the promise
-    # that strategy.params is opaque to the framework. The stop here (50.0)
-    # flagrantly exceeds max_stop_pts 5.0 and must still load untouched.
+def test_warns_but_loads_when_static_exit_block_is_partial(tmp_path):
+    # Only a COMPLETE pair is a static-exit declaration: the ratio invariant
+    # needs both, and treating a lone key as reserved would reject a
+    # third-party strategy keeping unrelated config under `risk`, breaking the
+    # promise that strategy.params is opaque. So this loads - but it WARNS,
+    # because a typo (`target_pts`) would otherwise look like a validated
+    # config. The caps are not bypassed: the engine validates whatever
+    # get_exit_params() returns on every signal and drops the trade on
+    # violation, so the over-cap stop here can only cause a zero-trade run,
+    # never a live out-of-cap order.
     partial = VALID_WITH_EXITS.replace("      target_points: 1.0\n", "").replace(
         "stop_points: 0.5", "stop_points: 50.0"
     )
     p = tmp_path / "partial_static_exit.yaml"
     p.write_text(partial)
-    cfg = load_config(p)
+    with pytest.warns(UserWarning, match="target_points"):
+        cfg = load_config(p)
     risk = cfg.strategy.params["risk"]
     assert risk["stop_points"] == 50.0
     assert "target_points" not in risk
