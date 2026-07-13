@@ -5,6 +5,11 @@ Append-only file ``feed-{day}.jsonl`` (newline-delimited base64-msgpack)
 + atomic-rename watermark sidecar ``feed-{day}.committed``. fsync is
 batched: every N records OR every Nms whichever first.
 
+Sequence numbers are strictly monotonic within a day-file. A producer
+restarting on the same day must seed its next live sequence from
+``WALAppender.next_seq`` so the integer watermark remains a sound cursor
+across process segments.
+
 On producer restart, ``read_uncommitted()`` returns records past the
 watermark - the producer drains these to Redis before entering its
 live loop. This is the durability boundary: every event that survives
@@ -62,6 +67,8 @@ class WALAppender:
         self._fsync_every_ms = fsync_every_ms
         self._unflushed = 0
         self._last_flush_ms = self._now_ms()
+        self._max_seq = self._scan_max_seq()
+        self._committed = self._read_committed()
         # Open in append-mode binary; line-buffered.
         self._fp = open(self._wal_path, "ab")  # noqa: SIM115
 
@@ -69,10 +76,45 @@ class WALAppender:
     def _now_ms() -> int:
         return int(time.monotonic() * 1000)
 
+    @property
+    def next_seq(self) -> int:
+        """Return the next strictly monotonic sequence for this day-file."""
+        return self._max_seq + 1
+
+    def _decode_line(self, line: bytes) -> WALRecord:
+        """Decode one WAL line, raising when the line is corrupt."""
+        seq_str, b64 = line.decode().rstrip("\n").split("\t", 1)
+        seq = int(seq_str)
+        msg_bytes = base64.b64decode(b64)
+        return WALRecord(seq=seq, msg_bytes=msg_bytes)
+
+    def _scan_max_seq(self) -> int:
+        """Find the highest sequence already present in the day-file."""
+        max_seq = -1
+        if not self._wal_path.exists():
+            return max_seq
+        with open(self._wal_path, "rb") as f:
+            for line in f:
+                try:
+                    record = self._decode_line(line)
+                except (ValueError, UnicodeDecodeError, Exception) as e:
+                    LOG.warning("skipping corrupt WAL line in %s: %s", self._wal_path, e)
+                    continue
+                max_seq = max(max_seq, record.seq)
+        return max_seq
+
     def append(self, seq: int, msg_bytes: bytes) -> None:
         """Append one record. fsync is batched per fsync_every_n / _ms."""
+        if seq <= self._max_seq:
+            LOG.warning(
+                "non-monotonic WAL append in %s: seq=%s current_max=%s",
+                self._wal_path,
+                seq,
+                self._max_seq,
+            )
         line = f"{seq}\t{base64.b64encode(msg_bytes).decode()}\n".encode()
         self._fp.write(line)
+        self._max_seq = max(self._max_seq, seq)
         self._unflushed += 1
         BM.bus_wal_pending.inc()
         if self._unflushed >= self._fsync_every_n or (self._now_ms() - self._last_flush_ms) >= self._fsync_every_ms:
@@ -87,12 +129,14 @@ class WALAppender:
 
     def advance_committed(self, seq: int) -> None:
         """Mark seq as confirmed-published. Atomic rename for crash safety."""
-        tmp = self._watermark_path.with_suffix(".committed.tmp")
-        tmp.write_text(str(seq))
-        # fsync the file content + the directory so the rename is durable.
-        with open(tmp, "rb") as f:
-            os.fsync(f.fileno())
-        os.replace(tmp, self._watermark_path)
+        if seq > self._committed:
+            tmp = self._watermark_path.with_suffix(".committed.tmp")
+            tmp.write_text(str(seq))
+            # fsync the file content + the directory so the rename is durable.
+            with open(tmp, "rb") as f:
+                os.fsync(f.fileno())
+            os.replace(tmp, self._watermark_path)
+            self._committed = seq
         BM.bus_wal_pending.dec()
 
     def _read_committed(self) -> int:
@@ -109,20 +153,18 @@ class WALAppender:
 
         Skips corrupt lines with a warning; never raises.
         """
-        committed = self._read_committed()
         if not self._wal_path.exists():
             return
         with open(self._wal_path, "rb") as f:
             for line in f:
                 try:
-                    seq_str, b64 = line.decode().rstrip("\n").split("\t", 1)
-                    seq = int(seq_str)
-                    msg_bytes = base64.b64decode(b64)
+                    record = self._decode_line(line)
                 except (ValueError, UnicodeDecodeError, Exception) as e:
                     LOG.warning("skipping corrupt WAL line in %s: %s", self._wal_path, e)
                     continue
-                if seq > committed:
-                    yield WALRecord(seq=seq, msg_bytes=msg_bytes)
+                if record.seq > self._committed:
+                    BM.bus_wal_pending.inc()
+                    yield record
 
     def close(self) -> None:
         if not self._fp.closed:

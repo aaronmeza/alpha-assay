@@ -17,12 +17,13 @@ import yaml
 
 from alpha_assay.bus import metrics as BM
 from alpha_assay.bus.lock import FeedLock, FeedLockHeldError
-from alpha_assay.bus.producer import Producer
 from alpha_assay.bus.streams import CURRENT_VERSION, Message, stream_name_for_bars, stream_name_for_ticks
 from alpha_assay.bus.streams import pack as pack_msg
+from alpha_assay.bus.streams import unpack as unpack_msg
 from alpha_assay.bus.wal import WALAppender
 
 LOG = logging.getLogger(__name__)
+WAL_REPLAY_WARN_THRESHOLD = 1000
 
 
 class ManifestError(ValueError):
@@ -155,7 +156,7 @@ class IBKRFeedDaemon:
     ) -> None:
         self._adapter = adapter
         self._redis = redis_client
-        self._producer = Producer(redis_client=redis_client, maxlen=maxlen)
+        self._maxlen = maxlen
         self._wal_dir = Path(wal_dir)
         self._wal_dir.mkdir(parents=True, exist_ok=True)
         # Shared with the staleness watchdog (None in unit tests that don't
@@ -211,11 +212,14 @@ class IBKRFeedDaemon:
         wal_subdir = self._wal_dir / stream
         day = datetime.now(UTC).strftime("%Y-%m-%d")
         wal = WALAppender(directory=wal_subdir, day=day)
-        for record in wal.read_uncommitted():
-            self._redis.xadd(stream, {"data": record.msg_bytes}, maxlen=3600, approximate=True)
+        pending_records = list(wal.read_uncommitted())
+        self._log_wal_replay(stream=stream, records=pending_records)
+        for record in pending_records:
+            self._redis.xadd(stream, {"data": record.msg_bytes}, maxlen=self._maxlen, approximate=True)
+            BM.bus_wal_replayed_total.labels(stream=stream).inc()
             wal.advance_committed(record.seq)
 
-        seq_counter = 0
+        seq_counter = wal.next_seq
         try:
             async for event in gen:
                 seq = seq_counter
@@ -235,7 +239,7 @@ class IBKRFeedDaemon:
                 wal.append(seq=seq, msg_bytes=msg_bytes)
                 # Direct XADD so we control the bytes; bypass Producer to
                 # keep WAL/publish/advance-committed atomic at this level.
-                self._redis.xadd(stream, {"data": msg_bytes}, maxlen=3600, approximate=True)
+                self._redis.xadd(stream, {"data": msg_bytes}, maxlen=self._maxlen, approximate=True)
                 BM.bus_publish_total.labels(stream=stream).inc()
                 wal.advance_committed(seq)
                 # Publish boundary: data is flowing for this stream.
@@ -245,6 +249,34 @@ class IBKRFeedDaemon:
             wal.close()
             BM.feed_lock_state.labels(contract=stream).set(0)
             lock.release()
+
+    @staticmethod
+    def _log_wal_replay(stream: str, records: list) -> None:
+        """Emit one restart-drain log line with count and best-effort time span."""
+        if not records:
+            return
+        level = logging.ERROR if len(records) > WAL_REPLAY_WARN_THRESHOLD else logging.WARNING
+        try:
+            first = unpack_msg(records[0].msg_bytes)
+            last = unpack_msg(records[-1].msg_bytes)
+            first_dt = datetime.fromtimestamp(first.ts_event_ns / 1_000_000_000, UTC).isoformat()
+            last_dt = datetime.fromtimestamp(last.ts_event_ns / 1_000_000_000, UTC).isoformat()
+            LOG.log(
+                level,
+                "replaying %d WAL records for %s with event span %s to %s",
+                len(records),
+                stream,
+                first_dt,
+                last_dt,
+            )
+        except Exception as e:
+            LOG.log(
+                level,
+                "replaying %d WAL records for %s; event span unavailable: %s",
+                len(records),
+                stream,
+                e,
+            )
 
     async def _connect_if_needed(self) -> None:
         if not getattr(self._adapter, "is_connected", False):
