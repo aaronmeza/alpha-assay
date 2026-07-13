@@ -16,7 +16,10 @@
 # Plug-in contract: dotted "module:Class" path of any BaseStrategy
 # subclass (yours can live in any importable package). Everything under
 # `params` is opaque to the framework and passed straight to your
-# strategy's __init__/_validate_config.
+# strategy's __init__/_validate_config, except a `risk` sub-block declaring
+# numeric `stop_points` / `target_points`. The loader cross-checks that
+# static pair against `risk_caps` at load time so an unsatisfiable bracket
+# fails as a config error instead of producing a zero-trade run.
 strategy:
   class: examples.sma_crossover:SMACrossoverStrategy
   params:
