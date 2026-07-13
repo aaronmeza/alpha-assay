@@ -398,39 +398,19 @@ def test_orders_submitted_counter_increments_with_type_labels():
 
 
 def test_on_fill_callback_receives_canonical_schema():
-    from types import SimpleNamespace
+    import datetime as _dt
+
+    from ib_insync import CommissionReport, Contract, Execution, Fill, Order, Trade
 
     ib = MagicMock(name="IB")
     ib.isConnected.return_value = True
     ib.client = MagicMock()
     ib.client.getReqId.side_effect = [601, 602, 603]
 
-    # Minimal eventkit.Event stand-in so += / -= work.
-    class _Event:
-        def __init__(self):
-            self._handlers = []
-
-        def __iadd__(self, h):
-            self._handlers.append(h)
-            return self
-
-        def __isub__(self, h):
-            if h in self._handlers:
-                self._handlers.remove(h)
-            return self
-
-        def fire(self, *a, **kw):
-            for h in list(self._handlers):
-                h(*a, **kw)
-
-    trades_by_id: dict[int, SimpleNamespace] = {}
+    trades_by_id: dict[int, Trade] = {}
 
     def _place_order(contract, order):
-        trade = SimpleNamespace(
-            order=order,
-            contract=contract,
-            filledEvent=_Event(),
-        )
+        trade = Trade(contract=contract, order=order)
         trades_by_id[order.orderId] = trade
         return trade
 
@@ -452,23 +432,25 @@ def test_on_fill_callback_receives_canonical_schema():
         limit_price=5000.0,
     )
 
-    import datetime as _dt
-
-    fake_fill = SimpleNamespace(
-        execution=SimpleNamespace(
+    fake_fill = Fill(
+        contract=Contract(),
+        execution=Execution(
             execId="E-1",
             time=_dt.datetime(2026, 5, 1, 14, 31, 0, tzinfo=_dt.UTC),
             shares=1.0,
             price=5000.25,
             side="BOT",
         ),
+        commissionReport=CommissionReport(),
+        time=_dt.datetime(2026, 5, 1, 14, 31, 0, tzinfo=_dt.UTC),
     )
-    fake_trade = SimpleNamespace(
-        order=SimpleNamespace(orderId=601, orderType="LMT"),
-    )
-    # Fire only the parent's filledEvent. Each child has its own event,
+    one_arg_trade = Trade(contract=Contract(), order=Order(orderId=601, orderType="LMT"))
+    trades_by_id[601].filledEvent.emit(one_arg_trade)
+    assert received == []
+
+    # Fire only the parent's fillEvent. Each child has its own event,
     # so this exercises the single-order -> single-callback path.
-    trades_by_id[601].filledEvent.fire(fake_trade, fake_fill)
+    trades_by_id[601].fillEvent.emit(one_arg_trade, fake_fill)
 
     assert len(received) == 1
     evt = received[0]
@@ -487,11 +469,20 @@ def test_on_fill_callback_receives_canonical_schema():
     assert evt["price"] == 5000.25
 
 
-def test_cancel_order_calls_ib_cancelOrder():
+def test_cancel_order_uses_retained_trade_order_and_unknown_logs(caplog):
+    from ib_insync import Trade
+
     ib = MagicMock(name="IB")
     ib.isConnected.return_value = True
     ib.client = MagicMock()
     ib.client.getReqId.side_effect = [701, 702, 703]
+    ib.trades.return_value = []
+
+    def _place_order(contract, order):
+        order.clientId = 23
+        return Trade(contract=contract, order=order)
+
+    ib.placeOrder.side_effect = _place_order
 
     read_adapter = IBKRAdapter(ib=ib, read_only=False)
     exec_adapter = IBKRExecAdapter(adapter=read_adapter)
@@ -507,6 +498,102 @@ def test_cancel_order_calls_ib_cancelOrder():
     )
     exec_adapter.cancel_order(plan.parent_id)
     assert ib.cancelOrder.call_count == 1
+    cancelled_order = ib.cancelOrder.call_args.args[0]
+    assert cancelled_order.orderId == plan.parent_id
+    assert cancelled_order.clientId == 23
+
+    with caplog.at_level(logging.WARNING):
+        exec_adapter.cancel_order(9999)
+    assert "cancel_order(9999): no live trade found" in caplog.text
+
+
+def test_terminal_cancelled_status_dispatches_order_status_event():
+    import datetime as _dt
+
+    from ib_insync import OrderStatus, Trade
+    from ib_insync.objects import TradeLogEntry
+
+    ib = MagicMock(name="IB")
+    ib.isConnected.return_value = True
+    ib.client = MagicMock()
+    ib.client.getReqId.return_value = 801
+
+    trades_by_id: dict[int, Trade] = {}
+
+    def _place_order(contract, order):
+        trade = Trade(contract=contract, order=order)
+        trades_by_id[order.orderId] = trade
+        return trade
+
+    ib.placeOrder.side_effect = _place_order
+
+    read_adapter = IBKRAdapter(ib=ib, read_only=False)
+    exec_adapter = IBKRExecAdapter(adapter=read_adapter)
+    received: list[dict[str, object]] = []
+    exec_adapter.on_order_status(received.append)
+
+    order_id = exec_adapter.place_market_order(contract_spec=_SPEC, side="BUY", quantity=1)
+    trade = trades_by_id[order_id]
+    trade.orderStatus.status = OrderStatus.Cancelled
+    trade.log.append(
+        TradeLogEntry(
+            time=_dt.datetime(2026, 5, 1, 14, 31, 0, tzinfo=_dt.UTC),
+            status=OrderStatus.Cancelled,
+            message="Order rejected",
+            errorCode=201,
+        )
+    )
+    trade.statusEvent.emit(trade)
+
+    assert received == [
+        {
+            "order_id": 801,
+            "status": OrderStatus.Cancelled,
+            "error_code": 201,
+            "message": "Order rejected",
+        }
+    ]
+
+
+def test_benign_ibkr_notice_cancelled_status_is_suppressed():
+    import datetime as _dt
+
+    from ib_insync import OrderStatus, Trade
+    from ib_insync.objects import TradeLogEntry
+
+    ib = MagicMock(name="IB")
+    ib.isConnected.return_value = True
+    ib.client = MagicMock()
+    ib.client.getReqId.return_value = 811
+
+    trades_by_id: dict[int, Trade] = {}
+
+    def _place_order(contract, order):
+        trade = Trade(contract=contract, order=order)
+        trades_by_id[order.orderId] = trade
+        return trade
+
+    ib.placeOrder.side_effect = _place_order
+
+    read_adapter = IBKRAdapter(ib=ib, read_only=False)
+    exec_adapter = IBKRExecAdapter(adapter=read_adapter)
+    received: list[dict[str, object]] = []
+    exec_adapter.on_order_status(received.append)
+
+    order_id = exec_adapter.place_market_order(contract_spec=_SPEC, side="BUY", quantity=1)
+    trade = trades_by_id[order_id]
+    trade.orderStatus.status = OrderStatus.Cancelled
+    trade.log.append(
+        TradeLogEntry(
+            time=_dt.datetime(2026, 5, 1, 14, 31, 0, tzinfo=_dt.UTC),
+            status=OrderStatus.Cancelled,
+            message="Order TIF was set to DAY based on order preset.",
+            errorCode=10349,
+        )
+    )
+    trade.statusEvent.emit(trade)
+
+    assert received == []
 
 
 def test_adapter_logs_mode_prominently_on_connect(caplog):

@@ -72,6 +72,12 @@ if TYPE_CHECKING:
 _LOG = logging.getLogger(__name__)
 
 _DEFAULT_CHECKLIST_SUFFIX = Path(".alpha_assay") / "go_live_checklist_signed"
+# ib_insync 0.9.86 keeps this as a local in wrapper.py:Wrapper.error,
+# not as a public attribute: warningCodes = {110, 165, 202, 399,
+# 404, 434, 492, 10167}. Keep this mirror paired with the source
+# because those notices must not be treated as terminal order rejects.
+_IB_INSYNC_WARNING_CODES = {110, 165, 202, 399, 404, 434, 492, 10167}
+_BENIGN_NOTICE_CODES = _IB_INSYNC_WARNING_CODES | {10349}
 
 
 class ExecMode(Enum):
@@ -242,6 +248,8 @@ class IBKRExecAdapter:
         self._loop_owner = loop_owner
         self._fill_dispatcher: FillDispatcher | None = None
         self._fill_callbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._order_status_callbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._trades_by_order_id: dict[int, Any] = {}
         _update_exec_mode_gauge(mode)
 
     # --- marshaling -------------------------------------------------------
@@ -270,7 +278,7 @@ class IBKRExecAdapter:
         _LOG.warning("IBKRExecAdapter connect: mode=%s", self.mode.value.upper())
         if self._loop_owner is not None:
             if self._fill_dispatcher is None:
-                self._fill_dispatcher = FillDispatcher(self._dispatch_fill)
+                self._fill_dispatcher = FillDispatcher(self._dispatch_dispatcher_event)
                 self._fill_dispatcher.start()
             if not self._adapter.is_connected:
                 self._loop_owner.run_coro(
@@ -443,29 +451,29 @@ class IBKRExecAdapter:
         M.orders_submitted_total.labels(type="target").inc()
         M.orders_submitted_total.labels(type="stop").inc()
 
-        # Wire the filledEvent on each child so callers see fills in
-        # canonical schema. Guard for mocks that may not return Trade
-        # objects with filledEvent attrs.
+        # Wire execution and status events on each trade so fills and
+        # broker-side terminal failures both reach the runner through
+        # dispatcher-owned callbacks.
         for trade in (parent_trade, target_trade, stop_trade):
-            fe = getattr(trade, "filledEvent", None)
-            if fe is None:
-                continue
-            fe += self._make_fill_handler()
+            self._retain_trade(trade)
+            self._wire_trade_events(trade)
 
         return plan
 
     def cancel_order(self, order_id: int) -> None:
         """Request cancellation of a given order id.
 
-        ib_insync's ``cancelOrder`` takes an Order object rather than
-        an id; we construct a minimal Order with the id set.
+        ib_insync's ``cancelOrder`` takes the original Order object so
+        local Trade bookkeeping can observe status/cancel events.
         """
         self._execute(self._cancel_order_on_loop, order_id)
 
     def _cancel_order_on_loop(self, order_id: int) -> None:
-        from ib_insync import Order
-
-        self._ib.cancelOrder(Order(orderId=order_id))
+        trade = self._find_trade(order_id)
+        if trade is None:
+            _LOG.warning("cancel_order(%d): no live trade found; already done?", order_id)
+            return
+        self._ib.cancelOrder(trade.order)
 
     def place_market_order(
         self,
@@ -518,10 +526,9 @@ class IBKRExecAdapter:
             return order_id
 
         trade = self._ib.placeOrder(contract, order)
+        self._retain_trade(trade)
         M.orders_submitted_total.labels(type="flatten").inc()
-        fe = getattr(trade, "filledEvent", None)
-        if fe is not None:
-            fe += self._make_fill_handler()
+        self._wire_trade_events(trade)
         return order_id
 
     def position_quantity(self, contract_spec: dict[str, Any]) -> float:
@@ -593,8 +600,46 @@ class IBKRExecAdapter:
         """
         self._fill_callbacks.append(callback)
 
+    def on_order_status(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Register a callback for terminal non-filled order outcomes.
+
+        The callback receives a canonical dict with the order id, broker
+        status string, numeric error code when available, and log message.
+        Delivery uses the same dispatcher thread as fills when a loop owner
+        is configured.
+        """
+        self._order_status_callbacks.append(callback)
+
+    def _retain_trade(self, trade: Any) -> None:
+        """Keep the live Trade object addressable by its order id."""
+        order = getattr(trade, "order", None)
+        order_id = _coerce_order_id(getattr(order, "orderId", 0))
+        if order_id:
+            self._trades_by_order_id[order_id] = trade
+
+    def _find_trade(self, order_id: int) -> Any | None:
+        """Find a retained or IB-local live Trade for ``order_id``."""
+        trade = self._trades_by_order_id.get(order_id)
+        if trade is not None:
+            return trade
+        for candidate in self._ib.trades():
+            order = getattr(candidate, "order", None)
+            if _coerce_order_id(getattr(order, "orderId", 0)) == order_id:
+                self._retain_trade(candidate)
+                return candidate
+        return None
+
+    def _wire_trade_events(self, trade: Any) -> None:
+        """Subscribe a Trade to fill and terminal-status handlers."""
+        fill_event = getattr(trade, "fillEvent", None)
+        if fill_event is not None:
+            fill_event += self._make_fill_handler()
+        status_event = getattr(trade, "statusEvent", None)
+        if status_event is not None:
+            status_event += self._make_order_status_handler()
+
     def _make_fill_handler(self) -> Callable[[Any, Any], None]:
-        """Build the ib_insync ``filledEvent`` handler.
+        """Build the ib_insync ``fillEvent`` handler.
 
         ib_insync fires the event on the connection-owning loop thread.
         With a fill dispatcher (loop_owner configured + connected), the
@@ -610,14 +655,44 @@ class IBKRExecAdapter:
             evt = _fill_to_canonical(trade, fill)
             dispatcher = self._fill_dispatcher
             if dispatcher is not None:
-                dispatcher.submit(evt)
+                dispatcher.submit(("fill", evt))
             else:
                 self._dispatch_fill(evt)
 
         return _handle
 
+    def _make_order_status_handler(self) -> Callable[[Any], None]:
+        """Build the ib_insync ``statusEvent`` rejection handler."""
+
+        def _handle(trade: Any) -> None:
+            evt = _order_status_to_canonical(trade)
+            if evt is None:
+                return
+            dispatcher = self._fill_dispatcher
+            if dispatcher is not None:
+                dispatcher.submit(("order_status", evt))
+            else:
+                self._dispatch_order_status(evt)
+
+        return _handle
+
+    def _dispatch_dispatcher_event(self, item: Any) -> None:
+        """Route dispatcher-thread events to their registered callback list."""
+        kind, evt = item
+        if kind == "fill":
+            self._dispatch_fill(evt)
+            return
+        if kind == "order_status":
+            self._dispatch_order_status(evt)
+            return
+        _LOG.error("unknown exec dispatcher event kind=%r payload=%r", kind, evt)
+
     def _dispatch_fill(self, evt: dict[str, Any]) -> None:
         for cb in list(self._fill_callbacks):
+            cb(evt)
+
+    def _dispatch_order_status(self, evt: dict[str, Any]) -> None:
+        for cb in list(self._order_status_callbacks):
             cb(evt)
 
 
@@ -641,6 +716,42 @@ def _fill_to_canonical(trade: Any, fill: Any) -> dict[str, Any]:
         "quantity": float(getattr(execution, "shares", 0.0) or 0.0),
         "price": float(getattr(execution, "price", 0.0) or 0.0),
         "side": str(getattr(execution, "side", "") or ""),
+    }
+
+
+def _coerce_order_id(value: Any) -> int:
+    """Return a real integer order id from ib_insync values, or zero."""
+    if isinstance(value, int | float | str):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _order_status_to_canonical(trade: Any) -> dict[str, Any] | None:
+    """Convert a terminal non-filled Trade status into a canonical event."""
+    from ib_insync import OrderStatus
+
+    status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+    if status not in OrderStatus.DoneStates or status == OrderStatus.Filled:
+        return None
+    order = getattr(trade, "order", None)
+    last_entry = trade.log[-1] if getattr(trade, "log", None) else None
+    error_code = int(getattr(last_entry, "errorCode", 0) or 0)
+    if error_code in _BENIGN_NOTICE_CODES:
+        # IBKR sends error 10349 when an order preset rewrites TIF to DAY.
+        # ib_insync does not classify that code as a warning, so
+        # Wrapper.error forces trade.orderStatus.status = Cancelled and
+        # emits statusEvent/cancelledEvent. Production then immediately
+        # receives PreSubmitted and execDetails for the same order. That
+        # transient Cancelled is broker noise, not a rejection.
+        return None
+    return {
+        "order_id": int(getattr(order, "orderId", 0) or 0),
+        "status": status,
+        "error_code": error_code,
+        "message": str(getattr(last_entry, "message", "") or ""),
     }
 
 

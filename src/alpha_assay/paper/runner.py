@@ -170,6 +170,8 @@ class PaperStrategyRunner:
         contract_spec: dict[str, Any],
         trade_log: TradeLog | None = None,
         starting_balance: float = 100_000.0,
+        max_bar_age: timedelta | None = timedelta(seconds=180),
+        now_fn: Any | None = None,
     ) -> None:
         self._strategy = strategy
         self._strategy_name = type(strategy).__name__
@@ -191,6 +193,9 @@ class PaperStrategyRunner:
         )
         self._balance = starting_balance
         self._realized_total = 0.0
+        self._max_bar_age = max_bar_age
+        self._now_fn = now_fn or (lambda: pd.Timestamp.now(tz="UTC"))
+        self._in_stale_bar_run = False
         self._builder = SessionFrameBuilder()
         self._aggregators = {symbol: MinuteCloseAggregator(symbol) for symbol in BREADTH_SYMBOL_COLUMNS}
         self._position: _OpenPosition | None = None
@@ -206,8 +211,9 @@ class PaperStrategyRunner:
         # loop that serves those marshaled calls (lock-inversion
         # deadlock). Invariant: handle_fill must stay free of exec-
         # adapter calls; if one is ever added it only blocks the
-        # dispatcher thread (safe), but it delays subsequent fills -
-        # prefer deferring broker actions to the bar-driven paths.
+        # dispatcher thread (safe), but it delays subsequent fills. Any
+        # status-driven broker read below must stay bounded and must not
+        # call back into the dispatcher.
         self._lock = threading.RLock()
 
         # Heartbeat counters (same contract as the always-flat strategy).
@@ -453,12 +459,80 @@ class PaperStrategyRunner:
             if pos.exit_qty >= pos.contracts:
                 self._finalize_round_trip(pos, outcome, evt.get("timestamp"))
 
+    def handle_order_status(self, evt: dict[str, Any]) -> None:
+        """React to terminal non-filled broker statuses for open orders."""
+        with self._lock:
+            pos = self._position
+            if pos is None:
+                _LOG.error("order status with no open position: %s", evt)
+                return
+            order_id = int(evt.get("order_id", 0) or 0)
+            if pos.flatten_order_id is not None and order_id == pos.flatten_order_id:
+                _LOG.error("flatten order rejected: %s", evt)
+                M.orders_rejected_total.labels(type="flatten").inc()
+                broker_qty = self._broker_position_quantity_for_status("flatten rejection")
+                pos.flatten_order_id = None
+                pos.flatten_reason = None
+                if broker_qty == 0:
+                    # The broker is already flat, so the rejected flatten has
+                    # no remaining exposure to manage and must not arm a
+                    # duplicate retry on the next bar.
+                    self._position = None
+                    M.position_contracts.set(0)
+                    self._apply_deferred_cutover_if_needed()
+                return
+            if order_id == pos.plan.parent_id:
+                _LOG.error("entry order rejected: %s", evt)
+                M.orders_rejected_total.labels(type="entry").inc()
+                broker_qty = self._broker_position_quantity_for_status("entry rejection")
+                if broker_qty is None:
+                    # Without broker truth, keep managing the bracket rather
+                    # than clearing a position that may already be live.
+                    return
+                if broker_qty != 0:
+                    # A status event alone is not authoritative. IBKR can emit
+                    # a transient Cancelled before PreSubmitted/fill, so keep
+                    # the local position latched when the account has exposure.
+                    _LOG.error(
+                        "entry rejection ignored because broker position is live: broker_qty=%+g evt=%s",
+                        broker_qty,
+                        evt,
+                    )
+                    return
+                # Only a flat broker proves the entry failed to open. Then
+                # cancel any resting children the broker may still know about.
+                for child_id in (pos.plan.stop_id, pos.plan.target_id):
+                    try:
+                        self._exec.cancel_order(child_id)
+                    except Exception:
+                        _LOG.exception("cancel_order(%d) failed after entry rejection", child_id)
+                self._position = None
+                M.position_contracts.set(0)
+                self._apply_deferred_cutover_if_needed()
+                return
+            _LOG.error("order status ignored for unrelated order: %s", evt)
+
     # --- internals -----------------------------------------------------------
 
     def _on_row(self, ts: pd.Timestamp) -> None:
         """Evaluate the strategy on a newly completed frame row."""
-        frame = self._builder.frame
+        if self._bar_is_stale(ts):
+            # The builder has already accepted this row, so returning here
+            # warms indicators without allowing replayed event time to drive
+            # time stops, entries, or broker flatten orders.
+            M.stale_bars_skipped_total.inc()
+            if not self._in_stale_bar_run:
+                _LOG.error(
+                    "stale bar skipped for broker interaction: ts=%s now=%s max_age=%s",
+                    ts,
+                    self._now_fn(),
+                    self._max_bar_age,
+                )
+                self._in_stale_bar_run = True
+            return
+        self._in_stale_bar_run = False
         self._manage_open_position(ts)
+        frame = self._builder.frame
         t0 = time.perf_counter()
         signals = self._strategy.generate_signals(frame)
         M.signal_eval_seconds.labels(strategy=self._strategy_name).observe(time.perf_counter() - t0)
@@ -542,21 +616,59 @@ class PaperStrategyRunner:
         if pos.time_stop is not None and (ts - pos.signal_ts) >= pos.time_stop:
             self._flatten(pos, "time_stop")
 
+    def _broker_position_quantity_for_status(self, reason: str) -> float | None:
+        """Read broker quantity during a status callback without clearing on failure."""
+        try:
+            return float(self._exec.position_quantity(self._contract_spec))
+        except Exception:
+            _LOG.exception("position_quantity failed during %s; keeping runner state", reason)
+            return None
+
     def _flatten(self, pos: _OpenPosition, reason: str) -> None:
-        """Cancel resting children and market-flatten the open position."""
+        """Cancel resting children and market-flatten the broker position."""
         _LOG.warning("flattening open position (%s): %+d x %d", reason, pos.direction, pos.contracts)
         for order_id in (pos.plan.stop_id, pos.plan.target_id):
             try:
                 self._exec.cancel_order(order_id)
             except Exception:
                 _LOG.exception("cancel_order(%d) failed during %s flatten", order_id, reason)
+        try:
+            broker_qty = float(self._exec.position_quantity(self._contract_spec))
+        except Exception:
+            _LOG.exception("position_quantity failed during %s flatten; no market order submitted", reason)
+            return
+        if broker_qty == 0:
+            # The bracket may already have closed the broker position. Trading
+            # against a flat account would open fresh exposure, so clear local
+            # state and wait for the next real signal.
+            _LOG.error("position desync during %s flatten: broker is flat; clearing runner state", reason)
+            M.position_desync_total.inc()
+            self._position = None
+            M.position_contracts.set(0)
+            self._apply_deferred_cutover_if_needed()
+            return
+        if _sign(broker_qty) != pos.direction:
+            # A broker position in the opposite direction is not safely
+            # attributable to this runner. Do not trade on an unexplained
+            # desync; surface it and clear the stale local latch.
+            _LOG.error(
+                "position desync during %s flatten: broker_qty=%+g runner_direction=%+d; no market order submitted",
+                reason,
+                broker_qty,
+                pos.direction,
+            )
+            M.position_desync_total.inc()
+            self._position = None
+            M.position_contracts.set(0)
+            self._apply_deferred_cutover_if_needed()
+            return
         side = "SELL" if pos.direction > 0 else "BUY"
         try:
             pos.flatten_order_id = int(
                 self._exec.place_market_order(
                     contract_spec=self._contract_spec,
                     side=side,
-                    quantity=pos.contracts,
+                    quantity=abs(int(broker_qty)),
                 )
             )
             pos.flatten_reason = reason
@@ -647,17 +759,32 @@ class PaperStrategyRunner:
         )
         self._position = None
 
-        # Deferred front-month cutover recovery: if a roll arrived while this
-        # position was open, update_front_month parked the new expiry rather
-        # than re-pointing the order contract mid-trade. Now that we are flat,
-        # apply it so divergence clears and new entries can resume on the live
-        # contract. Reached under self._lock (handle_fill holds the RLock).
+        self._apply_deferred_cutover_if_needed()
+
+    def _apply_deferred_cutover_if_needed(self) -> None:
+        """Apply a parked front-month cutover after local state is flat."""
         if self._pending_consumed_expiry is not None:
             _LOG.warning(
                 "applying deferred front-month cutover to %s now that the position is closed",
                 self._pending_consumed_expiry,
             )
             self._apply_consumed_cutover(self._pending_consumed_expiry)
+
+    def _bar_is_stale(self, ts: pd.Timestamp) -> bool:
+        """Return True when a row's event time is too old to trade."""
+        if self._max_bar_age is None:
+            return False
+        now = pd.Timestamp(self._now_fn())
+        if now.tzinfo is None:
+            now = now.tz_localize("UTC")
+        else:
+            now = now.tz_convert("UTC")
+        event_ts = pd.Timestamp(ts)
+        if event_ts.tzinfo is None:
+            event_ts = event_ts.tz_localize("UTC")
+        else:
+            event_ts = event_ts.tz_convert("UTC")
+        return (now - event_ts) > self._max_bar_age
 
     def _in_session(self, ts: pd.Timestamp) -> bool:
         mask = session_mask(
@@ -681,6 +808,11 @@ def _accumulate_avg(avg: float, qty: float, fill_px: float, fill_qty: float) -> 
     if total <= 0:
         return fill_px
     return (avg * qty + fill_px * fill_qty) / total
+
+
+def _sign(value: float) -> int:
+    """Return the sign of a non-zero broker quantity."""
+    return 1 if value > 0 else -1
 
 
 __all__ = [
