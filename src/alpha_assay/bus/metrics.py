@@ -38,6 +38,12 @@ bus_wal_pending = Gauge(
     "Producer-side WAL records appended but not yet confirmed published.",
 )
 
+bus_wal_replayed_total = Counter(
+    f"{_PREFIX}bus_wal_replayed_total",
+    "Records republished from the WAL on producer restart (drain).",
+    labelnames=("stream",),
+)
+
 bus_redis_degraded = Gauge(
     f"{_PREFIX}bus_redis_degraded",
     "1 if producer cannot reach Redis, else 0.",

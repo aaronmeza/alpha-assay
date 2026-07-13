@@ -6,10 +6,10 @@ Opt-in: requires ``RUN_INTEGRATION=1`` and a reachable Redis at
 so it does not run in the default ``pytest`` / CI pass.
 
 Uses a unique per-run stream name that is deleted on teardown, so it is
-safe to run against a shared Redis (the SER9 ``alphaassay-redis``)
+safe to run against a shared Redis (the deployed ``alphaassay-redis``)
 without touching production streams.
 
-On SER9 (the host has no project venv, so run in a throwaway container)::
+On the deploy host (which has no project venv, so run in a throwaway container)::
 
     docker run --rm --network host -v /home/ameza/personal/alpha-assay:/app -w /app \\
       python:3.11-slim sh -c \\
