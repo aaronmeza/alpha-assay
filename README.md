@@ -295,6 +295,14 @@ class MyStrategy(BaseStrategy):
         ...
 ```
 
+The engine validates every `ExitParams` value returned by `get_exit_params()`
+against the top-level `risk_caps` on every signal. For static exits declared in
+config, `strategy.params.risk.stop_points` and
+`strategy.params.risk.target_points` are a reserved key path: when both numeric
+values are present, the loader cross-checks them against the same `risk_caps`
+before reading data. Use a different key name for any unrelated strategy config
+that would otherwise live under `params.risk`.
+
 Drop it in your own repo, point a config at it, run:
 
 ```bash

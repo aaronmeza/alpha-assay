@@ -57,6 +57,11 @@ class BaseStrategy(ABC):
     Subclasses MUST NOT place orders, mutate broker state, or read from the
     broker directly. All execution flows through the engine's `exec/` layer so
     that paper-to-live is a config change, not a code change.
+
+    `strategy.params` is otherwise opaque to the framework, but
+    `strategy.params.risk.{stop_points,target_points}` is a reserved key path:
+    a static exit pair declared there is cross-checked against `risk_caps` at
+    config-load time. Name any unrelated config block something else.
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
