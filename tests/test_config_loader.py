@@ -136,14 +136,21 @@ def test_rejects_quoted_static_stop_above_max_stop_pts(tmp_path):
 
 
 def test_accepts_quoted_static_exit_params_within_caps(tmp_path):
+    # A quoted numeric IS a distance, so it is coerced and cap-checked rather
+    # than skipped. The coerced floats are written back, so a strategy reading
+    # params.risk gets the same number the caps approved - never a string that
+    # would blow up later in the per-signal check or the bracket arithmetic.
     valid = VALID_WITH_EXITS.replace("stop_points: 0.5", 'stop_points: "0.5"').replace(
         "target_points: 1.0", 'target_points: "1.0"'
     )
     p = tmp_path / "quoted_exits_ok.yaml"
     p.write_text(valid)
     cfg = load_config(p)
-    assert cfg.strategy.params["risk"]["stop_points"] == "0.5"
-    assert cfg.strategy.params["risk"]["target_points"] == "1.0"
+    risk = cfg.strategy.params["risk"]
+    assert risk["stop_points"] == 0.5
+    assert risk["target_points"] == 1.0
+    assert isinstance(risk["stop_points"], float)
+    assert isinstance(risk["target_points"], float)
 
 
 def test_rejects_non_numeric_static_stop(tmp_path):
@@ -240,9 +247,30 @@ def test_skips_exit_cap_check_when_risk_block_has_only_unrelated_keys(tmp_path):
     assert cfg.strategy.params["risk"]["position_size_multiplier"] == 2
 
 
-def test_rejects_partial_static_exit_block(tmp_path):
-    invalid = VALID_WITH_EXITS.replace("      target_points: 1.0\n", "")
+def test_skips_exit_cap_check_when_static_exit_block_is_partial(tmp_path):
+    # Only a COMPLETE pair is a static-exit declaration. A lone stop_points is
+    # not cap-checkable, and treating it as reserved would reject a third-party
+    # strategy that keeps unrelated config under `risk` - breaking the promise
+    # that strategy.params is opaque to the framework. The stop here (50.0)
+    # flagrantly exceeds max_stop_pts 5.0 and must still load untouched.
+    partial = VALID_WITH_EXITS.replace("      target_points: 1.0\n", "").replace(
+        "stop_points: 0.5", "stop_points: 50.0"
+    )
     p = tmp_path / "partial_static_exit.yaml"
-    p.write_text(invalid)
-    with pytest.raises(ValidationError, match=r"strategy\.params\.risk\.target_points"):
-        load_config(p)
+    p.write_text(partial)
+    cfg = load_config(p)
+    risk = cfg.strategy.params["risk"]
+    assert risk["stop_points"] == 50.0
+    assert "target_points" not in risk
+
+
+def test_skips_exit_cap_check_when_static_exit_values_are_null(tmp_path):
+    # An explicit YAML null means "not declared", same as an absent key, so a
+    # dynamic-exit strategy can carry the keys without inviting a cap check.
+    nulled = VALID_WITH_EXITS.replace("stop_points: 0.5", "stop_points: null").replace(
+        "target_points: 1.0", "target_points: null"
+    )
+    p = tmp_path / "null_static_exit.yaml"
+    p.write_text(nulled)
+    cfg = load_config(p)
+    assert cfg.strategy.params["risk"]["stop_points"] is None
