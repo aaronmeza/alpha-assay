@@ -111,6 +111,11 @@
           "expr": "sum by (filter_name, reason) (rate(alpha_assay_signals_filtered_total[1m]))",
           "legendFormat": "{{filter_name}} / {{reason}}",
           "refId": "A"
+        },
+        {
+          "expr": "rate(alpha_assay_stale_bars_skipped_total[1m])",
+          "legendFormat": "stale_bar_skip",
+          "refId": "B"
         }
       ]
     },
@@ -190,6 +195,11 @@
           "expr": "sum by (type, status) (rate(alpha_assay_orders_filled_total[1m]))",
           "legendFormat": "{{type}} / {{status}}",
           "refId": "A"
+        },
+        {
+          "expr": "sum by (type) (rate(alpha_assay_orders_rejected_total[1m]))",
+          "legendFormat": "{{type}} / rejected",
+          "refId": "B"
         }
       ]
     },
@@ -473,6 +483,11 @@
           "expr": "alpha_assay_position_contracts",
           "legendFormat": "position",
           "refId": "A"
+        },
+        {
+          "expr": "increase(alpha_assay_position_desync_total[1h])",
+          "legendFormat": "position_desync_1h",
+          "refId": "B"
         }
       ]
     },

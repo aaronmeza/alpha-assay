@@ -94,6 +94,9 @@ Environment
                              Required when ``PAPER_STRATEGY`` is set.
 ``PAPER_STARTING_BALANCE``   Reference balance for risk-based sizing in
                              strategy mode. Default ``100000``.
+``PAPER_MAX_BAR_AGE_SECONDS`` Maximum bar age for broker interaction in
+                             strategy mode. Default ``180``; empty
+                             string disables the gate.
 
 The script is invoked directly by the the deployment host ``paper-trader`` compose
 service. No CLI parser; everything is env-driven so the compose file
@@ -111,6 +114,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING, Any
@@ -189,6 +193,8 @@ class DryrunConfig:
     paper_strategy_config: str = ""
     # Reference balance for risk-based sizing in strategy mode.
     paper_starting_balance: float = 100_000.0
+    # Maximum bar age before broker interaction is suppressed.
+    paper_max_bar_age_seconds: float | None = 180.0
 
 
 def load_config_from_env() -> DryrunConfig:
@@ -202,6 +208,8 @@ def load_config_from_env() -> DryrunConfig:
     See module docstring for the per-variable defaults and meaning.
     """
     env_expiry = os.environ.get("ES_EXPIRY", "").strip() or None
+    max_bar_age_raw = os.environ.get("PAPER_MAX_BAR_AGE_SECONDS", "180").strip()
+    max_bar_age_seconds = None if max_bar_age_raw == "" else float(max_bar_age_raw)
     return DryrunConfig(
         ibkr_host=os.environ.get("IBKR_HOST", "127.0.0.1"),
         ibkr_port=int(os.environ.get("IBKR_PORT", "4002")),
@@ -215,6 +223,7 @@ def load_config_from_env() -> DryrunConfig:
         paper_strategy=os.environ.get("PAPER_STRATEGY", "").strip(),
         paper_strategy_config=os.environ.get("PAPER_STRATEGY_CONFIG", "").strip(),
         paper_starting_balance=float(os.environ.get("PAPER_STARTING_BALANCE", "100000")),
+        paper_max_bar_age_seconds=max_bar_age_seconds,
     )
 
 
@@ -1040,8 +1049,12 @@ def run(cfg: DryrunConfig) -> int:
             contract_spec=es_contract_spec(cfg),
             trade_log=trade_log,
             starting_balance=cfg.paper_starting_balance,
+            max_bar_age=(
+                None if cfg.paper_max_bar_age_seconds is None else timedelta(seconds=cfg.paper_max_bar_age_seconds)
+            ),
         )
         exec_adapter.on_fill(runner.handle_fill)
+        exec_adapter.on_order_status(runner.handle_order_status)
         # Retry the cold-start connect with backoff: a freshly (re)started
         # container can land mid-IBC-cycle while IB Gateway is briefly down, and
         # exiting immediately would churn the watchdog/Docker restart loop.

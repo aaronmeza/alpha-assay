@@ -143,9 +143,11 @@ class _OpenPosition:
     entry_qty: float = 0.0
     entry_avg_px: float = 0.0
     exit_qty: float = 0.0
+    exit_target_qty: float = 0.0
     exit_avg_px: float = 0.0
     flatten_order_id: int | None = None
-    flatten_reason: str | None = None  # "flat_close" / "time_stop"
+    flatten_reason: str | None = None  # "flat_close" / "time_stop" / "entry_rejected"
+    needs_broker_verification: bool = False
 
 
 class PaperStrategyRunner:
@@ -170,6 +172,8 @@ class PaperStrategyRunner:
         contract_spec: dict[str, Any],
         trade_log: TradeLog | None = None,
         starting_balance: float = 100_000.0,
+        max_bar_age: timedelta | None = timedelta(seconds=180),
+        now_fn: Any | None = None,
     ) -> None:
         self._strategy = strategy
         self._strategy_name = type(strategy).__name__
@@ -191,6 +195,9 @@ class PaperStrategyRunner:
         )
         self._balance = starting_balance
         self._realized_total = 0.0
+        self._max_bar_age = max_bar_age
+        self._now_fn = now_fn or (lambda: pd.Timestamp.now(tz="UTC"))
+        self._in_stale_bar_run = False
         self._builder = SessionFrameBuilder()
         self._aggregators = {symbol: MinuteCloseAggregator(symbol) for symbol in BREADTH_SYMBOL_COLUMNS}
         self._position: _OpenPosition | None = None
@@ -204,10 +211,10 @@ class PaperStrategyRunner:
         # on the exec adapter's FillDispatcher thread - NEVER the IB
         # loop thread - so taking this lock here can never wedge the
         # loop that serves those marshaled calls (lock-inversion
-        # deadlock). Invariant: handle_fill must stay free of exec-
-        # adapter calls; if one is ever added it only blocks the
-        # dispatcher thread (safe), but it delays subsequent fills -
-        # prefer deferring broker actions to the bar-driven paths.
+        # deadlock). Invariant: handle_fill and handle_order_status must
+        # stay free of exec-adapter calls; broker verification and broker
+        # actions are deferred to bar-driven paths that already own this
+        # lock on a bus thread.
         self._lock = threading.RLock()
 
         # Heartbeat counters (same contract as the always-flat strategy).
@@ -450,15 +457,57 @@ class PaperStrategyRunner:
             pos.exit_avg_px = _accumulate_avg(pos.exit_avg_px, pos.exit_qty, price, qty)
             pos.exit_qty += qty
             M.orders_filled_total.labels(type=outcome, status="filled").inc()
-            if pos.exit_qty >= pos.contracts:
+            if pos.exit_qty >= pos.exit_target_qty:
                 self._finalize_round_trip(pos, outcome, evt.get("timestamp"))
+
+    def handle_order_status(self, evt: dict[str, Any]) -> None:
+        """React to terminal non-filled broker statuses for open orders."""
+        with self._lock:
+            pos = self._position
+            if pos is None:
+                _LOG.error("order status with no open position: %s", evt)
+                return
+            order_id = int(evt.get("order_id", 0) or 0)
+            if pos.flatten_order_id is not None and order_id == pos.flatten_order_id:
+                _LOG.error("flatten order rejected: %s", evt)
+                M.orders_rejected_total.labels(type="flatten").inc()
+                pos.flatten_order_id = None
+                pos.flatten_reason = None
+                return
+            if order_id == pos.plan.parent_id:
+                _LOG.error("entry order rejected: %s", evt)
+                M.orders_rejected_total.labels(type="entry").inc()
+                # A terminal status event is not authoritative enough to clear
+                # runner state: IBKR can emit transient Cancelled statuses
+                # before a real PreSubmitted/fill. Mark the position for the
+                # next bar-driven management pass, which reads broker truth in
+                # _flatten and either clears a flat broker or submits the
+                # protective market exit for live exposure.
+                pos.needs_broker_verification = True
+                return
+            _LOG.error("order status ignored for unrelated order: %s", evt)
 
     # --- internals -----------------------------------------------------------
 
     def _on_row(self, ts: pd.Timestamp) -> None:
         """Evaluate the strategy on a newly completed frame row."""
-        frame = self._builder.frame
+        if self._bar_is_stale(ts):
+            # The builder has already accepted this row, so returning here
+            # warms indicators without allowing replayed event time to drive
+            # time stops, entries, or broker flatten orders.
+            M.stale_bars_skipped_total.inc()
+            if not self._in_stale_bar_run:
+                _LOG.error(
+                    "stale bar skipped for broker interaction: ts=%s now=%s max_age=%s",
+                    ts,
+                    self._now_fn(),
+                    self._max_bar_age,
+                )
+                self._in_stale_bar_run = True
+            return
+        self._in_stale_bar_run = False
         self._manage_open_position(ts)
+        frame = self._builder.frame
         t0 = time.perf_counter()
         signals = self._strategy.generate_signals(frame)
         M.signal_eval_seconds.labels(strategy=self._strategy_name).observe(time.perf_counter() - t0)
@@ -515,6 +564,7 @@ class PaperStrategyRunner:
             signal_type="long_entry" if direction > 0 else "short_entry",
             entry_ref_price=entry_ref,
             time_stop=exit_params.time_stop,
+            exit_target_qty=float(contracts),
         )
         self.fired_signals.append(signal)
         M.signals_fired_total.labels(strategy=self._strategy_name, direction=str(direction)).inc()
@@ -534,6 +584,9 @@ class PaperStrategyRunner:
         pos = self._position
         if pos is None or pos.flatten_order_id is not None:
             return
+        if pos.needs_broker_verification:
+            self._flatten(pos, "entry_rejected")
+            return
         minutes = ts.hour * 60 + ts.minute
         cutoff = CLOSE_CT_MINUTES - self._config.session.minutes_before_close
         if minutes >= cutoff:
@@ -543,23 +596,56 @@ class PaperStrategyRunner:
             self._flatten(pos, "time_stop")
 
     def _flatten(self, pos: _OpenPosition, reason: str) -> None:
-        """Cancel resting children and market-flatten the open position."""
+        """Cancel resting children and market-flatten the broker position."""
         _LOG.warning("flattening open position (%s): %+d x %d", reason, pos.direction, pos.contracts)
         for order_id in (pos.plan.stop_id, pos.plan.target_id):
             try:
                 self._exec.cancel_order(order_id)
             except Exception:
                 _LOG.exception("cancel_order(%d) failed during %s flatten", order_id, reason)
+        try:
+            broker_qty = float(self._exec.position_quantity(self._contract_spec))
+        except Exception:
+            _LOG.exception("position_quantity failed during %s flatten; no market order submitted", reason)
+            return
+        if broker_qty == 0:
+            # The bracket may already have closed the broker position. Trading
+            # against a flat account would open fresh exposure, so clear local
+            # state and wait for the next real signal.
+            _LOG.error("position desync during %s flatten: broker is flat; clearing runner state", reason)
+            M.position_desync_total.inc()
+            self._position = None
+            M.position_contracts.set(0)
+            self._apply_deferred_cutover_if_needed()
+            return
+        if _sign(broker_qty) != pos.direction:
+            # A broker position in the opposite direction is not safely
+            # attributable to this runner. Do not trade on an unexplained
+            # desync; surface it and clear the stale local latch.
+            _LOG.error(
+                "position desync during %s flatten: broker_qty=%+g runner_direction=%+d; no market order submitted",
+                reason,
+                broker_qty,
+                pos.direction,
+            )
+            M.position_desync_total.inc()
+            self._position = None
+            M.position_contracts.set(0)
+            self._apply_deferred_cutover_if_needed()
+            return
         side = "SELL" if pos.direction > 0 else "BUY"
+        quantity = abs(int(broker_qty))
         try:
             pos.flatten_order_id = int(
                 self._exec.place_market_order(
                     contract_spec=self._contract_spec,
                     side=side,
-                    quantity=pos.contracts,
+                    quantity=quantity,
                 )
             )
             pos.flatten_reason = reason
+            pos.exit_target_qty = float(quantity)
+            pos.needs_broker_verification = False
         except Exception:
             _LOG.exception("market flatten submission failed (%s); brackets may still be resting", reason)
 
@@ -569,7 +655,19 @@ class PaperStrategyRunner:
         if pos.entry_qty <= 0:
             _LOG.warning("exit fill before any entry fill observed; using entry reference price %.2f", entry_px)
         points = (pos.exit_avg_px - entry_px) * pos.direction
-        realized = points * pos.contracts * self._point_value
+        if pos.entry_qty > 0:
+            # P&L is the measured strategy edge, so it uses only quantity with
+            # both an observed strategy entry and an observed exit. A broker
+            # desync can make the flatten order larger than pos.contracts; that
+            # extra size is exposure cleanup, not a priced strategy round trip,
+            # and including it would silently corrupt the edge measurement.
+            matched_qty = min(pos.entry_qty, pos.exit_qty)
+        else:
+            # When the entry fill event was missed, fall back to the submitted
+            # exit target/reference-price convention that this runner used
+            # before the miss, capped by the fills actually observed.
+            matched_qty = min(pos.exit_qty, pos.exit_target_qty)
+        realized = points * matched_qty * self._point_value
         self._balance += realized
         self._realized_total += realized
         ts = pd.Timestamp(exit_ts) if exit_ts is not None else pd.Timestamp.now(tz="UTC")
@@ -636,10 +734,10 @@ class PaperStrategyRunner:
                         record,
                     )
         _LOG.info(
-            "round trip closed (%s): %s %d x %.2f -> %.2f = %+.2f USD (balance %.2f)",
+            "round trip closed (%s): %s %g x %.2f -> %.2f = %+.2f USD (balance %.2f)",
             outcome,
             pos.signal_type,
-            pos.contracts,
+            matched_qty,
             entry_px,
             pos.exit_avg_px,
             realized,
@@ -647,17 +745,32 @@ class PaperStrategyRunner:
         )
         self._position = None
 
-        # Deferred front-month cutover recovery: if a roll arrived while this
-        # position was open, update_front_month parked the new expiry rather
-        # than re-pointing the order contract mid-trade. Now that we are flat,
-        # apply it so divergence clears and new entries can resume on the live
-        # contract. Reached under self._lock (handle_fill holds the RLock).
+        self._apply_deferred_cutover_if_needed()
+
+    def _apply_deferred_cutover_if_needed(self) -> None:
+        """Apply a parked front-month cutover after local state is flat."""
         if self._pending_consumed_expiry is not None:
             _LOG.warning(
                 "applying deferred front-month cutover to %s now that the position is closed",
                 self._pending_consumed_expiry,
             )
             self._apply_consumed_cutover(self._pending_consumed_expiry)
+
+    def _bar_is_stale(self, ts: pd.Timestamp) -> bool:
+        """Return True when a row's event time is too old to trade."""
+        if self._max_bar_age is None:
+            return False
+        now = pd.Timestamp(self._now_fn())
+        if now.tzinfo is None:
+            now = now.tz_localize("UTC")
+        else:
+            now = now.tz_convert("UTC")
+        event_ts = pd.Timestamp(ts)
+        if event_ts.tzinfo is None:
+            event_ts = event_ts.tz_localize("UTC")
+        else:
+            event_ts = event_ts.tz_convert("UTC")
+        return (now - event_ts) > self._max_bar_age
 
     def _in_session(self, ts: pd.Timestamp) -> bool:
         mask = session_mask(
@@ -681,6 +794,11 @@ def _accumulate_avg(avg: float, qty: float, fill_px: float, fill_qty: float) -> 
     if total <= 0:
         return fill_px
     return (avg * qty + fill_px * fill_qty) / total
+
+
+def _sign(value: float) -> int:
+    """Return the sign of a non-zero broker quantity."""
+    return 1 if value > 0 else -1
 
 
 __all__ = [

@@ -14,14 +14,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 
 from alpha_assay.config.loader import AlphaAssayConfig
-from alpha_assay.exec.ibkr import OrderPlan
+from alpha_assay.data.ibkr_adapter import IBKRAdapter
+from alpha_assay.exec.ibkr import IBKRExecAdapter, OrderPlan
 from alpha_assay.exec.trade_log import TradeLog
+from alpha_assay.observability import metrics as M
 from alpha_assay.paper.runner import PaperStrategyRunner, load_paper_strategy, point_value_for
 from alpha_assay.strategy.base import BaseStrategy, ExitParams, Signal
 
@@ -108,8 +112,11 @@ class FakeExecAdapter:
     market_orders: list[dict[str, Any]] = field(default_factory=list)
     cancelled: list[int] = field(default_factory=list)
     open_position_qty: float = 0.0
+    position_quantities: list[float] = field(default_factory=list)
+    position_quantity_calls: int = 0
     open_order_count: int = 0
     _callbacks: list = field(default_factory=list)
+    _order_status_callbacks: list = field(default_factory=list)
 
     def _allocate(self) -> int:
         self.next_id += 1
@@ -120,6 +127,7 @@ class FakeExecAdapter:
         side = kwargs["side"]
         sign = 1.0 if side == "BUY" else -1.0
         entry = float(kwargs["limit_price"])
+        self.open_position_qty = sign * float(kwargs["quantity"])
         return OrderPlan(
             parent_id=self._allocate(),
             stop_id=self._allocate(),
@@ -140,6 +148,9 @@ class FakeExecAdapter:
         self.cancelled.append(order_id)
 
     def position_quantity(self, contract_spec: dict[str, Any]) -> float:
+        self.position_quantity_calls += 1
+        if self.position_quantities:
+            self.open_position_qty = self.position_quantities.pop(0)
         return self.open_position_qty
 
     def cancel_open_orders(self, contract_spec: dict[str, Any]) -> int:
@@ -147,6 +158,13 @@ class FakeExecAdapter:
 
     def on_fill(self, callback) -> None:
         self._callbacks.append(callback)
+
+    def on_order_status(self, callback) -> None:
+        self._order_status_callbacks.append(callback)
+
+    def fire_order_status(self, evt: dict[str, Any]) -> None:
+        for cb in self._order_status_callbacks:
+            cb(evt)
 
     def fire_fill(self, order_id: int, price: float, quantity: float, ts: str | pd.Timestamp) -> None:
         evt = {
@@ -168,6 +186,8 @@ def _make_runner(
     config: AlphaAssayConfig | None = None,
     trade_log: TradeLog | None = None,
     time_stop_min: int | None = None,
+    max_bar_age: timedelta | None = None,
+    now_fn: Any | None = None,
 ) -> tuple[PaperStrategyRunner, FakeExecAdapter]:
     config = config or _make_config()
     strategy = ScriptedStrategy(
@@ -185,9 +205,64 @@ def _make_runner(
         contract_spec=CONTRACT_SPEC,
         trade_log=trade_log,
         starting_balance=100_000.0,
+        max_bar_age=max_bar_age,
+        now_fn=now_fn,
     )
     exec_adapter.on_fill(runner.handle_fill)
+    exec_adapter.on_order_status(runner.handle_order_status)
     return runner, exec_adapter
+
+
+def _make_ibkr_runner(
+    *,
+    fire_at: dict[pd.Timestamp, int] | None = None,
+    time_stop_min: int | None = None,
+) -> tuple[PaperStrategyRunner, IBKRExecAdapter, dict[int, Any], list[float]]:
+    """Build a runner wired to IBKRExecAdapter event objects."""
+    from ib_insync import Trade
+
+    ib = MagicMock(name="IB")
+    ib.isConnected.return_value = True
+    ib.client = MagicMock()
+    ib.client.getReqId.side_effect = list(range(9001, 9050))
+    broker_qty = [0.0]
+    trades_by_id: dict[int, Trade] = {}
+
+    def _positions() -> list[Any]:
+        """Expose the mutable broker position to position_quantity."""
+        if broker_qty[0] == 0:
+            return []
+        contract = SimpleNamespace(symbol="ES", secType="FUT")
+        return [SimpleNamespace(contract=contract, position=broker_qty[0])]
+
+    def _place_order(contract: Any, order: Any) -> Trade:
+        """Return a retained Trade with real ib_insync events."""
+        trade = Trade(contract=contract, order=order)
+        trades_by_id[int(order.orderId)] = trade
+        return trade
+
+    ib.positions.side_effect = _positions
+    ib.placeOrder.side_effect = _place_order
+    exec_adapter = IBKRExecAdapter(adapter=IBKRAdapter(ib=ib, read_only=False))
+    config = _make_config()
+    strategy = ScriptedStrategy(
+        {
+            "fire_at": fire_at or {},
+            "risk": {"stop_points": 2.0, "target_points": 4.0},
+            "time_stop_min": time_stop_min,
+        }
+    )
+    runner = PaperStrategyRunner(
+        strategy=strategy,
+        config=config,
+        exec_adapter=exec_adapter,
+        contract_spec=CONTRACT_SPEC,
+        starting_balance=100_000.0,
+        now_fn=lambda: _ct("10:06"),
+    )
+    exec_adapter.on_fill(runner.handle_fill)
+    exec_adapter.on_order_status(runner.handle_order_status)
+    return runner, exec_adapter, trades_by_id, broker_qty
 
 
 def _feed_minutes(
@@ -219,6 +294,52 @@ def _feed_minutes(
                 },
                 feed_label="es",
             )
+
+
+def _counter_value(counter, **labels) -> float:
+    """Read a Prometheus counter value for focused unit assertions."""
+    if labels:
+        return counter.labels(**labels)._value.get()
+    return counter._value.get()
+
+
+def _emit_ibkr_status(trade: Any, status: str, error_code: int, message: str) -> None:
+    """Emit an ib_insync statusEvent with the matching TradeLogEntry."""
+    import datetime as _dt
+
+    from ib_insync.objects import TradeLogEntry
+
+    trade.orderStatus.status = status
+    trade.log.append(
+        TradeLogEntry(
+            time=_dt.datetime(2026, 6, 2, 15, 6, 0, tzinfo=_dt.UTC),
+            status=status,
+            message=message,
+            errorCode=error_code,
+        )
+    )
+    trade.statusEvent.emit(trade)
+
+
+def _emit_ibkr_fill(trade: Any, *, price: float, quantity: float) -> None:
+    """Emit an ib_insync fillEvent in the adapter's canonical path."""
+    import datetime as _dt
+
+    from ib_insync import CommissionReport, Contract, Execution, Fill
+
+    fill = Fill(
+        contract=Contract(),
+        execution=Execution(
+            execId=f"E-{trade.order.orderId}",
+            time=_dt.datetime(2026, 6, 2, 15, 6, 1, tzinfo=_dt.UTC),
+            shares=quantity,
+            price=price,
+            side="BOT" if trade.order.action == "BUY" else "SLD",
+        ),
+        commissionReport=CommissionReport(),
+        time=_dt.datetime(2026, 6, 2, 15, 6, 1, tzinfo=_dt.UTC),
+    )
+    trade.fillEvent.emit(trade, fill)
 
 
 # --- signal -> bracket submission ----------------------------------------
@@ -326,6 +447,56 @@ def test_signal_at_window_edges_acts_only_inside():
     assert len(exec_adapter.brackets) == 1
 
 
+# --- stale-bar safety ------------------------------------------------------
+
+
+def test_stale_bar_warms_frame_without_submitting_bracket():
+    before = _counter_value(M.stale_bars_skipped_total)
+    runner, exec_adapter = _make_runner(
+        fire_at={_ct("10:05"): 1},
+        max_bar_age=timedelta(seconds=180),
+        now_fn=lambda: _ct("11:35"),
+    )
+
+    _feed_minutes(runner, _ct("10:00"), 8)
+
+    assert exec_adapter.brackets == []
+    assert len(runner.frame) > 0
+    assert _counter_value(M.stale_bars_skipped_total) > before
+
+
+def test_fresh_control_submits_identical_signal():
+    runner, exec_adapter = _make_runner(
+        fire_at={_ct("10:05"): 1},
+        max_bar_age=timedelta(seconds=180),
+        now_fn=lambda: _ct("10:06"),
+    )
+
+    _feed_minutes(runner, _ct("10:00"), 8)
+
+    assert len(exec_adapter.brackets) == 1
+
+
+def test_stale_replay_burst_does_not_advance_time_stop_or_enter():
+    now = [_ct("10:06")]
+    runner, exec_adapter = _make_runner(
+        fire_at={_ct("10:05"): 1, _ct("10:30"): -1},
+        time_stop_min=3,
+        max_bar_age=timedelta(seconds=180),
+        now_fn=lambda: now[0],
+    )
+
+    _feed_minutes(runner, _ct("10:00"), 7)
+    assert len(exec_adapter.brackets) == 1
+    now[0] = _ct("12:00")
+
+    _feed_minutes(runner, _ct("10:07"), 35)
+
+    assert len(exec_adapter.brackets) == 1
+    assert exec_adapter.market_orders == []
+    assert runner.open_position is not None
+
+
 # --- max one concurrent position ---------------------------------------------
 
 
@@ -335,6 +506,62 @@ def test_second_signal_while_position_open_is_skipped():
     _feed_minutes(runner, _ct("10:00"), 15)
 
     assert len(exec_adapter.brackets) == 1
+
+
+def test_ibkr_phantom_cancelled_entry_status_does_not_clear_position():
+    runner, exec_adapter, trades_by_id, broker_qty = _make_ibkr_runner(fire_at={_ct("10:05"): 1, _ct("10:06"): 1})
+
+    _feed_minutes(runner, _ct("10:00"), 7)
+    pos = runner.open_position
+    assert pos is not None
+    broker_qty[0] = float(pos.contracts)
+    parent_trade = trades_by_id[pos.plan.parent_id]
+
+    _emit_ibkr_status(
+        parent_trade,
+        "Cancelled",
+        10349,
+        "Order TIF was set to DAY based on order preset.",
+    )
+    _emit_ibkr_status(parent_trade, "PreSubmitted", 0, "")
+    _feed_minutes(runner, _ct("10:07"), 1)
+    _emit_ibkr_fill(parent_trade, price=5000.25, quantity=pos.contracts)
+
+    assert runner.open_position is pos
+    assert runner.open_position.entry_qty == pytest.approx(pos.contracts)
+    assert len(exec_adapter._ib.placeOrder.call_args_list) == 3
+    assert exec_adapter._ib.cancelOrder.call_args_list == []
+
+
+def test_genuine_entry_rejection_defers_flat_broker_clear_to_next_bar():
+    before = _counter_value(M.orders_rejected_total, type="entry")
+    runner, exec_adapter = _make_runner(fire_at={_ct("10:05"): 1})
+
+    _feed_minutes(runner, _ct("10:00"), 8)
+    pos = runner.open_position
+    assert pos is not None
+    exec_adapter.open_position_qty = 0.0
+    calls_before = exec_adapter.position_quantity_calls
+
+    exec_adapter.fire_order_status(
+        {
+            "order_id": pos.plan.parent_id,
+            "status": "Cancelled",
+            "error_code": 201,
+            "message": "Order rejected - insufficient margin",
+        }
+    )
+
+    assert runner.open_position is pos
+    assert runner.open_position.needs_broker_verification is True
+    assert exec_adapter.cancelled == []
+    assert exec_adapter.position_quantity_calls == calls_before
+
+    _feed_minutes(runner, _ct("10:09"), 1)
+
+    assert runner.open_position is None
+    assert exec_adapter.cancelled == [pos.plan.stop_id, pos.plan.target_id]
+    assert _counter_value(M.orders_rejected_total, type="entry") == before + 1
 
 
 def test_second_signal_after_round_trip_closes_is_accepted():
@@ -471,6 +698,159 @@ def test_time_stop_flattens_after_configured_minutes():
     assert len(exec_adapter.cancelled) == 2
     pos = runner.open_position
     assert pos.flatten_reason == "time_stop"
+
+
+def test_time_stop_does_not_open_position_when_broker_already_flat():
+    before = _counter_value(M.position_desync_total)
+    runner, exec_adapter = _make_runner(fire_at={_ct("10:05"): 1}, time_stop_min=3)
+
+    _feed_minutes(runner, _ct("10:00"), 7)
+    assert runner.open_position is not None
+    exec_adapter.open_position_qty = 0.0
+    _feed_minutes(runner, _ct("10:07"), 5)
+
+    assert exec_adapter.market_orders == []
+    assert runner.open_position is None
+    assert _counter_value(M.position_desync_total) == before + 1
+
+
+def test_flatten_sizes_market_order_from_broker_quantity():
+    runner, exec_adapter = _make_runner(fire_at={_ct("10:05"): 1}, time_stop_min=3)
+
+    _feed_minutes(runner, _ct("10:00"), 7)
+    exec_adapter.open_position_qty = 2.0
+    _feed_minutes(runner, _ct("10:07"), 5)
+
+    assert len(exec_adapter.market_orders) == 1
+    assert exec_adapter.market_orders[0]["quantity"] == 2
+
+
+def test_partial_flatten_larger_than_runner_contracts_waits_for_exit_target(tmp_path):
+    config = _make_config(max_contracts=1)
+    trade_log = TradeLog(out_dir=tmp_path)
+    runner, exec_adapter = _make_runner(
+        fire_at={_ct("10:05"): 1},
+        config=config,
+        trade_log=trade_log,
+        time_stop_min=3,
+    )
+
+    _feed_minutes(runner, _ct("10:00"), 7)
+    pos = runner.open_position
+    assert pos is not None
+    assert pos.contracts == 1
+    exec_adapter.open_position_qty = 2.0
+    _feed_minutes(runner, _ct("10:07"), 5)
+
+    assert len(exec_adapter.market_orders) == 1
+    assert exec_adapter.market_orders[0]["quantity"] == 2
+    assert pos.exit_target_qty == pytest.approx(2.0)
+
+    exec_adapter.fire_fill(pos.plan.parent_id, 5000.25, 1, "2026-06-02 15:06:05+00:00")
+    exec_adapter.fire_fill(pos.flatten_order_id, 5001.25, 1, "2026-06-02 15:09:00+00:00")
+
+    assert runner.open_position is pos
+    assert runner.account_balance == pytest.approx(100_000.0)
+
+    exec_adapter.fire_fill(pos.flatten_order_id, 5001.25, 1, "2026-06-02 15:10:00+00:00")
+    exec_adapter.fire_fill(pos.flatten_order_id, 5001.25, 1, "2026-06-02 15:11:00+00:00")
+
+    expected = (5001.25 - 5000.25) * 1 * 50.0
+    assert runner.open_position is None
+    assert runner.account_balance == pytest.approx(100_000.0 + expected)
+    df = pd.read_parquet(tmp_path / "trades.parquet")
+    assert len(df) == 1
+    assert df.iloc[0]["mock_pnl_dollars"] == pytest.approx(expected)
+
+
+def test_rejected_flatten_clears_marker_and_next_fresh_bar_retries():
+    before = _counter_value(M.orders_rejected_total, type="flatten")
+    runner, exec_adapter = _make_runner(fire_at={_ct("10:05"): 1}, time_stop_min=3)
+
+    _feed_minutes(runner, _ct("10:00"), 12)
+    assert len(exec_adapter.market_orders) == 1
+    pos = runner.open_position
+    rejected_order_id = pos.flatten_order_id
+    calls_before = exec_adapter.position_quantity_calls
+
+    exec_adapter.fire_order_status(
+        {
+            "order_id": rejected_order_id,
+            "status": "Cancelled",
+            "error_code": 201,
+            "message": "Order rejected",
+        }
+    )
+
+    assert runner.open_position.flatten_order_id is None
+    assert runner.open_position.flatten_reason is None
+    assert exec_adapter.position_quantity_calls == calls_before
+    assert _counter_value(M.orders_rejected_total, type="flatten") == before + 1
+
+    _feed_minutes(runner, _ct("10:13"), 2)
+
+    assert len(exec_adapter.market_orders) == 2
+    assert runner.open_position.flatten_order_id != rejected_order_id
+
+
+def test_rejected_flatten_defers_flat_broker_clear_to_next_bar():
+    before = _counter_value(M.orders_rejected_total, type="flatten")
+    runner, exec_adapter = _make_runner(fire_at={_ct("10:05"): 1}, time_stop_min=3)
+
+    _feed_minutes(runner, _ct("10:00"), 12)
+    assert len(exec_adapter.market_orders) == 1
+    pos = runner.open_position
+    rejected_order_id = pos.flatten_order_id
+    exec_adapter.open_position_qty = 0.0
+    calls_before = exec_adapter.position_quantity_calls
+
+    exec_adapter.fire_order_status(
+        {
+            "order_id": rejected_order_id,
+            "status": "Cancelled",
+            "error_code": 201,
+            "message": "Order rejected - already flat",
+        }
+    )
+
+    assert runner.open_position is pos
+    assert runner.open_position.flatten_order_id is None
+    assert exec_adapter.position_quantity_calls == calls_before
+
+    _feed_minutes(runner, _ct("10:13"), 2)
+
+    assert runner.open_position is None
+    assert len(exec_adapter.market_orders) == 1
+    assert _counter_value(M.orders_rejected_total, type="flatten") == before + 1
+
+
+def test_ibkr_phantom_cancelled_flatten_status_does_not_submit_duplicate_flatten():
+    runner, exec_adapter, trades_by_id, broker_qty = _make_ibkr_runner(
+        fire_at={_ct("10:05"): 1},
+        time_stop_min=3,
+    )
+
+    _feed_minutes(runner, _ct("10:00"), 7)
+    pos = runner.open_position
+    assert pos is not None
+    broker_qty[0] = float(pos.contracts)
+    _feed_minutes(runner, _ct("10:07"), 5)
+    flatten_order_id = pos.flatten_order_id
+    assert flatten_order_id is not None
+    flatten_trade = trades_by_id[flatten_order_id]
+
+    _emit_ibkr_status(
+        flatten_trade,
+        "Cancelled",
+        10349,
+        "Order TIF was set to DAY based on order preset.",
+    )
+    _emit_ibkr_status(flatten_trade, "PreSubmitted", 0, "")
+    _feed_minutes(runner, _ct("10:13"), 2)
+    _emit_ibkr_fill(flatten_trade, price=5001.25, quantity=pos.contracts)
+
+    assert runner.open_position is None
+    assert len(exec_adapter._ib.placeOrder.call_args_list) == 4
 
 
 # --- risk caps ----------------------------------------------------------------

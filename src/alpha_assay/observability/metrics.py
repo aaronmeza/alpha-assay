@@ -51,6 +51,19 @@ orders_filled_total = Counter(
     "Count of orders resolved by the broker.",
     labelnames=("type", "status"),
 )
+orders_rejected_total = Counter(
+    f"{_PREFIX}orders_rejected_total",
+    "Count of terminal broker order outcomes that did not fill.",
+    labelnames=("type",),
+)
+stale_bars_skipped_total = Counter(
+    f"{_PREFIX}stale_bars_skipped_total",
+    "Count of completed frame rows skipped for broker interaction because their event time is stale.",
+)
+position_desync_total = Counter(
+    f"{_PREFIX}position_desync_total",
+    "Count of runner/broker position desyncs where the runner cleared state without submitting a flatten.",
+)
 
 fill_slippage_points = Histogram(
     f"{_PREFIX}fill_slippage_points",
