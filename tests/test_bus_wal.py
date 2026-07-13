@@ -195,6 +195,104 @@ def test_dirty_day_file_full_drains_exactly_once(wal_dir: Path):
     assert list(restarted.read_uncommitted()) == []
 
 
+def test_post_migration_unpublished_record_is_still_replayed(wal_dir: Path):
+    """A record appended AFTER migration, then lost to a crash, is still recovered.
+
+    Adversarial-review claim (round 2): once ``.migrated`` exists, the dirty
+    file falls back to the scalar watermark cursor while its duplicate seqs are
+    still on disk - so a post-migration record that is appended and then lost to
+    a crash before its publish would be skipped forever.
+
+    It is not, and this test pins down why. The full drain advances the
+    watermark for EVERY record it replays, so at migration the watermark equals
+    the file's max seq. Live appends then resume at ``next_seq`` == max + 1, i.e.
+    strictly ABOVE the watermark. So every post-migration record - published or
+    not - sits above the cursor, and an unpublished one is always replayed. The
+    legacy duplicates below the watermark were all published by the full drain.
+    The scalar cursor is therefore sound for everything written after migration,
+    even though the file itself never becomes strictly increasing again.
+    """
+    day = "2026-07-13"
+    wal_dir.mkdir(parents=True, exist_ok=True)
+    wal_path = wal_dir / f"feed-{day}.jsonl"
+
+    # A legacy dirty file: segment 1 wrote 0..4, segment 2 restarted at 0.
+    lines = [f"{seq}\t{base64.b64encode(f'seg1-{seq}'.encode()).decode()}\n" for seq in range(5)]
+    lines.extend(f"{seq}\t{base64.b64encode(f'seg2-{seq}'.encode()).decode()}\n" for seq in range(3))
+    wal_path.write_text("".join(lines))
+    (wal_dir / f"feed-{day}.committed").write_text("4")
+
+    # The migrating process full-drains, then starts publishing live.
+    wal = WALAppender(directory=wal_dir, day=day)
+    assert wal.needs_full_drain is True
+    for record in wal.read_uncommitted():
+        wal.advance_committed(record.seq)
+    wal.mark_migrated()
+
+    # The drain leaves the watermark at the file's high-water mark, which is
+    # the invariant the whole argument rests on.
+    assert (wal_dir / f"feed-{day}.committed").read_text().strip() == "4"
+
+    # Live loop resumes above it, publishes one record, then dies mid-record:
+    # seq 6 is appended but never published (no advance_committed).
+    seq_counter = wal.next_seq
+    assert seq_counter == 5
+    wal.append(seq=5, msg_bytes=b"post-migration-published")
+    wal.advance_committed(5)
+    wal.append(seq=6, msg_bytes=b"post-migration-LOST")
+    wal.close()
+
+    # Restart. The file is still not strictly increasing and the marker is
+    # present, so it uses the scalar cursor - and still recovers the lost record.
+    restarted = WALAppender(directory=wal_dir, day=day)
+    assert restarted.needs_full_drain is False
+    replayed = [record.msg_bytes for record in restarted.read_uncommitted()]
+    assert replayed == [b"post-migration-LOST"]
+
+
+def test_marker_is_not_written_when_the_drain_fails_midway(wal_dir: Path):
+    """A drain that dies partway leaves no marker, so the next boot re-drains.
+
+    Adversarial-review claim (round 2): the migration marker is not atomic with
+    the replay, so a crash could leave ``.migrated`` behind while records were
+    still unpublished, permanently hiding them.
+
+    It cannot. ``mark_migrated()`` runs only AFTER the drain loop completes, and
+    the loop publishes every record before it advances. A publish that raises
+    propagates out before the marker is ever written, so the next boot still
+    sees a dirty, unmigrated file and conservatively drains it again. The
+    failure mode is a repeated over-replay, never a skipped record.
+    """
+    day = "2026-07-13"
+    wal_dir.mkdir(parents=True, exist_ok=True)
+    wal_path = wal_dir / f"feed-{day}.jsonl"
+    lines = [f"{seq}\t{base64.b64encode(f'seg1-{seq}'.encode()).decode()}\n" for seq in range(3)]
+    lines.extend(f"{seq}\t{base64.b64encode(f'seg2-{seq}'.encode()).decode()}\n" for seq in range(2))
+    wal_path.write_text("".join(lines))
+    (wal_dir / f"feed-{day}.committed").write_text("2")
+
+    wal = WALAppender(directory=wal_dir, day=day)
+    assert wal.needs_full_drain is True
+
+    # Simulate the publish blowing up on the third record, the way a Redis
+    # outage would take the drain loop down before mark_migrated() is reached.
+    published: list[bytes] = []
+    with pytest.raises(RuntimeError):
+        for i, record in enumerate(wal.read_uncommitted()):
+            if i == 2:
+                raise RuntimeError("redis is down")
+            published.append(record.msg_bytes)
+            wal.advance_committed(record.seq)
+    wal.close()
+
+    assert not (wal_dir / f"feed-{day}.migrated").exists()
+
+    # Next boot: still dirty, still unmigrated, so the whole file replays again.
+    restarted = WALAppender(directory=wal_dir, day=day)
+    assert restarted.needs_full_drain is True
+    assert len(list(restarted.read_uncommitted())) == 5
+
+
 def test_clean_day_file_uses_watermark_cursor_without_full_drain(wal_dir: Path):
     """A strictly increasing file only replays records above the watermark."""
     day = "2026-07-13"
