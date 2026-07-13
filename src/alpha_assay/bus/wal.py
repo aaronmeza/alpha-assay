@@ -40,6 +40,14 @@ class WALRecord:
     msg_bytes: bytes
 
 
+@dataclass(frozen=True)
+class WALScan:
+    """Startup facts collected from one pass over the day-file."""
+
+    max_seq: int
+    strictly_increasing: bool
+
+
 class WALAppender:
     """Append-only WAL for the bus producer.
 
@@ -63,11 +71,22 @@ class WALAppender:
         self._day = day
         self._wal_path = self._dir / f"feed-{day}.jsonl"
         self._watermark_path = self._dir / f"feed-{day}.committed"
+        self._migrated_path = self._dir / f"feed-{day}.migrated"
         self._fsync_every_n = fsync_every_n
         self._fsync_every_ms = fsync_every_ms
         self._unflushed = 0
         self._last_flush_ms = self._now_ms()
-        self._max_seq = self._scan_max_seq()
+        scan = self._scan_wal()
+        self._max_seq = scan.max_seq
+        self._strictly_increasing = scan.strictly_increasing
+        self._needs_full_drain = not self._strictly_increasing and not self._migrated_path.exists()
+        if not self._strictly_increasing:
+            LOG.warning(
+                "dirty WAL day-file detected: path=%s migrated=%s needs_full_drain=%s",
+                self._wal_path,
+                self._migrated_path.exists(),
+                self._needs_full_drain,
+            )
         self._committed = self._read_committed()
         # Open in append-mode binary; line-buffered.
         self._fp = open(self._wal_path, "ab")  # noqa: SIM115
@@ -81,6 +100,16 @@ class WALAppender:
         """Return the next strictly monotonic sequence for this day-file."""
         return self._max_seq + 1
 
+    @property
+    def needs_full_drain(self) -> bool:
+        """Return True when a legacy dirty file needs one conservative drain."""
+        return self._needs_full_drain
+
+    @property
+    def path(self) -> Path:
+        """Return the WAL day-file path for diagnostic logging."""
+        return self._wal_path
+
     def _decode_line(self, line: bytes) -> WALRecord:
         """Decode one WAL line, raising when the line is corrupt."""
         seq_str, b64 = line.decode().rstrip("\n").split("\t", 1)
@@ -88,11 +117,13 @@ class WALAppender:
         msg_bytes = base64.b64decode(b64)
         return WALRecord(seq=seq, msg_bytes=msg_bytes)
 
-    def _scan_max_seq(self) -> int:
-        """Find the highest sequence already present in the day-file."""
+    def _scan_wal(self) -> WALScan:
+        """Find the highest sequence and whether seqs strictly increase."""
         max_seq = -1
+        prev_seq: int | None = None
+        strictly_increasing = True
         if not self._wal_path.exists():
-            return max_seq
+            return WALScan(max_seq=max_seq, strictly_increasing=strictly_increasing)
         with open(self._wal_path, "rb") as f:
             for line in f:
                 try:
@@ -100,8 +131,11 @@ class WALAppender:
                 except (ValueError, UnicodeDecodeError, Exception) as e:
                     LOG.warning("skipping corrupt WAL line in %s: %s", self._wal_path, e)
                     continue
+                if prev_seq is not None and record.seq <= prev_seq:
+                    strictly_increasing = False
+                prev_seq = record.seq
                 max_seq = max(max_seq, record.seq)
-        return max_seq
+        return WALScan(max_seq=max_seq, strictly_increasing=strictly_increasing)
 
     def append(self, seq: int, msg_bytes: bytes) -> None:
         """Append one record. fsync is batched per fsync_every_n / _ms."""
@@ -130,16 +164,25 @@ class WALAppender:
     def advance_committed(self, seq: int) -> None:
         """Mark seq as confirmed-published. Atomic rename for crash safety."""
         if seq > self._committed:
-            tmp = self._watermark_path.with_suffix(".committed.tmp")
-            tmp.write_text(str(seq))
-            # fsync the file content + the directory so the rename is durable.
-            with open(tmp, "rb") as f:
-                os.fsync(f.fileno())
-            os.replace(tmp, self._watermark_path)
+            self._write_int_sidecar(self._watermark_path, seq)
             self._committed = seq
         BM.bus_wal_pending.dec()
 
+    def mark_migrated(self) -> None:
+        """Record that this dirty day-file has been conservatively drained."""
+        self._write_int_sidecar(self._migrated_path, self._max_seq)
+        self._needs_full_drain = False
+
+    def _write_int_sidecar(self, path: Path, value: int) -> None:
+        """Atomically write an integer sidecar and fsync its file content."""
+        tmp = path.with_suffix(f"{path.suffix}.tmp")
+        tmp.write_text(str(value))
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
     def _read_committed(self) -> int:
+        """Read the durable committed watermark sidecar."""
         if not self._watermark_path.exists():
             return -1
         try:
@@ -155,6 +198,7 @@ class WALAppender:
         """
         if not self._wal_path.exists():
             return
+        committed = -1 if self._needs_full_drain else self._committed
         with open(self._wal_path, "rb") as f:
             for line in f:
                 try:
@@ -162,8 +206,7 @@ class WALAppender:
                 except (ValueError, UnicodeDecodeError, Exception) as e:
                     LOG.warning("skipping corrupt WAL line in %s: %s", self._wal_path, e)
                     continue
-                if record.seq > self._committed:
-                    BM.bus_wal_pending.inc()
+                if record.seq > committed:
                     yield record
 
     def close(self) -> None:

@@ -150,6 +150,92 @@ def test_advance_committed_never_moves_watermark_backwards(wal_dir: Path):
     assert sidecar.read_text().strip() == "10"
 
 
+def test_dirty_duplicate_segment_replays_unpublished_below_watermark(wal_dir: Path):
+    """A dirty legacy file must not lose an unpublished duplicate seq."""
+    day = "2026-07-13"
+    wal = WALAppender(directory=wal_dir, day=day)
+    for seq in range(5):
+        wal.append(seq=seq, msg_bytes=f"segment-1-{seq}".encode())
+        wal.advance_committed(seq)
+    wal.close()
+
+    dirty_writer = WALAppender(directory=wal_dir, day=day)
+    dirty_writer.append(seq=0, msg_bytes=b"segment-2-published-0")
+    dirty_writer.append(seq=1, msg_bytes=b"segment-2-published-1")
+    dirty_writer.append(seq=2, msg_bytes=b"segment-2-unpublished-2")
+    dirty_writer.close()
+
+    restarted = WALAppender(directory=wal_dir, day=day)
+    replayed = [record.msg_bytes for record in restarted.read_uncommitted()]
+
+    assert b"segment-2-unpublished-2" in replayed
+
+
+def test_dirty_day_file_full_drains_exactly_once(wal_dir: Path):
+    """The dirty-file migration drains once, then the marker restores cursor replay."""
+    day = "2026-07-13"
+    wal_dir.mkdir(parents=True, exist_ok=True)
+    wal_path = wal_dir / f"feed-{day}.jsonl"
+    lines = [f"{seq}\t{base64.b64encode(f'segment-1-{seq}'.encode()).decode()}\n" for seq in range(5)]
+    lines.extend(f"{seq}\t{base64.b64encode(f'segment-2-{seq}'.encode()).decode()}\n" for seq in range(3))
+    wal_path.write_text("".join(lines))
+    (wal_dir / f"feed-{day}.committed").write_text("4")
+
+    wal = WALAppender(directory=wal_dir, day=day)
+    assert wal.needs_full_drain is True
+    replayed = list(wal.read_uncommitted())
+    assert [record.seq for record in replayed] == [0, 1, 2, 3, 4, 0, 1, 2]
+    for record in replayed:
+        wal.advance_committed(record.seq)
+    wal.mark_migrated()
+    wal.close()
+
+    restarted = WALAppender(directory=wal_dir, day=day)
+    assert restarted.needs_full_drain is False
+    assert list(restarted.read_uncommitted()) == []
+
+
+def test_clean_day_file_uses_watermark_cursor_without_full_drain(wal_dir: Path):
+    """A strictly increasing file only replays records above the watermark."""
+    day = "2026-07-13"
+    wal = WALAppender(directory=wal_dir, day=day)
+    for seq in range(5):
+        wal.append(seq=seq, msg_bytes=f"clean-{seq}".encode())
+        if seq <= 2:
+            wal.advance_committed(seq)
+    wal.close()
+
+    restarted = WALAppender(directory=wal_dir, day=day)
+    assert restarted.needs_full_drain is False
+    assert [record.seq for record in restarted.read_uncommitted()] == [3, 4]
+
+
+def test_seeded_same_day_restarts_remain_strictly_increasing(wal_dir: Path):
+    """A file written by fixed producers across restarts is never dirty."""
+    day = "2026-07-13"
+
+    first = WALAppender(directory=wal_dir, day=day)
+    seq_counter = first.next_seq
+    for _ in range(3):
+        first.append(seq=seq_counter, msg_bytes=f"first-{seq_counter}".encode())
+        first.advance_committed(seq_counter)
+        seq_counter += 1
+    first.close()
+
+    second = WALAppender(directory=wal_dir, day=day)
+    assert second.needs_full_drain is False
+    seq_counter = second.next_seq
+    for _ in range(3):
+        second.append(seq=seq_counter, msg_bytes=f"second-{seq_counter}".encode())
+        second.advance_committed(seq_counter)
+        seq_counter += 1
+    second.close()
+
+    restarted = WALAppender(directory=wal_dir, day=day)
+    assert restarted.needs_full_drain is False
+    assert list(restarted.read_uncommitted()) == []
+
+
 def test_next_seq_is_zero_for_absent_file_and_max_plus_one_for_populated_file(wal_dir: Path):
     """The caller can seed live seqs from the existing day-file high-water mark."""
     wal = WALAppender(directory=wal_dir, day="2026-05-06")
@@ -173,8 +259,8 @@ def test_next_seq_ignores_corrupt_lines(wal_dir: Path):
     assert wal.next_seq == 5
 
 
-def test_pending_gauge_never_goes_negative_across_restart_drain(wal_dir: Path):
-    """Replay increments pending before each matching advance decrements it."""
+def test_pending_gauge_never_goes_negative_when_replay_is_seeded(wal_dir: Path):
+    """Replay drain decrements balance a caller-seeded pending count."""
     start_value = BM.bus_wal_pending._value.get()
     BM.bus_wal_pending._value.set(0)
     try:
@@ -185,6 +271,7 @@ def test_pending_gauge_never_goes_negative_across_restart_drain(wal_dir: Path):
         BM.bus_wal_pending._value.set(0)
 
         restarted = WALAppender(directory=wal_dir, day="2026-05-06")
+        BM.bus_wal_pending.inc(2)
         seen_values = []
         for record in restarted.read_uncommitted():
             seen_values.append(BM.bus_wal_pending._value.get())
@@ -226,13 +313,13 @@ def test_legacy_dirty_day_file_recovers_to_a_monotonic_cursor(wal_dir: Path):
     # segment 2's trailing 2 - which is what let the counter collide before.
     assert wal.next_seq == 5
 
-    # (b) The above-watermark tail replays once: segment 1's seqs 3 and 4.
-    # This residual replay is bounded and expected on the first restart after
-    # deploy; it is the last one this file can ever produce.
+    # (b) The dirty file full-drains once so duplicate-seq records below the
+    # watermark cannot be silently skipped.
     replayed = [record.seq for record in wal.read_uncommitted()]
-    assert replayed == [3, 4]
+    assert replayed == [0, 1, 2, 3, 4, 0, 1, 2]
     for seq in replayed:
         wal.advance_committed(seq)
+    wal.mark_migrated()
 
     # (c) Live appends resume above the high-water mark, so no NEW duplicate
     # seq is written and the watermark only ever moves forward.

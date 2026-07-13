@@ -258,3 +258,72 @@ def test_daemon_drain_counts_and_logs_replayed_records(redis_client, tmp_path, c
     assert replay_counter._value.get() == before + 2
     assert "replaying 2 WAL records" in caplog.text
     assert stream in caplog.text
+
+
+def test_daemon_large_wal_drain_streams_and_balances_pending(redis_client, tmp_path, caplog):
+    """A large restart drain logs before streaming records without leaking pending gauge."""
+    stream = "bars.es.cme.20260618"
+    wal_dir = tmp_path / "wal"
+    day = datetime.now(UTC).strftime("%Y-%m-%d")
+    record_count = 5000
+    baseline_pending = BM.bus_wal_pending._value.get()
+    BM.bus_wal_pending._value.set(0)
+    try:
+        wal = WALAppender(directory=wal_dir / stream, day=day)
+        base_event_time = datetime(2026, 5, 6, 13, 30, tzinfo=UTC)
+        for seq in range(record_count):
+            msg = Message(
+                v=CURRENT_VERSION,
+                seq=seq,
+                ts_recv_ns=time.time_ns(),
+                ts_event_ns=int(base_event_time.timestamp() * 1_000_000_000) + seq,
+                stream=stream,
+                payload={"close": float(seq)},
+            )
+            wal.append(seq=seq, msg_bytes=pack_msg(msg))
+        wal.close()
+        BM.bus_wal_pending._value.set(baseline_pending)
+
+        async def fake_subscribe_bars(spec, **kw):
+            while True:
+                await asyncio.sleep(3600)
+                if False:
+                    yield {}
+
+        mock_adapter = MagicMock()
+        mock_adapter.connect_async = AsyncMock()
+        mock_adapter.is_connected = False
+        mock_adapter.subscribe_bars = fake_subscribe_bars
+
+        sub = Subscription(
+            kind="bars",
+            contract={"symbol": "ES", "sec_type": "FUT", "exchange": "CME", "expiry": "20260618"},
+        )
+
+        replay_counter = BM.bus_wal_replayed_total.labels(stream=stream)
+        before_replayed = replay_counter._value.get()
+
+        async def _run():
+            """Run long enough for the WAL drain to finish."""
+            daemon = IBKRFeedDaemon(
+                adapter=mock_adapter,
+                redis_client=redis_client,
+                wal_dir=wal_dir,
+            )
+            task = asyncio.create_task(daemon.run_subscription(sub))
+            await asyncio.sleep(1.0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(_run())
+
+        assert replay_counter._value.get() == before_replayed + record_count
+        assert BM.bus_wal_pending._value.get() == baseline_pending
+        assert f"replaying {record_count} WAL records" in caplog.text
+        assert stream in caplog.text
+    finally:
+        BM.bus_wal_pending._value.set(baseline_pending)

@@ -208,16 +208,27 @@ class IBKRFeedDaemon:
         # so concurrent subscriptions don't share state (otherwise each
         # task's drain would republish messages from other subscriptions
         # to its own Redis stream - the cause of the cross-stream contam
-        # bug observed during the first SER9 deploy).
+        # bug observed during the first factory-server deploy).
         wal_subdir = self._wal_dir / stream
         day = datetime.now(UTC).strftime("%Y-%m-%d")
         wal = WALAppender(directory=wal_subdir, day=day)
-        pending_records = list(wal.read_uncommitted())
-        self._log_wal_replay(stream=stream, records=pending_records)
-        for record in pending_records:
+        replay_count, first_msg_bytes, last_msg_bytes = self._scan_wal_replay(wal)
+        self._log_wal_replay(
+            stream=stream,
+            count=replay_count,
+            first_msg_bytes=first_msg_bytes,
+            last_msg_bytes=last_msg_bytes,
+        )
+        if replay_count:
+            BM.bus_wal_pending.inc(replay_count)
+        if wal.needs_full_drain:
+            LOG.error("full-draining dirty WAL day-file %s with %d records", wal.path, replay_count)
+        for record in wal.read_uncommitted():
             self._redis.xadd(stream, {"data": record.msg_bytes}, maxlen=self._maxlen, approximate=True)
             BM.bus_wal_replayed_total.labels(stream=stream).inc()
             wal.advance_committed(record.seq)
+        if wal.needs_full_drain:
+            wal.mark_migrated()
 
         seq_counter = wal.next_seq
         try:
@@ -251,20 +262,40 @@ class IBKRFeedDaemon:
             lock.release()
 
     @staticmethod
-    def _log_wal_replay(stream: str, records: list) -> None:
+    def _scan_wal_replay(wal: WALAppender) -> tuple[int, bytes | None, bytes | None]:
+        """Count restart-drain records while retaining only span endpoints."""
+        count = 0
+        first_msg_bytes = None
+        last_msg_bytes = None
+        for record in wal.read_uncommitted():
+            if first_msg_bytes is None:
+                first_msg_bytes = record.msg_bytes
+            last_msg_bytes = record.msg_bytes
+            count += 1
+        return count, first_msg_bytes, last_msg_bytes
+
+    @staticmethod
+    def _log_wal_replay(
+        stream: str,
+        count: int,
+        first_msg_bytes: bytes | None,
+        last_msg_bytes: bytes | None,
+    ) -> None:
         """Emit one restart-drain log line with count and best-effort time span."""
-        if not records:
+        if not count:
             return
-        level = logging.ERROR if len(records) > WAL_REPLAY_WARN_THRESHOLD else logging.WARNING
+        level = logging.ERROR if count > WAL_REPLAY_WARN_THRESHOLD else logging.WARNING
         try:
-            first = unpack_msg(records[0].msg_bytes)
-            last = unpack_msg(records[-1].msg_bytes)
+            if first_msg_bytes is None or last_msg_bytes is None:
+                raise ValueError("missing WAL replay endpoints")
+            first = unpack_msg(first_msg_bytes)
+            last = unpack_msg(last_msg_bytes)
             first_dt = datetime.fromtimestamp(first.ts_event_ns / 1_000_000_000, UTC).isoformat()
             last_dt = datetime.fromtimestamp(last.ts_event_ns / 1_000_000_000, UTC).isoformat()
             LOG.log(
                 level,
                 "replaying %d WAL records for %s with event span %s to %s",
-                len(records),
+                count,
                 stream,
                 first_dt,
                 last_dt,
@@ -273,7 +304,7 @@ class IBKRFeedDaemon:
             LOG.log(
                 level,
                 "replaying %d WAL records for %s; event span unavailable: %s",
-                len(records),
+                count,
                 stream,
                 e,
             )
