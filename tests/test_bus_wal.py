@@ -346,6 +346,49 @@ def test_next_seq_is_zero_for_absent_file_and_max_plus_one_for_populated_file(wa
     assert restarted.next_seq == 8
 
 
+def test_next_seq_clears_a_watermark_that_outran_the_log(wal_dir: Path):
+    """A watermark ahead of the last durable record must not be re-used.
+
+    The watermark sidecar is fsynced on every advance_committed(); the day-file
+    is fsynced in batches. So a hard kill drops the buffered tail and leaves a
+    committed value HIGHER than any seq on disk. This is not hypothetical - it
+    was measured on the live feed on 2026-07-13, where the ES bars WAL sat at
+    watermark=1349 with max_seq=1340 because the last nine published bars were
+    still in the write buffer.
+
+    Seeding from the log alone hands back a seq the watermark has already
+    passed. Combined with the monotonic advance_committed guard, that record's
+    advance is a no-op and an unpublished one is filtered out of the replay as
+    seq <= committed - the exact under-replay this branch exists to prevent,
+    arriving through a different door.
+    """
+    day = "2026-07-13"
+    wal_dir.mkdir(parents=True, exist_ok=True)
+    wal_path = wal_dir / f"feed-{day}.jsonl"
+
+    # Five records made it to disk; the watermark says nine were published,
+    # because records 5..9 were still buffered when the process was killed.
+    lines = [f"{seq}\t{base64.b64encode(f'flushed-{seq}'.encode()).decode()}\n" for seq in range(5)]
+    wal_path.write_text("".join(lines))
+    (wal_dir / f"feed-{day}.committed").write_text("9")
+
+    wal = WALAppender(directory=wal_dir, day=day)
+    # The file is strictly increasing, so this takes the ordinary cursor path -
+    # the dirty-file full drain is not what saves us here.
+    assert wal.needs_full_drain is False
+    # Not 5: that would collide with a watermark that has already reached 9.
+    assert wal.next_seq == 10
+
+    # Prove the record stays recoverable: append at the seeded seq, then die
+    # before publishing it (no advance_committed).
+    wal.append(seq=wal.next_seq, msg_bytes=b"appended-never-published")
+    wal.close()
+
+    restarted = WALAppender(directory=wal_dir, day=day)
+    replayed = [record.msg_bytes for record in restarted.read_uncommitted()]
+    assert replayed == [b"appended-never-published"]
+
+
 def test_next_seq_ignores_corrupt_lines(wal_dir: Path):
     """Corrupt day-file lines do not stop seq discovery."""
     wal_dir.mkdir(parents=True, exist_ok=True)
