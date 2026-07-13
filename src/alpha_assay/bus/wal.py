@@ -97,8 +97,24 @@ class WALAppender:
 
     @property
     def next_seq(self) -> int:
-        """Return the next strictly monotonic sequence for this day-file."""
-        return self._max_seq + 1
+        """Next seq strictly above BOTH the durable log and the watermark.
+
+        The watermark sidecar is fsynced on every ``advance_committed()`` while
+        the day-file itself is fsynced in batches, so the watermark can outrun
+        the log: a hard kill drops the buffered tail and leaves a committed
+        value HIGHER than any seq on disk. Observed live 2026-07-13 - the ES
+        bars WAL sat at watermark=1349, max_seq=1340, because the last nine
+        published bars were still in the write buffer.
+
+        Seeding from the log alone would then hand out seqs the watermark has
+        already passed. Their ``advance_committed()`` would no-op against the
+        monotonic guard, and an unpublished one would be filtered out of the
+        replay as ``seq <= committed`` - silently dropping a record the WAL
+        exists to protect. Seeding above both keeps every new record strictly
+        above the cursor, so it is always replayable. Seqs need only be
+        strictly increasing, not contiguous, so skipping the gap is free.
+        """
+        return max(self._max_seq, self._committed) + 1
 
     @property
     def needs_full_drain(self) -> bool:
