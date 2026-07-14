@@ -99,7 +99,27 @@ def test_every_append_is_durable(wal_dir: Path, monkeypatch):
     for i in range(append_count):
         wal.append(seq=i, msg_bytes=f"m-{i}".encode())
 
+    # >= not ==: creating the day-file also fsyncs its directory, so the real
+    # count is append_count + 1. The floor is what matters - one fsync per
+    # append, with no record left sitting in the write buffer.
     assert fsync_calls["n"] >= append_count
+
+
+def test_fsync_duration_is_recorded_per_stream(wal_dir: Path):
+    """Each stream's fsync cost is attributable to that stream, not pooled globally.
+
+    Every WAL shares one disk, so a pooled histogram cannot distinguish "the box
+    is slow" from "this one day-file is slow" - which is the question you actually
+    ask when a single feed stalls.
+    """
+    stream = "bars.es.cme.20260918"
+    before = BM.bus_wal_fsync_seconds.labels(stream=stream)._sum.get()
+
+    wal = WALAppender(directory=wal_dir, day="2026-05-06", stream=stream)
+    wal.append(seq=0, msg_bytes=b"labelled")
+    wal.close()
+
+    assert BM.bus_wal_fsync_seconds.labels(stream=stream)._sum.get() > before
 
 
 def _hard_kill_wal_writer(wal_dir: Path, day: str, body: str) -> int:

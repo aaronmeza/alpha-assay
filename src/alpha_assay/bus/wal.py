@@ -64,9 +64,24 @@ class WALAppender:
         self,
         directory: Path,
         day: str,
+        *,
+        stream: str | None = None,
     ) -> None:
         self._dir = Path(directory)
+        # A directory entry is not durable until its PARENT is fsynced, so note
+        # whether we had to create this one. A brand-new stream subdir is not a
+        # once-ever event: the stream name carries the contract expiry, so every
+        # quarterly roll produces one. Losing it to a power cut would take every
+        # record inside it - under-replay, the exact failure this class exists to
+        # prevent.
+        dir_existed = self._dir.exists()
         self._dir.mkdir(parents=True, exist_ok=True)
+        if not dir_existed:
+            self._fsync_dir(self._dir.parent)
+        # Metric label only. The WAL directory IS the per-stream subdir by
+        # construction (the producer opens `wal_root / stream`), so fall back to
+        # its name when a caller does not name the stream explicitly.
+        self._stream = stream or self._dir.name
         self._day = day
         self._wal_path = self._dir / f"feed-{day}.jsonl"
         self._watermark_path = self._dir / f"feed-{day}.committed"
@@ -93,12 +108,16 @@ class WALAppender:
             )
         # Open in append-mode binary; line-buffered.
         self._fp = open(self._wal_path, "ab")  # noqa: SIM115
+        # os.fsync() on the file syncs its data and inode but does NOT durably
+        # link a newly created file into its directory, so fsync the directory
+        # to persist the new day-file's entry.
         if not wal_existed:
-            self._fsync_directory()
+            self._fsync_dir(self._dir)
 
-    def _fsync_directory(self) -> None:
-        """Durably link a newly created WAL day-file into its directory."""
-        dir_fd = os.open(self._dir, os.O_RDONLY)
+    @staticmethod
+    def _fsync_dir(directory: Path) -> None:
+        """Durably persist a directory's entries (its own, not its parent's)."""
+        dir_fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(dir_fd)
         finally:
@@ -183,9 +202,12 @@ class WALAppender:
         line = f"{seq}\t{base64.b64encode(msg_bytes).decode()}\n".encode()
         self._fp.write(line)
         self._max_seq = max(self._max_seq, seq)
+        # Time the fsync per stream: every WAL shares one disk, so a single
+        # stream showing a divergent p99 points at that day-file (or its I/O
+        # path) rather than at the box.
         start = time.perf_counter()
         self.flush()
-        BM.bus_wal_fsync_seconds.observe(time.perf_counter() - start)
+        BM.bus_wal_fsync_seconds.labels(stream=self._stream).observe(time.perf_counter() - start)
         BM.bus_wal_pending.inc()
 
     def flush(self) -> None:

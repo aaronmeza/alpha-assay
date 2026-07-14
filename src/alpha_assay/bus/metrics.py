@@ -41,6 +41,7 @@ bus_wal_pending = Gauge(
 bus_wal_fsync_seconds = Histogram(
     f"{_PREFIX}bus_wal_fsync_seconds",
     "Producer-side WAL fsync duration per append.",
+    labelnames=("stream",),
     buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1),
 )
 

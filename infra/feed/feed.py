@@ -212,7 +212,7 @@ class IBKRFeedDaemon:
         # bug observed during the first deployment).
         wal_subdir = self._wal_dir / stream
         day = datetime.now(UTC).strftime("%Y-%m-%d")
-        wal = WALAppender(directory=wal_subdir, day=day)
+        wal = WALAppender(directory=wal_subdir, day=day, stream=stream)
         replay_count, first_msg_bytes, last_msg_bytes = self._scan_wal_replay(wal)
         self._log_wal_replay(
             stream=stream,
