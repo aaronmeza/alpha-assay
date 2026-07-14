@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import base64
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -82,21 +84,156 @@ def test_corrupt_line_skipped_with_warning(wal_dir: Path, caplog):
     assert uncommitted == []
 
 
-def test_fsync_batched_by_count(wal_dir: Path, monkeypatch):
+def test_every_append_is_durable(wal_dir: Path, monkeypatch):
     fsync_calls = {"n": 0}
     real_fsync = os.fsync
 
     def counting_fsync(fd):
+        """Count fsync calls while preserving real durability semantics."""
         fsync_calls["n"] += 1
         real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", counting_fsync)
-    wal = WALAppender(directory=wal_dir, day="2026-05-06", fsync_every_n=10, fsync_every_ms=100_000)
-    for i in range(25):
+    wal = WALAppender(directory=wal_dir, day="2026-05-06")
+    append_count = 25
+    for i in range(append_count):
         wal.append(seq=i, msg_bytes=f"m-{i}".encode())
-    wal.close()  # final flush
-    # 25 records, fsync every 10 -> 2 batched flushes + 1 close flush = 3
-    assert 2 <= fsync_calls["n"] <= 4
+
+    # >= not ==: creating the day-file also fsyncs its directory, so the real
+    # count is append_count + 1. The floor is what matters - one fsync per
+    # append, with no record left sitting in the write buffer.
+    assert fsync_calls["n"] >= append_count
+
+
+def test_fsync_duration_is_recorded_per_stream(wal_dir: Path):
+    """Each stream's fsync cost is attributable to that stream, not pooled globally.
+
+    Every WAL shares one disk, so a pooled histogram cannot distinguish "the box
+    is slow" from "this one day-file is slow" - which is the question you actually
+    ask when a single feed stalls.
+    """
+    stream = "bars.es.cme.20260918"
+    before = BM.bus_wal_fsync_seconds.labels(stream=stream)._sum.get()
+
+    wal = WALAppender(directory=wal_dir, day="2026-05-06", stream=stream)
+    wal.append(seq=0, msg_bytes=b"labelled")
+    wal.close()
+
+    assert BM.bus_wal_fsync_seconds.labels(stream=stream)._sum.get() > before
+
+
+def _hard_kill_wal_writer(wal_dir: Path, day: str, body: str, stream: str | None = None) -> int:
+    """Drive WAL calls in a child interpreter that dies WITHOUT unwinding.
+
+    ``os._exit()`` skips finally-blocks, atexit handlers, and - the point here -
+    the flush of Python's userspace write buffer. That makes this a true hard
+    kill (SIGKILL / OOM / power loss), which an in-process test cannot simulate:
+    anything that lets the interpreter tear down cleanly flushes the buffer and
+    hides the very bug under test.
+
+    ``body`` runs against a ``wal`` already bound to *wal_dir* / *day*. The
+    child imports from this checkout's ``src`` so it exercises the code under
+    test, not whatever an editable install happens to point at.
+    """
+    src_path = Path(__file__).resolve().parents[1] / "src"
+    script = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "from alpha_assay.bus.wal import WALAppender\n"
+        f"wal = WALAppender(directory=Path({str(wal_dir)!r}), day={day!r}, stream={stream!r})\n"
+        f"{body}\n"
+        "os._exit(1)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "PYTHONPATH": str(src_path)},
+        check=False,
+    )
+    return result.returncode
+
+
+def test_appended_record_survives_hard_kill_without_flush_or_close(tmp_path: Path):
+    """A record appended but never flushed/closed is still replayable after a hard kill.
+
+    This is the whole point of a write-AHEAD log, and it is what the batched
+    fsync silently broke: the record died in the write buffer, was never
+    published, and no replay could recover it.
+    """
+    wal_dir = tmp_path / "wal"
+
+    returncode = _hard_kill_wal_writer(
+        wal_dir,
+        "2026-05-06",
+        "wal.append(seq=0, msg_bytes=b'hard-kill-survivor')",
+    )
+
+    assert returncode == 1
+    restarted = WALAppender(directory=wal_dir, day="2026-05-06")
+    uncommitted = list(restarted.read_uncommitted())
+    assert [(record.seq, record.msg_bytes) for record in uncommitted] == [(0, b"hard-kill-survivor")]
+
+
+def test_committed_never_exceeds_max_seq_after_hard_kill(tmp_path: Path):
+    """The watermark can never outrun the log, even when the producer is hard-killed.
+
+    The child publishes all 5 records (append + advance_committed each) and is
+    then killed without unwinding. Under batched fsync that is the losing state,
+    not a benign one: 5 records fewer than the 10-record batch threshold are still
+    sitting in the write buffer, while advance_committed() has eagerly fsynced the
+    watermark to 4. The kill leaves committed=4 over an EMPTY day-file (max_seq=-1)
+    - the on-disk signature measured on the production host (watermark 1349 vs
+    max_seq 1340), with every published record unrecoverable.
+
+    The hard kill is what gives this teeth. close() flushes the day-file, so the
+    same append/advance sequence closed normally upholds committed <= max_seq even
+    on the batched-fsync code - it would pass for the wrong reason and prove
+    nothing. Verified: this test fails against the pre-fix WAL.
+    """
+    day = "2026-05-06"
+    wal_dir = tmp_path / "wal"
+    stream = "bars.es.cme.20260918"
+    published = 5
+    body = "\n".join(
+        f"wal.append(seq={seq}, msg_bytes=b'published-{seq}')\nwal.advance_committed({seq})" for seq in range(published)
+    )
+
+    returncode = _hard_kill_wal_writer(wal_dir, day, body, stream=stream)
+
+    assert returncode == 1
+    before = BM.bus_wal_watermark_ahead_total.labels(stream=stream)._value.get()
+    restarted = WALAppender(directory=wal_dir, day=day, stream=stream)
+
+    # Every published record is durable, so the cursor cannot have outrun the log.
+    assert restarted.committed == published - 1
+    assert restarted.max_seq == published - 1
+    assert restarted.committed <= restarted.max_seq
+    # ...and the watermark-ahead tripwire stays silent, because there is nothing to trip.
+    assert BM.bus_wal_watermark_ahead_total.labels(stream=stream)._value.get() == before
+
+
+def test_legacy_committed_above_max_seq_warns_and_seeds_above_both(wal_dir: Path, caplog):
+    """A legacy watermark-ahead file stays open, trips the metric, and seeds above both.
+
+    Files written by the batched-fsync producer are still on disk, so this state
+    has to be survived, not merely declared unreachable. Seeding above BOTH cursors
+    is what keeps a record in that file replayable rather than filtered out as
+    already-committed - do not "simplify" next_seq back to max_seq + 1.
+    """
+    day = "2026-05-06"
+    stream = "ticks.tick-nyse"
+    wal_dir.mkdir(parents=True, exist_ok=True)
+    wal_path = wal_dir / f"feed-{day}.jsonl"
+    lines = [f"{seq}\t{base64.b64encode(f'flushed-{seq}'.encode()).decode()}\n" for seq in range(5)]
+    wal_path.write_text("".join(lines))
+    (wal_dir / f"feed-{day}.committed").write_text("9")
+    before = BM.bus_wal_watermark_ahead_total.labels(stream=stream)._value.get()
+
+    wal = WALAppender(directory=wal_dir, day=day, stream=stream)
+
+    assert "committed watermark exceeds day-file max seq" in caplog.text
+    assert BM.bus_wal_watermark_ahead_total.labels(stream=stream)._value.get() == before + 1
+    # Above the watermark (9), not merely above the log (4).
+    assert wal.next_seq == 10
 
 
 def test_same_day_restart_keeps_seq_monotonic_and_replays_only_unpublished(wal_dir: Path):

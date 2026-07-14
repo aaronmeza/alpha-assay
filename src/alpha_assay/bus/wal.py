@@ -2,8 +2,9 @@
 """Producer-side write-ahead log for the alpha-assay bus.
 
 Append-only file ``feed-{day}.jsonl`` (newline-delimited base64-msgpack)
-+ atomic-rename watermark sidecar ``feed-{day}.committed``. fsync is
-batched: every N records OR every Nms whichever first.
++ atomic-rename watermark sidecar ``feed-{day}.committed``. ``append()``
+flushes and fsyncs each record before returning, so the caller's publish
+step always happens after the event is durable on disk.
 
 Sequence numbers are strictly monotonic within a day-file. A producer
 restarting on the same day must seed its next live sequence from
@@ -13,8 +14,8 @@ across process segments.
 On producer restart, ``read_uncommitted()`` returns records past the
 watermark - the producer drains these to Redis before entering its
 live loop. This is the durability boundary: every event that survives
-``append() + flush()`` will eventually land on the bus, even if Redis
-or the producer process die in between.
+``append()`` will eventually land on the bus, even if Redis or the
+producer process die in between.
 """
 
 from __future__ import annotations
@@ -63,19 +64,35 @@ class WALAppender:
         self,
         directory: Path,
         day: str,
-        fsync_every_n: int = 10,
-        fsync_every_ms: int = 100,
+        *,
+        stream: str | None = None,
     ) -> None:
         self._dir = Path(directory)
+        # A directory entry is not durable until its PARENT is fsynced, so note
+        # whether we had to create this one. A brand-new stream subdir is not a
+        # once-ever event: the stream name carries the contract expiry, so every
+        # quarterly roll produces one. Losing it to a power cut would take every
+        # record inside it - under-replay, the exact failure this class exists to
+        # prevent.
+        #
+        # Only the immediate parent is fsynced, which is sufficient because only
+        # one level is ever created here: the producer pre-creates the WAL root in
+        # its own constructor, so `parents=True` has at most the stream subdir left
+        # to make. A caller that hands this class a path several levels below an
+        # existing directory would leave the intermediate levels unsynced.
+        dir_existed = self._dir.exists()
         self._dir.mkdir(parents=True, exist_ok=True)
+        if not dir_existed:
+            self._fsync_dir(self._dir.parent)
+        # Metric label only. The WAL directory IS the per-stream subdir by
+        # construction (the producer opens `wal_root / stream`), so fall back to
+        # its name when a caller does not name the stream explicitly.
+        self._stream = stream or self._dir.name
         self._day = day
         self._wal_path = self._dir / f"feed-{day}.jsonl"
         self._watermark_path = self._dir / f"feed-{day}.committed"
         self._migrated_path = self._dir / f"feed-{day}.migrated"
-        self._fsync_every_n = fsync_every_n
-        self._fsync_every_ms = fsync_every_ms
-        self._unflushed = 0
-        self._last_flush_ms = self._now_ms()
+        wal_existed = self._wal_path.exists()
         scan = self._scan_wal()
         self._max_seq = scan.max_seq
         self._strictly_increasing = scan.strictly_increasing
@@ -88,31 +105,48 @@ class WALAppender:
                 self._needs_full_drain,
             )
         self._committed = self._read_committed()
+        # The watermark outrunning the log is the on-disk signature of the
+        # data-loss window this class was fixed to close, so it gets a metric and
+        # not just a log line - a warning nobody queries pages nobody. It is
+        # unreachable for files this code writes (append() fsyncs before the
+        # caller can publish and advance), which is exactly what makes a non-zero
+        # count meaningful: a legacy day-file, or a regression that reopened the
+        # window. next_seq below is what keeps either case safe.
+        if self._committed > self._max_seq:
+            BM.bus_wal_watermark_ahead_total.labels(stream=self._stream).inc()
+            LOG.warning(
+                "WAL committed watermark exceeds day-file max seq: path=%s committed=%s max_seq=%s",
+                self._wal_path,
+                self._committed,
+                self._max_seq,
+            )
         # Open in append-mode binary; line-buffered.
         self._fp = open(self._wal_path, "ab")  # noqa: SIM115
+        # os.fsync() on the file syncs its data and inode but does NOT durably
+        # link a newly created file into its directory, so fsync the directory
+        # to persist the new day-file's entry.
+        if not wal_existed:
+            self._fsync_dir(self._dir)
 
     @staticmethod
-    def _now_ms() -> int:
-        return int(time.monotonic() * 1000)
+    def _fsync_dir(directory: Path) -> None:
+        """Durably persist a directory's entries (its own, not its parent's)."""
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
     @property
     def next_seq(self) -> int:
         """Next seq strictly above BOTH the durable log and the watermark.
 
-        The watermark sidecar is fsynced on every ``advance_committed()`` while
-        the day-file itself is fsynced in batches, so the watermark can outrun
-        the log: a hard kill drops the buffered tail and leaves a committed
-        value HIGHER than any seq on disk. Observed live 2026-07-13 - the ES
-        bars WAL sat at watermark=1349, max_seq=1340, because the last nine
-        published bars were still in the write buffer.
-
-        Seeding from the log alone would then hand out seqs the watermark has
-        already passed. Their ``advance_committed()`` would no-op against the
-        monotonic guard, and an unpublished one would be filtered out of the
-        replay as ``seq <= committed`` - silently dropping a record the WAL
-        exists to protect. Seeding above both keeps every new record strictly
-        above the cursor, so it is always replayable. Seqs need only be
-        strictly increasing, not contiguous, so skipping the gap is free.
+        Legacy files can have a committed watermark ahead of the durable
+        day-file. Seeding from the log alone would hand back a seq the
+        watermark has already passed, so an unpublished record could be
+        filtered out of replay. Seeding above both keeps every new record
+        strictly above the cursor. Seqs need only be strictly increasing,
+        not contiguous, so skipping the gap is free.
         """
         return max(self._max_seq, self._committed) + 1
 
@@ -125,6 +159,23 @@ class WALAppender:
     def path(self) -> Path:
         """Return the WAL day-file path for diagnostic logging."""
         return self._wal_path
+
+    @property
+    def committed(self) -> int:
+        """Highest seq confirmed published, per the durable watermark sidecar."""
+        return self._committed
+
+    @property
+    def max_seq(self) -> int:
+        """Highest seq durably on disk in the day-file (-1 when the file is empty).
+
+        Exposed alongside ``committed`` so the cursor invariant this class now
+        upholds - ``committed <= max_seq``, because ``append()`` fsyncs before
+        the caller can publish and advance - is assertable from outside without
+        reaching into private state. Legacy files written by the pre-fsync
+        producer can still violate it; see ``next_seq``.
+        """
+        return self._max_seq
 
     def _decode_line(self, line: bytes) -> WALRecord:
         """Decode one WAL line, raising when the line is corrupt."""
@@ -154,7 +205,7 @@ class WALAppender:
         return WALScan(max_seq=max_seq, strictly_increasing=strictly_increasing)
 
     def append(self, seq: int, msg_bytes: bytes) -> None:
-        """Append one record. fsync is batched per fsync_every_n / _ms."""
+        """Append one record and fsync it before returning."""
         if seq <= self._max_seq:
             LOG.warning(
                 "non-monotonic WAL append in %s: seq=%s current_max=%s",
@@ -165,17 +216,18 @@ class WALAppender:
         line = f"{seq}\t{base64.b64encode(msg_bytes).decode()}\n".encode()
         self._fp.write(line)
         self._max_seq = max(self._max_seq, seq)
-        self._unflushed += 1
+        # Time the fsync per stream: every WAL shares one disk, so a single
+        # stream showing a divergent p99 points at that day-file (or its I/O
+        # path) rather than at the box.
+        start = time.perf_counter()
+        self.flush()
+        BM.bus_wal_fsync_seconds.labels(stream=self._stream).observe(time.perf_counter() - start)
         BM.bus_wal_pending.inc()
-        if self._unflushed >= self._fsync_every_n or (self._now_ms() - self._last_flush_ms) >= self._fsync_every_ms:
-            self.flush()
 
     def flush(self) -> None:
-        """Force fsync to disk."""
+        """Force any buffered WAL bytes to disk."""
         self._fp.flush()
         os.fsync(self._fp.fileno())
-        self._unflushed = 0
-        self._last_flush_ms = self._now_ms()
 
     def advance_committed(self, seq: int) -> None:
         """Mark seq as confirmed-published. Atomic rename for crash safety."""
