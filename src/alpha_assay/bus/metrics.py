@@ -45,6 +45,15 @@ bus_wal_fsync_seconds = Histogram(
     buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1),
 )
 
+bus_wal_watermark_ahead_total = Counter(
+    f"{_PREFIX}bus_wal_watermark_ahead_total",
+    "WAL opens found with a committed watermark above the day-file's max seq. "
+    "Unreachable once append() fsyncs before the publish; a non-zero value means "
+    "either a legacy day-file written by the batched-fsync producer, or a "
+    "regression that has reopened the data-loss window.",
+    labelnames=("stream",),
+)
+
 bus_wal_replayed_total = Counter(
     f"{_PREFIX}bus_wal_replayed_total",
     "Records republished from the WAL on producer restart (drain).",

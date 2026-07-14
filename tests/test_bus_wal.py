@@ -122,7 +122,7 @@ def test_fsync_duration_is_recorded_per_stream(wal_dir: Path):
     assert BM.bus_wal_fsync_seconds.labels(stream=stream)._sum.get() > before
 
 
-def _hard_kill_wal_writer(wal_dir: Path, day: str, body: str) -> int:
+def _hard_kill_wal_writer(wal_dir: Path, day: str, body: str, stream: str | None = None) -> int:
     """Drive WAL calls in a child interpreter that dies WITHOUT unwinding.
 
     ``os._exit()`` skips finally-blocks, atexit handlers, and - the point here -
@@ -140,7 +140,7 @@ def _hard_kill_wal_writer(wal_dir: Path, day: str, body: str) -> int:
         "import os\n"
         "from pathlib import Path\n"
         "from alpha_assay.bus.wal import WALAppender\n"
-        f"wal = WALAppender(directory=Path({str(wal_dir)!r}), day={day!r})\n"
+        f"wal = WALAppender(directory=Path({str(wal_dir)!r}), day={day!r}, stream={stream!r})\n"
         f"{body}\n"
         "os._exit(1)\n"
     )
@@ -176,43 +176,63 @@ def test_appended_record_survives_hard_kill_without_flush_or_close(tmp_path: Pat
 def test_committed_never_exceeds_max_seq_after_hard_kill(tmp_path: Path):
     """The watermark can never outrun the log, even when the producer is hard-killed.
 
-    Driving this through a hard kill is what gives it teeth. Closing the WAL
-    normally flushes the day-file, so an in-process append/advance/close
-    sequence upholds ``committed <= max_seq`` even on the batched-fsync code -
-    the assertion passes for the wrong reason and proves nothing.
+    The child publishes all 5 records (append + advance_committed each) and is
+    then killed without unwinding. Under batched fsync that is the losing state,
+    not a benign one: 5 records fewer than the 10-record batch threshold are still
+    sitting in the write buffer, while advance_committed() has eagerly fsynced the
+    watermark to 4. The kill leaves committed=4 over an EMPTY day-file (max_seq=-1)
+    - the on-disk signature measured on the production host (watermark 1349 vs
+    max_seq 1340), with every published record unrecoverable.
 
-    Killed mid-flight, the batched-fsync producer left the eagerly-fsynced
-    watermark pointing past a day-file whose tail was still buffered. That is
-    the exact state measured on the production host (watermark 1349 vs max_seq
-    1340) and the one the seq cursor then has to defend against. An fsync on
-    every append makes it unreachable.
+    The hard kill is what gives this teeth. close() flushes the day-file, so the
+    same append/advance sequence closed normally upholds committed <= max_seq even
+    on the batched-fsync code - it would pass for the wrong reason and prove
+    nothing. Verified: this test fails against the pre-fix WAL.
     """
     day = "2026-05-06"
     wal_dir = tmp_path / "wal"
+    stream = "bars.es.cme.20260918"
+    published = 5
     body = "\n".join(
-        f"wal.append(seq={seq}, msg_bytes=b'published-{seq}')\nwal.advance_committed({seq})" for seq in range(5)
+        f"wal.append(seq={seq}, msg_bytes=b'published-{seq}')\nwal.advance_committed({seq})" for seq in range(published)
     )
 
-    returncode = _hard_kill_wal_writer(wal_dir, day, body)
+    returncode = _hard_kill_wal_writer(wal_dir, day, body, stream=stream)
 
     assert returncode == 1
-    restarted = WALAppender(directory=wal_dir, day=day)
-    assert restarted.committed == 4
+    before = BM.bus_wal_watermark_ahead_total.labels(stream=stream)._value.get()
+    restarted = WALAppender(directory=wal_dir, day=day, stream=stream)
+
+    # Every published record is durable, so the cursor cannot have outrun the log.
+    assert restarted.committed == published - 1
+    assert restarted.max_seq == published - 1
     assert restarted.committed <= restarted.max_seq
+    # ...and the watermark-ahead tripwire stays silent, because there is nothing to trip.
+    assert BM.bus_wal_watermark_ahead_total.labels(stream=stream)._value.get() == before
 
 
 def test_legacy_committed_above_max_seq_warns_and_seeds_above_both(wal_dir: Path, caplog):
-    """A legacy watermark-ahead file stays open and seeds above both cursors."""
+    """A legacy watermark-ahead file stays open, trips the metric, and seeds above both.
+
+    Files written by the batched-fsync producer are still on disk, so this state
+    has to be survived, not merely declared unreachable. Seeding above BOTH cursors
+    is what keeps a record in that file replayable rather than filtered out as
+    already-committed - do not "simplify" next_seq back to max_seq + 1.
+    """
     day = "2026-05-06"
+    stream = "ticks.tick-nyse"
     wal_dir.mkdir(parents=True, exist_ok=True)
     wal_path = wal_dir / f"feed-{day}.jsonl"
     lines = [f"{seq}\t{base64.b64encode(f'flushed-{seq}'.encode()).decode()}\n" for seq in range(5)]
     wal_path.write_text("".join(lines))
     (wal_dir / f"feed-{day}.committed").write_text("9")
+    before = BM.bus_wal_watermark_ahead_total.labels(stream=stream)._value.get()
 
-    wal = WALAppender(directory=wal_dir, day=day)
+    wal = WALAppender(directory=wal_dir, day=day, stream=stream)
 
     assert "committed watermark exceeds day-file max seq" in caplog.text
+    assert BM.bus_wal_watermark_ahead_total.labels(stream=stream)._value.get() == before + 1
+    # Above the watermark (9), not merely above the log (4).
     assert wal.next_seq == 10
 
 

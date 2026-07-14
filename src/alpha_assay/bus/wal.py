@@ -74,6 +74,12 @@ class WALAppender:
         # quarterly roll produces one. Losing it to a power cut would take every
         # record inside it - under-replay, the exact failure this class exists to
         # prevent.
+        #
+        # Only the immediate parent is fsynced, which is sufficient because only
+        # one level is ever created here: the producer pre-creates the WAL root in
+        # its own constructor, so `parents=True` has at most the stream subdir left
+        # to make. A caller that hands this class a path several levels below an
+        # existing directory would leave the intermediate levels unsynced.
         dir_existed = self._dir.exists()
         self._dir.mkdir(parents=True, exist_ok=True)
         if not dir_existed:
@@ -99,7 +105,15 @@ class WALAppender:
                 self._needs_full_drain,
             )
         self._committed = self._read_committed()
+        # The watermark outrunning the log is the on-disk signature of the
+        # data-loss window this class was fixed to close, so it gets a metric and
+        # not just a log line - a warning nobody queries pages nobody. It is
+        # unreachable for files this code writes (append() fsyncs before the
+        # caller can publish and advance), which is exactly what makes a non-zero
+        # count meaningful: a legacy day-file, or a regression that reopened the
+        # window. next_seq below is what keeps either case safe.
         if self._committed > self._max_seq:
+            BM.bus_wal_watermark_ahead_total.labels(stream=self._stream).inc()
             LOG.warning(
                 "WAL committed watermark exceeds day-file max seq: path=%s committed=%s max_seq=%s",
                 self._wal_path,
