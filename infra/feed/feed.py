@@ -142,7 +142,8 @@ class IBKRFeedDaemon:
 
     Per subscription, the receive->WAL-append->publish->watermark-advance
     sequence guarantees that every IBKR event durably lands in either
-    Redis (immediately) or the WAL (for replay on restart).
+    Redis or the WAL. ``WALAppender.append()`` fsyncs before returning, so
+    the live loop does not need a separate flush between append and XADD.
     """
 
     def __init__(
@@ -208,7 +209,7 @@ class IBKRFeedDaemon:
         # so concurrent subscriptions don't share state (otherwise each
         # task's drain would republish messages from other subscriptions
         # to its own Redis stream - the cause of the cross-stream contam
-        # bug observed during the first factory-server deploy).
+        # bug observed during the first deployment).
         wal_subdir = self._wal_dir / stream
         day = datetime.now(UTC).strftime("%Y-%m-%d")
         wal = WALAppender(directory=wal_subdir, day=day)

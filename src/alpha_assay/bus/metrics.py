@@ -38,6 +38,12 @@ bus_wal_pending = Gauge(
     "Producer-side WAL records appended but not yet confirmed published.",
 )
 
+bus_wal_fsync_seconds = Histogram(
+    f"{_PREFIX}bus_wal_fsync_seconds",
+    "Producer-side WAL fsync duration per append.",
+    buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1),
+)
+
 bus_wal_replayed_total = Counter(
     f"{_PREFIX}bus_wal_replayed_total",
     "Records republished from the WAL on producer restart (drain).",
